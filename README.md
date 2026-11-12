@@ -47,7 +47,8 @@ front sensor probes, but streaming does not start.
 | `scripts/build-libcamera.sh`, `scripts/abuild-inner.sh` | builds the patched libcamera as signed Alpine aarch64 packages |
 | `scripts/camera-raw-test.sh` | bring-up test on the phone without libcamera: sensor -> seninf -> CAMSV -> memory, focus sweep, test pattern, RAW10 -> PNG converter |
 | `netroot/` | the hook for titan2-tools' image builder: package lists and the install script |
-| `kernel/` | where the kernel part is, and the camera kernel config fragment `kernel/titan2-camera.config` |
+| `kernel/` | the kernel part: the patch series `kernel/patches/` (on top of titan2-linux branch `titan2`), the config fragment `kernel/titan2-camera.config`, and how to build it |
+| `tools/csv2fw.py` | converts a sensor register table (CSV) into the S5KGD1SP firmware patch format; holds no data, see kernel/README.md |
 
 ## Dependencies
 
@@ -59,8 +60,10 @@ front sensor probes, but streaming does not start.
 
       git clone https://github.com/Serlk/titan2-tools external/titan2-tools
 
-- **Kernel**: branch `camera` of https://github.com/Serlk/titan2-linux (on top of `titan2`), with
-  `kernel/titan2-camera.config`; DTB `mt6878-unihertz-titan2-all.dtb`.
+- **Kernel**: https://github.com/Serlk/titan2-linux branch `titan2` with `kernel/patches/`
+  applied by `git am`, and `kernel/titan2-camera.config`
+  (`FRAGMENTS=` of titan2-tools' `scripts/build-mainline.sh`, see kernel/README.md); DTB
+  `mt6878-unihertz-titan2-all.dtb`.
 - **Mesa** with Mali-G615 (panthor/panfrost) support for the GPU software ISP and for GTK
   applications that take pictures (Snapshot).
 - This repository does **not** need `titan2-vendor-runtime` from titan2-tools: the whole camera
@@ -142,7 +145,7 @@ No factory tuning is shipped in this repository. What is there:
 
 ## Related repositories
 
-- [titan2-linux](https://github.com/Serlk/titan2-linux): the kernel. Branch `titan2` is the mainline port; branches `camera`, `fingerprint` and `gnss` carry the optional camera, fingerprint and GNSS series on top of it.
+- [titan2-linux](https://github.com/Serlk/titan2-linux): the kernel, branch `titan2` (the mainline port). The optional camera, fingerprint and GNSS kernel parts are not in it: each lives as a patch series in `kernel/patches/` of its own repository below, applied with `git am` on `titan2`.
 - [titan2-boot](https://github.com/Serlk/titan2-boot): the boot menu in `boot_a` (Android and Linux side by side).
 - [titan2-tools](https://github.com/Serlk/titan2-tools): image builders, initramfs, network and disk root, modem, power and sensor services, and the shared `titan2-vendor-runtime`.
 - [titan2-docs](https://github.com/Serlk/titan2-docs): documentation and hardware notes.

@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:22:43 +0300
+Subject: [PATCH 01/12] media: dt-bindings: mediatek: Add MT6878 CAMSV
+
+CAMSV is the "camera simple" capture engine of the MT6878 camera
+subsystem: it writes sensor interface (seninf) tags straight to memory
+and is programmed through a command queue. Each engine has six register
+windows (outer and active sets of the central, DMA and command queue
+blocks), four interrupts, eight clocks and sits in the CAM_MAIN power
+domain. Its reset bits live in the camsys main block. It reaches memory
+through an SMI larb and the MM IOMMU with two ports, its command queue
+reader and its write DMA (iommus).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../bindings/media/mediatek,mt6878-camsv.yaml | 161 ++++++++++++++++++
+ 1 file changed, 161 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/media/mediatek,mt6878-camsv.yaml
+
+diff --git a/Documentation/devicetree/bindings/media/mediatek,mt6878-camsv.yaml b/Documentation/devicetree/bindings/media/mediatek,mt6878-camsv.yaml
+new file mode 100644
+index 000000000000..504eeae84111
+--- /dev/null
++++ b/Documentation/devicetree/bindings/media/mediatek,mt6878-camsv.yaml
+@@ -0,0 +1,161 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/media/mediatek,mt6878-camsv.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT6878 CAMSV capture engine
++
++maintainers:
++  - serlk <22211586+Serlk@users.noreply.github.com>
++
++description:
++  CAMSV ("camera simple") is a capture engine of the MT6878 camera
++  subsystem. It receives up to eight tags of a sensor interface (seninf)
++  stream and writes them to memory without further processing. Its
++  registers come in an outer set, written by software or by its command
++  queue (CQ), and an active (inner) set that the outer set is loaded into
++  at the start of a frame. The engine reaches memory only through its SMI
++  larb and the multimedia IOMMU: its command queue reader and its image
++  write DMA are ports of that larb.
++
++properties:
++  compatible:
++    const: mediatek,mt6878-camsv
++
++  reg:
++    items:
++      - description: central block, outer registers
++      - description: DMA block, outer registers
++      - description: command queue
++      - description: central block, active registers
++      - description: DMA block, active registers
++      - description: command queue, active registers
++
++  reg-names:
++    items:
++      - const: base
++      - const: dma
++      - const: scq
++      - const: inner
++      - const: inner-dma
++      - const: inner-scq
++
++  interrupts:
++    items:
++      - description: frame (group) done
++      - description: error
++      - description: start of frame
++      - description: command queue done
++
++  interrupt-names:
++    items:
++      - const: done
++      - const: err
++      - const: sof
++      - const: cq-done
++
++  clocks:
++    items:
++      - description: camsys main CAM gate
++      - description: SMI larb gate of this engine
++      - description: CAMSV top gate
++      - description: CAM to MM0 GALS gate
++      - description: CAM to MM1 GALS gate
++      - description: gate of this CAMSV engine
++      - description: CAM clock mux
++      - description: CAM timer clock mux
++
++  clock-names:
++    items:
++      - const: cam
++      - const: larb
++      - const: camsv-top
++      - const: gals0
++      - const: gals1
++      - const: camsv
++      - const: cam-sel
++      - const: camtm-sel
++
++  power-domains:
++    maxItems: 1
++
++  iommus:
++    items:
++      - description: command queue read port (CQI) of the engine's larb
++      - description: image write DMA port (WDMA) of the engine's larb
++
++  mediatek,camsv-id:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    minimum: 0
++    maximum: 5
++    description:
++      Hardware index of the engine. It selects the engine's bits in the
++      camsys main reset register and its DMA FIFO sizes.
++
++  mediatek,camsys:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      The camsys main syscon, which holds the engine reset register.
++
++  port:
++    $ref: /schemas/graph.yaml#/properties/port
++    description:
++      Input port, connected to a source port of the sensor interface.
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - interrupts
++  - interrupt-names
++  - clocks
++  - clock-names
++  - power-domains
++  - iommus
++  - mediatek,camsv-id
++  - mediatek,camsys
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/clock/mediatek,mt6878-clock.h>
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++    #include <dt-bindings/memory/mediatek,mt6878-memory-port.h>
++    #include <dt-bindings/power/mediatek,mt6878-power.h>
++
++    camsv@1a100000 {
++        compatible = "mediatek,mt6878-camsv";
++        reg = <0x1a100000 0x1000>, <0x1a110000 0x1000>,
++              <0x1a120000 0x1000>, <0x1a108000 0x1000>,
++              <0x1a118000 0x1000>, <0x1a128000 0x1000>;
++        reg-names = "base", "dma", "scq", "inner", "inner-dma", "inner-scq";
++        interrupts = <GIC_SPI 651 IRQ_TYPE_LEVEL_HIGH>,
++                     <GIC_SPI 652 IRQ_TYPE_LEVEL_HIGH>,
++                     <GIC_SPI 653 IRQ_TYPE_LEVEL_HIGH>,
++                     <GIC_SPI 669 IRQ_TYPE_LEVEL_HIGH>;
++        interrupt-names = "done", "err", "sof", "cq-done";
++        clocks = <&camsys_main CLK_CAM_MAIN_CAM>,
++                 <&camsys_main CLK_CAM_MAIN_LARB14>,
++                 <&camsys_main CLK_CAM_MAIN_CAMSV_TOP>,
++                 <&camsys_main CLK_CAM_MAIN_CAM2MM0_GALS>,
++                 <&camsys_main CLK_CAM_MAIN_CAM2MM1_GALS>,
++                 <&camsys_main CLK_CAM_MAIN_CAMSV_A_CON_1>,
++                 <&topckgen CLK_TOP_CAM_SEL>,
++                 <&topckgen CLK_TOP_CAMTM_SEL>;
++        clock-names = "cam", "larb", "camsv-top", "gals0", "gals1",
++                      "camsv", "cam-sel", "camtm-sel";
++        power-domains = <&spm MT6878_POWER_DOMAIN_CAM_MAIN>;
++        iommus = <&m4u M4U_L14_P0_CAMSV_A_CQI_E1>,
++                 <&m4u M4U_L14_P1_CAMSV_A0_WDMA>;
++        mediatek,camsv-id = <0>;
++        mediatek,camsys = <&camsys_main>;
++
++        port {
++            camsv1_in: endpoint {
++                remote-endpoint = <&seninf_out>;
++            };
++        };
++    };
+-- 
+2.56.0
+

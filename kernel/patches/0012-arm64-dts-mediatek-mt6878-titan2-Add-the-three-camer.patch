@@ -1,0 +1,1123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:23:01 +0300
+Subject: [PATCH 12/12] arm64: dts: mediatek: mt6878-titan2: Add the three
+ cameras
+
+mt6878-unihertz-titan2-cameras.dtsi, included by -all: the IMX766 main,
+S5KGD1SP front and Hi-847 second rear cameras with their VCMs, GPIO
+switched supplies, 24 MHz MCLKs, the camera vcore domain supply (MT6319
+VMM buck), the seninf CSI ports and one CAMSV engine per sensor behind the
+SMI larbs and the MM IOMMU; each engine is its own media device. The
+S5KGD1SP needs its sensor firmware patch, which is not distributed.
+
+-all-iommu: a test board, -all plus the display behind the same IOMMU,
+which -all leaves out for now (with the camera ports on the same M4U the
+screen showed the boot loader picture). Examples (not built) for a
+single-sensor fragment, the media graph and the CAMSV IOMMU path.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/boot/dts/mediatek/Makefile         |   1 +
+ .../mt6878-unihertz-titan2-all-iommu.dts      |  17 +
+ .../mediatek/mt6878-unihertz-titan2-all.dts   |  11 +-
+ ...-unihertz-titan2-camera-graph.dtsi.example | 121 ++++
+ .../mt6878-unihertz-titan2-cameras.dtsi       | 539 ++++++++++++++++++
+ ...t6878-unihertz-titan2-cameras.dtsi.example | 258 +++++++++
+ ...-unihertz-titan2-iommu-camera.dtsi.example |  62 ++
+ .../mediatek/mt6878-unihertz-titan2-jpeg.dts  |   4 +
+ 8 files changed, 1010 insertions(+), 3 deletions(-)
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all-iommu.dts
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-camera-graph.dtsi.example
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi.example
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-iommu-camera.dtsi.example
+
+diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
+index f14bdbb56829..60534fd4a8e2 100644
+--- a/arch/arm64/boot/dts/mediatek/Makefile
++++ b/arch/arm64/boot/dts/mediatek/Makefile
+@@ -10,6 +10,7 @@ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-nothing-tetris.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-all.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-all-fb.dtb
++dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-all-iommu.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-audio.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-drm.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-dvfs.dtb
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all-iommu.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all-iommu.dts
+new file mode 100644
+index 000000000000..84ca701065e1
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all-iommu.dts
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
++/*
++ * Titan 2: TEST board, -all plus the display behind the M4U
++ * (mt6878-unihertz-titan2-iommu-disp.dtsi), which -all leaves out for now:
++ * with the cameras on the same M4U the screen showed the boot loader
++ * picture instead of the compositor's buffers (no IOMMU fault, with and
++ * without mtk_iommu.hyp_smc). For the bisection: kernel parameters
++ * mtk_iommu.resv_boot_fb=1 (IOVA window of the boot frame buffer kept out of
++ * the allocator), the walk_iova debug parameter, and the camera modules
++ * blacklisted to run the display alone on the same DTB.
++ *
++ * If the screen shows the boot loader picture or stays dark, boot -all.
++ *
++ * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
++ */
++#include "mt6878-unihertz-titan2-all.dts"
++#include "mt6878-unihertz-titan2-iommu-disp.dtsi"
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts
+index b5b5fb8f5567..cae6ff13c6fa 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts
+@@ -3,7 +3,9 @@
+  * Titan 2: every bring-up stage at once, the display on mediatek-drm.
+  * Same as -all-fb plus the -drm stage, plus the MT6375 charger with the
+  * Type-C port manager (PD sink 5 V / 9 V, host role with VBUS from the
+- * charger's OTG boost) and USB in OTG mode, with the factory device tree
++ * charger's OTG boost) and USB in OTG mode, plus the three cameras on their
++ * CAMSV engines behind the multimedia IOMMU
++ * (mt6878-unihertz-titan2-cameras.dtsi), with the factory device tree
+  * battery limits (2.05 A, CV 4.45 V).
+  *
+  * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+@@ -12,10 +14,13 @@
+ #include "mt6878-unihertz-titan2-drm.dtsi"
+ /*
+  * The display behind the multimedia IOMMU (OVL0 iommus) is not included
+- * yet: it works as the only IOMMU master, but together with other masters
+- * on the same M4U the screen showed stale memory.
++ * yet: it works as the only IOMMU master, but together with the camera
++ * ports on the same M4U the screen showed stale memory (the boot loader
++ * frame buffer, no IOMMU fault). The test board -all-iommu adds it back
++ * for the bisection.
+  * #include "mt6878-unihertz-titan2-iommu-disp.dtsi"
+  */
++#include "mt6878-unihertz-titan2-cameras.dtsi"
+ 
+ &i2c5 {
+ 	pmic@34 {
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-camera-graph.dtsi.example b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-camera-graph.dtsi.example
+new file mode 100644
+index 000000000000..4cf6250935c1
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-camera-graph.dtsi.example
+@@ -0,0 +1,121 @@
++// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
++/*
++ * Unihertz Titan 2: camera media graph sensor -> seninf -> CAMSV (EXAMPLE,
++ * not built).
++ *
++ * Copyright (c) 2026 serlk
++ *
++ * Goes on top of mt6878-unihertz-titan2-cameras.dtsi.example (sensor nodes
++ * and their endpoint labels) and needs the CAMSV nodes (camsv1, camsv2,
++ * camsv5) of the CAMSV series. Their power domain (CAM_MAIN) exists only
++ * with the camera vcore domain tree enabled, as the -camera board does;
++ * mt6878-unihertz-titan2-camera-tpg.dts is the built test-pattern graph.
++ *
++ *   sensor    CSI port  seninf  mux  cam mux  CAMSV (camsv-id)
++ *   S5KGD1SP  0         0       0    0x0a     camsv2 (1), tag 2
++ *   Hi-847    1         2       4    0x20     camsv5 (4)
++ *   IMX766    2         4       1    0x02     camsv1 (0), tag 2
++ *
++ * CSI port and seninf index are those of the factory device tree. The CAMSV
++ * engine of each sensor, and with it the mux and cam mux, are a choice
++ * of this description; the driver derives the mux and cam mux from the
++ * linked engine. TODO: the factory assignment is not known.
++ */
++
++#include <dt-bindings/media/video-interfaces.h>
++
++&seninf {
++	status = "okay";
++};
++
++/* S5KGD1SP, front: D-PHY 4 lanes */
++&seninf_port0 {
++	seninf_csi0_in: endpoint {
++		bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
++		data-lanes = <1 2 3 4>;
++		remote-endpoint = <&s5kgd1sp_out>;
++	};
++};
++
++/* Hi-847, rear second: D-PHY 4 lanes */
++&seninf_port1 {
++	seninf_csi1_in: endpoint {
++		bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
++		data-lanes = <1 2 3 4>;
++		remote-endpoint = <&hi847_out>;
++	};
++};
++
++/*
++ * IMX766, rear main: C-PHY 3 trios. The fixed C-PHY settle times are the
++ * per-mode values of the factory sensor modes 0 (574 MHz) and 3 (377 MHz).
++ */
++&seninf_port2 {
++	seninf_csi2_in: endpoint {
++		bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++		data-lanes = <0 1 2>;
++		link-frequencies = /bits/ 64 <574000000 377000000>;
++		mediatek,cphy-settle-ns = <73 76>;
++		remote-endpoint = <&imx766_out>;
++	};
++};
++
++&seninf_port3 {
++	seninf_csi0_out: endpoint {
++		remote-endpoint = <&camsv2_in>;
++	};
++};
++
++&seninf_port4 {
++	seninf_csi1_out: endpoint {
++		remote-endpoint = <&camsv5_in>;
++	};
++};
++
++&seninf_port5 {
++	seninf_csi2_out: endpoint {
++		remote-endpoint = <&camsv1_in>;
++	};
++};
++
++&s5kgd1sp_out {
++	remote-endpoint = <&seninf_csi0_in>;
++};
++
++&hi847_out {
++	remote-endpoint = <&seninf_csi1_in>;
++};
++
++&imx766_out {
++	remote-endpoint = <&seninf_csi2_in>;
++};
++
++&camsv1 {
++	status = "okay";
++
++	port {
++		camsv1_in: endpoint {
++			remote-endpoint = <&seninf_csi2_out>;
++		};
++	};
++};
++
++&camsv2 {
++	status = "okay";
++
++	port {
++		camsv2_in: endpoint {
++			remote-endpoint = <&seninf_csi0_out>;
++		};
++	};
++};
++
++&camsv5 {
++	status = "okay";
++
++	port {
++		camsv5_in: endpoint {
++			remote-endpoint = <&seninf_csi1_out>;
++		};
++	};
++};
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi
+new file mode 100644
+index 000000000000..fb4bdcae3832
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi
+@@ -0,0 +1,539 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
++/*
++ * Unihertz Titan 2: the three cameras, each on its own CAMSV engine behind
++ * the MM IOMMU, so user space (libcamera) sees three cameras at once.
++ * Included by mt6878-unihertz-titan2-all.dts.
++ *
++ *   sensor    bus        CSI port  seninf  mux  cam mux  CAMSV (camsv-id)  larb
++ *   IMX766    i2c8 0x1a  2 C-PHY   4       1    0x02     camsv1 (0) tag 2  14
++ *   Hi-847    i2c7 0x20  1 D-PHY   2       2    0x0a     camsv2 (1) tag 2  13
++ *   S5KGD1SP  i2c4 0x2d  0 D-PHY   0       4    0x20     camsv5 (4)        29
++ *
++ * CSI ports and seninf indexes are those of the factory device tree; the
++ * driver derives mux and cam mux from the linked engine (cam mux bases
++ * 0x00, 0x08 and 0x20 are the factory mediatek,cammux-id of camsv1, camsv2 and
++ * camsv5; a tagged engine adds the tag, the single engine
++ * camsv5 does not, as mtk_cam_get_sv_cammux_id() of the GPL ISP7SP driver).
++ * The engine per sensor is a choice of this description (the factory one is
++ * not known): the fastest sensor (IMX766, up to 1488 Mpixel/s) gets the
++ * engine with the largest DMA FIFO (camsv1, 3412), the slowest (S5KGD1SP,
++ * 346 Mpixel/s) the single engine with the smallest (camsv5, 352). To move a
++ * sensor to another engine, swap the remote-endpoint pairs of the seninf
++ * output ports (port@3..5) and the camsv endpoints below. Verified on the
++ * phone 2026-11-09..11: all three stream at once, 30 fps each.
++ *
++ * Power: the MT6319 buck vbuck1 is the camera/ISP vcore ("VMM") rail and the
++ * supply of the CAM and ISP power domain trees (CAM_VCORE -> CAM_MAIN ->
++ * SUBA/SUBB and CCU, ISP_VCORE -> ISP_MAIN -> DIP1); the camsys and imgsys
++ * clock controllers live in those domains. Nothing switches a domain on by
++ * itself: the sensor interface and the CAMSV engines take CAM_MAIN by
++ * runtime PM, at probe (the engine is reset once) and while streaming. The
++ * sensors are powered by their drivers (probe: chip ID, then off; on again
++ * for streaming). Their rails are GPIO load switches (regulator-fixed):
++ * DOVDD (GPIO194) is shared by the three sensors and AFVDD (GPIO193) by the
++ * two VCMs, one regulator each with several consumers, counted by the
++ * regulator core. Reset and power down lines are the sensor drivers' GPIOs.
++ *
++ * Paths to memory: camsv1 larb14 -> cam sub-common 1; camsv2 larb13 and
++ * camsv5 larb29 -> cam sub-common 0; both sub-commons -> cam-vcore
++ * sub-common -> smi-common -> M4U. Every CAMSV
++ * engine is its own media device ("mtk-camsv") with one video node, one
++ * seninf CSI port sub-device and one sensor (plus its lens); the libcamera
++ * simple pipeline handler makes one camera of each. A media graph completes
++ * only when its sensor (and VCM) driver is bound, so the modules can load in
++ * any order (udev loads them all at boot).
++ *
++ * The S5KGD1SP needs its sensor firmware patch, /lib/firmware/s5kgd1sp_tnp.bin,
++ * at stream start. The file is not distributed; the user has to supply it
++ * (format: drivers/media/i2c/s5kgd1sp.c).
++ *
++ * Sensors (factory device tree, Titan 2 V01.00.14):
++ * - main IMX766 on i2c8, MCLK CAMTG3 on GPIO94, avdd GPIO195, dvdd GPIO37,
++ *   reset GPIO26, power down GPIO28, VCM DW9800K at 0x0c (afvdd GPIO193);
++ * - front S5KGD1SP on i2c4, MCLK CAMTG5 on GPIO96, avdd GPIO192,
++ *   dvdd GPIO191, reset GPIO24, fixed focus;
++ * - second rear Hi-847 on i2c7, MCLK CAMTG2 on GPIO93, avdd GPIO188,
++ *   dvdd GPIO39, reset GPIO25, power down GPIO189, VCM DW9714 at 0x0c;
++ * - dovdd of all three: GPIO194.
++ *
++ * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
++ */
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/media/video-interfaces.h>
++
++/* ------------------------------------------------------------------ */
++/* VMM rail, CAM/ISP power domains, clock controllers                  */
++
++/*
++ * The MT6319 as the factory kernel uses it: vbuck1 is the camera/ISP vcore,
++ * switched with the camera power domains; vbuck2 (GPU) and vbuck4 (SoC
++ * vcore) stay always on and untouched, as in the base board file. vbuck1 is
++ * held at the top camera/ISP operating point of the downstream mmdvfs tables
++ * (0.7 V), since nothing scales it yet.
++ */
++&mt6319 {
++	status = "okay";
++
++	regulators {
++		mt6319_vbuck1: vbuck1 {
++			regulator-name = "6_vbuck1";
++			regulator-min-microvolt = <700000>;
++			regulator-max-microvolt = <700000>;
++			regulator-enable-ramp-delay = <256>;
++		};
++	};
++};
++
++&cam_vcore_pd {
++	domain-supply = <&mt6319_vbuck1>;
++	status = "okay";
++};
++
++&isp_vcore_pd {
++	domain-supply = <&mt6319_vbuck1>;
++	status = "okay";
++};
++
++/* subsys clocks of the CAM and ISP domains */
++&camsys_main {
++	status = "okay";
++};
++
++&camsys_mraw {
++	status = "okay";
++};
++
++&camsys_rawa {
++	status = "okay";
++};
++
++&camsys_rawb {
++	status = "okay";
++};
++
++&camsys_yuva {
++	status = "okay";
++};
++
++&camsys_yuvb {
++	status = "okay";
++};
++
++/* the cam-vcore sub-common is clocked by camsys_vcore */
++&camsys_vcore {
++	status = "okay";
++};
++
++&ccusys {
++	status = "okay";
++};
++
++&imgsys {
++	status = "okay";
++};
++
++&imgsys_vcore {
++	status = "okay";
++};
++
++/* ------------------------------------------------------------------ */
++/* MM IOMMU path of camsv1 (larb14), camsv2 (larb13), camsv5 (larb29)  */
++
++&smi_common {
++	status = "okay";
++};
++
++&smi_sub_common_cam_vcore {
++	status = "okay";
++};
++
++&smi_sub_common_cam0 {
++	status = "okay";
++};
++
++&smi_sub_common_cam1 {
++	status = "okay";
++};
++
++&larb13 {
++	status = "okay";
++};
++
++&larb14 {
++	status = "okay";
++};
++
++&larb29 {
++	status = "okay";
++};
++
++&m4u {
++	status = "okay";
++};
++
++/* ------------------------------------------------------------------ */
++/* Pads, buses, rails                                                  */
++
++&pio {
++	cam_i2c4_pins: cam-i2c4-pins {
++		pins-bus {
++			pinmux = <PINMUX_GPIO133__FUNC_SCL4>,
++				 <PINMUX_GPIO134__FUNC_SDA4>;
++		};
++	};
++
++	cam_i2c7_pins: cam-i2c7-pins {
++		pins-bus {
++			pinmux = <PINMUX_GPIO139__FUNC_SCL7>,
++				 <PINMUX_GPIO140__FUNC_SDA7>;
++		};
++	};
++
++	cam_i2c8_pins: cam-i2c8-pins {
++		pins-bus {
++			pinmux = <PINMUX_GPIO141__FUNC_SCL8>,
++				 <PINMUX_GPIO142__FUNC_SDA8>;
++		};
++	};
++
++	/*
++	 * MCLK pads; the drive strength is the MCLK_DRIVING_CURRENT step of
++	 * each factory power sequence: 4, 6 and 2 mA.
++	 */
++	cam_main_mclk_pins: cam-main-mclk-pins {
++		pins-mclk {
++			pinmux = <PINMUX_GPIO94__FUNC_CMMCLK2>;
++			drive-strength = <4>;
++		};
++	};
++
++	cam_front_mclk_pins: cam-front-mclk-pins {
++		pins-mclk {
++			pinmux = <PINMUX_GPIO96__FUNC_CMMCLK4>;
++			drive-strength = <6>;
++		};
++	};
++
++	cam_rear2_mclk_pins: cam-rear2-mclk-pins {
++		pins-mclk {
++			pinmux = <PINMUX_GPIO93__FUNC_CMMCLK1>;
++			drive-strength = <2>;
++		};
++	};
++};
++
++/* Sensor buses: the factory device tree runs all three at 1 MHz */
++&i2c4 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	clock-frequency = <1000000>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&cam_i2c4_pins>;
++};
++
++&i2c7 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	clock-frequency = <1000000>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&cam_i2c7_pins>;
++};
++
++&i2c8 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	clock-frequency = <1000000>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&cam_i2c8_pins>;
++};
++
++/ {
++	/*
++	 * Sensor rails: load switches / LDOs enabled by SoC GPIOs (the factory
++	 * imgsensor nodes drive them through pinctrl states, without any
++	 * -supply). Voltages as the GPL imgsensor power tables give them.
++	 */
++	cam_dovdd: regulator-cam-dovdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_dovdd";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&pio 194 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <1000>;
++	};
++
++	cam_afvdd: regulator-cam-afvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_afvdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&pio 193 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <1000>;
++	};
++
++	cam_main_avdd: regulator-cam-main-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_main_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&pio 195 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <1000>;
++	};
++
++	cam_main_dvdd: regulator-cam-main-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_main_dvdd";
++		regulator-min-microvolt = <1100000>;
++		regulator-max-microvolt = <1100000>;
++		gpio = <&pio 37 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <1000>;
++	};
++
++	cam_front_avdd: regulator-cam-front-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_front_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&pio 192 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <1000>;
++	};
++
++	cam_front_dvdd: regulator-cam-front-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_front_dvdd";
++		regulator-min-microvolt = <1100000>;
++		regulator-max-microvolt = <1100000>;
++		gpio = <&pio 191 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <1000>;
++	};
++
++	cam_rear2_avdd: regulator-cam-rear2-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_rear2_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&pio 188 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <1000>;
++	};
++
++	/*
++	 * TODO: the Hi-847 power sequence says 1.1 V, the GPL power table
++	 * 1.2 V; the switch has one output either way.
++	 */
++	cam_rear2_dvdd: regulator-cam-rear2-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "cam_rear2_dvdd";
++		regulator-min-microvolt = <1200000>;
++		regulator-max-microvolt = <1200000>;
++		gpio = <&pio 39 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <1000>;
++	};
++};
++
++/* ------------------------------------------------------------------ */
++/* Sensors and VCMs                                                    */
++
++/* S5KGD1SP, front, fixed focus */
++&i2c4 {
++	s5kgd1sp: camera@2d {
++		compatible = "samsung,s5kgd1sp";
++		reg = <0x2d>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam_front_mclk_pins>;
++		/* 24 MHz: univpll 192 MHz / 8 */
++		clocks = <&topckgen CLK_TOP_CAMTG5_SEL>;
++		assigned-clocks = <&topckgen CLK_TOP_CAMTG5_SEL>;
++		assigned-clock-parents = <&topckgen CLK_TOP_UVPLL192M_D8>;
++		assigned-clock-rates = <24000000>;
++		reset-gpios = <&pio 24 GPIO_ACTIVE_LOW>;
++		dovdd-supply = <&cam_dovdd>;
++		avdd-supply = <&cam_front_avdd>;
++		dvdd-supply = <&cam_front_dvdd>;
++		orientation = <0>;	/* front */
++		/* factory Android orientation 270 with the factory H + V flip */
++		rotation = <90>;
++
++		port {
++			s5kgd1sp_out: endpoint {
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <432000000>;
++				remote-endpoint = <&seninf_csi0_in>;
++			};
++		};
++	};
++};
++
++/* Hi-847, rear second, and its DW9714 VCM */
++&i2c7 {
++	hi847_vcm: lens@c {
++		compatible = "dongwoon,dw9714";
++		reg = <0x0c>;
++		vcc-supply = <&cam_afvdd>;
++	};
++
++	hi847: camera@20 {
++		compatible = "hynix,hi847";
++		reg = <0x20>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam_rear2_mclk_pins>;
++		/* 24 MHz: univpll 192 MHz / 8 */
++		clocks = <&topckgen CLK_TOP_CAMTG2_SEL>;
++		assigned-clocks = <&topckgen CLK_TOP_CAMTG2_SEL>;
++		assigned-clock-parents = <&topckgen CLK_TOP_UVPLL192M_D8>;
++		assigned-clock-rates = <24000000>;
++		reset-gpios = <&pio 25 GPIO_ACTIVE_LOW>;
++		powerdown-gpios = <&pio 189 GPIO_ACTIVE_LOW>;
++		dovdd-supply = <&cam_dovdd>;
++		avdd-supply = <&cam_rear2_avdd>;
++		dvdd-supply = <&cam_rear2_dvdd>;
++		lens-focus = <&hi847_vcm>;
++		orientation = <1>;	/* back */
++		/* factory Android orientation 90 */
++		rotation = <270>;
++
++		port {
++			hi847_out: endpoint {
++				data-lanes = <1 2 3 4>;
++				/* 24 MHz MCLK: 500 MHz for 3264x2448, 400 MHz for 1080p */
++				link-frequencies = /bits/ 64 <500000000 400000000>;
++				remote-endpoint = <&seninf_csi1_in>;
++			};
++		};
++	};
++};
++
++/* IMX766, rear main, and its DW9800K VCM */
++&i2c8 {
++	imx766_vcm: lens@c {
++		compatible = "dongwoon,dw9800k";
++		reg = <0x0c>;
++		vdd-supply = <&cam_afvdd>;
++		dongwoon,vcm-prescale = <0x60>;
++	};
++
++	imx766: camera@1a {
++		compatible = "sony,imx766";
++		reg = <0x1a>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam_main_mclk_pins>;
++		/* 24 MHz: univpll 192 MHz / 8 */
++		clocks = <&topckgen CLK_TOP_CAMTG3_SEL>;
++		assigned-clocks = <&topckgen CLK_TOP_CAMTG3_SEL>;
++		assigned-clock-parents = <&topckgen CLK_TOP_UVPLL192M_D8>;
++		assigned-clock-rates = <24000000>;
++		reset-gpios = <&pio 26 GPIO_ACTIVE_LOW>;
++		powerdown-gpios = <&pio 28 GPIO_ACTIVE_LOW>;
++		avdd-supply = <&cam_main_avdd>;
++		dvdd-supply = <&cam_main_dvdd>;
++		dovdd-supply = <&cam_dovdd>;
++		lens-focus = <&imx766_vcm>;
++		orientation = <1>;	/* back */
++		/* factory Android orientation 90 */
++		rotation = <270>;
++
++		port {
++			imx766_out: endpoint {
++				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++				data-lanes = <0 1 2>;
++				link-frequencies = /bits/ 64 <574000000 377000000>;
++				remote-endpoint = <&seninf_csi2_in>;
++			};
++		};
++	};
++};
++
++/* ------------------------------------------------------------------ */
++/* seninf: CSI ports 0..2 in, outputs 0..2 to camsv5, camsv2, camsv1    */
++
++&seninf {
++	status = "okay";
++};
++
++&seninf_port0 {
++	seninf_csi0_in: endpoint {
++		bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
++		data-lanes = <1 2 3 4>;
++		link-frequencies = /bits/ 64 <432000000>;
++		remote-endpoint = <&s5kgd1sp_out>;
++	};
++};
++
++&seninf_port1 {
++	seninf_csi1_in: endpoint {
++		bus-type = <MEDIA_BUS_TYPE_CSI2_DPHY>;
++		data-lanes = <1 2 3 4>;
++		link-frequencies = /bits/ 64 <500000000 400000000>;
++		remote-endpoint = <&hi847_out>;
++	};
++};
++
++/* C-PHY settle of the factory IMX766 modes 0 and 3 */
++&seninf_port2 {
++	seninf_csi2_in: endpoint {
++		bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++		data-lanes = <0 1 2>;
++		link-frequencies = /bits/ 64 <574000000 377000000>;
++		mediatek,cphy-settle-ns = <73 76>;
++		remote-endpoint = <&imx766_out>;
++	};
++};
++
++&seninf_port3 {
++	seninf_csi0_out: endpoint {
++		remote-endpoint = <&camsv5_in>;
++	};
++};
++
++&seninf_port4 {
++	seninf_csi1_out: endpoint {
++		remote-endpoint = <&camsv2_in>;
++	};
++};
++
++&seninf_port5 {
++	seninf_csi2_out: endpoint {
++		remote-endpoint = <&camsv1_in>;
++	};
++};
++
++/* ------------------------------------------------------------------ */
++/* CAMSV engines (iommus in mt6878.dtsi)                               */
++
++&camsv1 {
++	status = "okay";
++
++	port {
++		camsv1_in: endpoint {
++			remote-endpoint = <&seninf_csi2_out>;
++		};
++	};
++};
++
++&camsv2 {
++	status = "okay";
++
++	port {
++		camsv2_in: endpoint {
++			remote-endpoint = <&seninf_csi1_out>;
++		};
++	};
++};
++
++&camsv5 {
++	status = "okay";
++
++	port {
++		camsv5_in: endpoint {
++			remote-endpoint = <&seninf_csi0_out>;
++		};
++	};
++};
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi.example b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi.example
+new file mode 100644
+index 000000000000..b2b52c3c9699
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi.example
+@@ -0,0 +1,258 @@
++// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
++/*
++ * Unihertz Titan 2: camera sensors and autofocus VCMs (EXAMPLE, not built).
++ *
++ * Copyright (c) 2026 serlk
++ *
++ * Not included by any board dts. The seninf (CSI-2 receiver) driver does not
++ * exist yet, so the remote endpoints below are commented out; without them
++ * the sensor drivers fail to probe (they need an endpoint for the bus
++ * configuration).
++ *
++ *   sensor0  IMX766    rear main   i2c8 0x1a  C-PHY 3 trios  csi-port-2
++ *   sensor1  S5KGD1SP  front       i2c4 0x2d  D-PHY 4 lanes  csi-port-0
++ *   sensor4  Hi-847    rear second i2c7 0x20  D-PHY 4 lanes  csi-port-1
++ *
++ * I2C addresses are the factory 8-bit write addresses shifted right by one
++ * (0x34, 0x5a, 0x40); the factory device tree reg values (0x1a, 0x5a, 0x10) are not
++ * what the downstream driver uses on the bus. TODO: verify 0x2d and 0x20.
++ *
++ * Supplies are GPIO-switched load switches; DOVDD (GPIO194) is shared by all
++ * three sensors and VCAMAF (GPIO193) by both VCMs, so they are one
++ * regulator-fixed each and the regulator core counts the users.
++ *
++ * rotation: the user-space HAL reports the Android SENSOR_ORIENTATION (clockwise
++ * correction): IMX766 90, S5KGD1SP 270, Hi-847 90. The DT rotation property
++ * is the counter-clockwise angle (video-interface-devices.yaml), and
++ * libcamera's Android layer uses orientation = (360 - rotation) % 360 for
++ * both facings, so rotation = 270, 90, 270. For the S5KGD1SP this assumes
++ * the driver default flips (H mirror + V flip, the factory setting).
++ * TODO: check on the first frame of every sensor.
++ */
++
++#include <dt-bindings/clock/mediatek,mt6878-clock.h>
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/media/video-interfaces.h>
++
++/ {
++	vcam_dovdd: regulator-vcam-dovdd {
++		compatible = "regulator-fixed";
++		regulator-name = "vcam_dovdd";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&pio 194 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	vcamaf: regulator-vcamaf {
++		compatible = "regulator-fixed";
++		regulator-name = "vcamaf";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&pio 193 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	/* IMX766 */
++	vcam0_avdd: regulator-vcam0-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "vcam0_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&pio 195 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	vcam0_dvdd: regulator-vcam0-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "vcam0_dvdd";
++		regulator-min-microvolt = <1100000>;
++		regulator-max-microvolt = <1100000>;
++		gpio = <&pio 37 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	/* S5KGD1SP */
++	vcam1_avdd: regulator-vcam1-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "vcam1_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&pio 192 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	vcam1_dvdd: regulator-vcam1-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "vcam1_dvdd";
++		regulator-min-microvolt = <1100000>;
++		regulator-max-microvolt = <1100000>;
++		gpio = <&pio 191 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	/* Hi-847 */
++	vcam4_avdd: regulator-vcam4-avdd {
++		compatible = "regulator-fixed";
++		regulator-name = "vcam4_avdd";
++		regulator-min-microvolt = <2800000>;
++		regulator-max-microvolt = <2800000>;
++		gpio = <&pio 188 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++
++	vcam4_dvdd: regulator-vcam4-dvdd {
++		compatible = "regulator-fixed";
++		regulator-name = "vcam4_dvdd";
++		regulator-min-microvolt = <1100000>;
++		regulator-max-microvolt = <1100000>;
++		gpio = <&pio 39 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++	};
++};
++
++&pio {
++	/*
++	 * MCLK pads. drive-strength follows the MCLK_DRIVING_CURRENT step of
++	 * each factory power sequence (4, 6 and 2 mA). TODO: the
++	 * static isp_driving_current parameters say 4, 8 and 8 mA.
++	 */
++	cam0_mclk_pins: cam0-mclk-pins {
++		pins-mclk {
++			pinmux = <PINMUX_GPIO94__FUNC_CMMCLK2>;
++			drive-strength = <4>;
++		};
++	};
++
++	cam1_mclk_pins: cam1-mclk-pins {
++		pins-mclk {
++			pinmux = <PINMUX_GPIO96__FUNC_CMMCLK4>;
++			drive-strength = <6>;
++		};
++	};
++
++	cam4_mclk_pins: cam4-mclk-pins {
++		pins-mclk {
++			pinmux = <PINMUX_GPIO93__FUNC_CMMCLK1>;
++			drive-strength = <2>;
++		};
++	};
++};
++
++/* IMX766, rear main, and its DW9800 VCM */
++&i2c8 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	status = "okay";
++
++	vcm0: lens@c {
++		compatible = "dongwoon,dw9800k";
++		reg = <0x0c>;
++		vdd-supply = <&vcamaf>;
++		dongwoon,vcm-prescale = <0x60>;
++	};
++
++	camera@1a {
++		compatible = "sony,imx766";
++		reg = <0x1a>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam0_mclk_pins>;
++		clocks = <&topckgen CLK_TOP_CAMTG3_SEL>;
++		assigned-clocks = <&topckgen CLK_TOP_CAMTG3_SEL>;
++		/* univpll 192 MHz / 8 */
++		assigned-clock-parents = <&topckgen CLK_TOP_UVPLL192M_D8>;
++		assigned-clock-rates = <24000000>;
++		reset-gpios = <&pio 26 GPIO_ACTIVE_LOW>;
++		powerdown-gpios = <&pio 28 GPIO_ACTIVE_LOW>;
++		avdd-supply = <&vcam0_avdd>;
++		dvdd-supply = <&vcam0_dvdd>;
++		dovdd-supply = <&vcam_dovdd>;
++		lens-focus = <&vcm0>;
++		orientation = <1>;	/* back */
++		rotation = <270>;
++
++		port {
++			imx766_out: endpoint {
++				bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++				data-lanes = <0 1 2>;
++				link-frequencies = /bits/ 64 <574000000 377000000>;
++				/* remote-endpoint = <&seninf_csi2_in>; */
++			};
++		};
++	};
++};
++
++/* S5KGD1SP, front, fixed focus */
++&i2c4 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	status = "okay";
++
++	camera@2d {
++		compatible = "samsung,s5kgd1sp";
++		reg = <0x2d>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam1_mclk_pins>;
++		clocks = <&topckgen CLK_TOP_CAMTG5_SEL>;
++		assigned-clocks = <&topckgen CLK_TOP_CAMTG5_SEL>;
++		/* univpll 192 MHz / 8 */
++		assigned-clock-parents = <&topckgen CLK_TOP_UVPLL192M_D8>;
++		assigned-clock-rates = <24000000>;
++		reset-gpios = <&pio 24 GPIO_ACTIVE_LOW>;
++		avdd-supply = <&vcam1_avdd>;
++		dvdd-supply = <&vcam1_dvdd>;
++		dovdd-supply = <&vcam_dovdd>;
++		orientation = <0>;	/* front */
++		rotation = <90>;
++
++		port {
++			s5kgd1sp_out: endpoint {
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <432000000>;
++				/* remote-endpoint = <&seninf_csi0_in>; */
++			};
++		};
++	};
++};
++
++/* Hi-847, rear second, and its DW9714 VCM */
++&i2c7 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++	status = "okay";
++
++	vcm4: lens@c {
++		compatible = "dongwoon,dw9714";
++		reg = <0x0c>;
++		vcc-supply = <&vcamaf>;
++	};
++
++	camera@20 {
++		compatible = "hynix,hi847";
++		reg = <0x20>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&cam4_mclk_pins>;
++		clocks = <&topckgen CLK_TOP_CAMTG2_SEL>;
++		assigned-clocks = <&topckgen CLK_TOP_CAMTG2_SEL>;
++		/* univpll 192 MHz / 8 */
++		assigned-clock-parents = <&topckgen CLK_TOP_UVPLL192M_D8>;
++		assigned-clock-rates = <24000000>;
++		reset-gpios = <&pio 25 GPIO_ACTIVE_LOW>;
++		powerdown-gpios = <&pio 189 GPIO_ACTIVE_LOW>;
++		avdd-supply = <&vcam4_avdd>;
++		dvdd-supply = <&vcam4_dvdd>;
++		dovdd-supply = <&vcam_dovdd>;
++		lens-focus = <&vcm4>;
++		orientation = <1>;	/* back */
++		rotation = <270>;
++
++		port {
++			hi847_out: endpoint {
++				data-lanes = <1 2 3 4>;
++				/* 24 MHz MCLK: 500 MHz for 3264x2448, 400 MHz for 1080p */
++				link-frequencies = /bits/ 64 <500000000 400000000>;
++				/* remote-endpoint = <&seninf_csi1_in>; */
++			};
++		};
++	};
++};
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-iommu-camera.dtsi.example b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-iommu-camera.dtsi.example
+new file mode 100644
+index 000000000000..da9d2bfe2eab
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-iommu-camera.dtsi.example
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
++/*
++ * Titan 2: CAMSV through the MM IOMMU. EXAMPLE of the camsv1 path alone;
++ * the built description is mt6878-unihertz-titan2-cameras.dtsi (all three
++ * engines: larb13/14/29, both cam sub-commons), part of -all since
++ * 2026-11-11. Before that it was appended to the seninf test pattern board
++ * -camera-tpg (the CAM_VCORE/VMM chain of -camera and camsv1).
++ * Nothing here is LK-relevant: it only switches on SoC nodes and adds
++ * iommus, so the LK requirements of the base DTB are unchanged; run
++ * scripts/lk-fdt-check.py on the result anyway.
++ *
++ * Path of camsv1: larb14 (CAM_MAIN) -> cam sub-common 1 (CAM_MAIN) ->
++ * cam-vcore sub-common (CAM_VCORE) -> smi-common (MM_INFRA) -> M4U. The
++ * M4U needs one available larb to probe; larb14 is it here. The factory
++ * description gives camsv1 no iommus (its ports are in a "camisp-l14-1"
++ * helper node); mt6878.dtsi puts them on the engine, as the factory device tree does for
++ * camsv5. The CAMSV driver requires this path (it refuses to probe
++ * without an IOMMU).
++ *
++ * For camsv5 instead (larb29 ports 2 and 6), enable larb29 and
++ * smi_sub_common_cam0 as in the commented block; the seninf graph of
++ * -camera-tpg then has to end at camsv5.
++ */
++
++/* the cam-vcore sub-common is clocked by camsys_vcore */
++&camsys_vcore {
++	status = "okay";
++};
++
++&smi_common {
++	status = "okay";
++};
++
++&smi_sub_common_cam_vcore {
++	status = "okay";
++};
++
++&smi_sub_common_cam1 {
++	status = "okay";
++};
++
++&larb14 {
++	status = "okay";
++};
++
++&m4u {
++	status = "okay";
++};
++
++/*
++ * camsv1's iommus (larb14 ports 0 and 1) are in mt6878.dtsi.
++ *
++ * camsv5 instead (iommus: larb29 ports 2 and 6, also in the dtsi):
++ *
++ * &smi_sub_common_cam0 {
++ *	status = "okay";
++ * };
++ *
++ * &larb29 {
++ *	status = "okay";
++ * };
++ */
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-jpeg.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-jpeg.dts
+index 2b03f6e469f7..c6caa8422b44 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-jpeg.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-jpeg.dts
+@@ -17,6 +17,10 @@
+  * init values and bus selection while the display is running, as with
+  * the -iommu DTB.
+  *
++ * With the cameras (titan2-camera) -all has the M4U, and larb7 enabled
++ * here is bound to it too; without iommus on the encoder its ports keep
++ * MMU_EN clear and the physical addressing above still applies.
++ *
+  * If the encoder times out or the bus hangs, boot the -all DTB again.
+  *
+  * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+-- 
+2.56.0
+

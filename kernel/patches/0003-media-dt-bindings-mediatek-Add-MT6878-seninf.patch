@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:22:48 +0300
+Subject: [PATCH 03/12] media: dt-bindings: mediatek: Add MT6878 seninf
+
+Describe the sensor interface (seninf) of the MediaTek MT6878 camera
+subsystem: the CSI-2 D-PHY/C-PHY receivers of CSI ports 0..2 and their
+outputs toward the CAMSV capture engines, as a graph with one input and
+one output port per CSI port.
+
+The optional mediatek,cphy-settle-ns property gives fixed C-PHY settle
+times per link frequency, as some sensor modes require.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/mediatek,mt6878-seninf.yaml         | 195 ++++++++++++++++++
+ 1 file changed, 195 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/media/mediatek,mt6878-seninf.yaml
+
+diff --git a/Documentation/devicetree/bindings/media/mediatek,mt6878-seninf.yaml b/Documentation/devicetree/bindings/media/mediatek,mt6878-seninf.yaml
+new file mode 100644
+index 000000000000..6693dd030648
+--- /dev/null
++++ b/Documentation/devicetree/bindings/media/mediatek,mt6878-seninf.yaml
+@@ -0,0 +1,195 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/media/mediatek,mt6878-seninf.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: MediaTek MT6878 sensor interface (seninf)
++
++maintainers:
++  - serlk <22211586+Serlk@users.noreply.github.com>
++
++description:
++  The sensor interface of the MT6878 camera subsystem receives MIPI CSI-2
++  streams on its CSI ports, each a combined D-PHY (up to 4 data lanes and
++  a clock lane) and C-PHY (up to 3 trios) receiver, and routes them
++  through seninf interfaces, seninf muxes and cam muxes to the capture
++  engines (CAMSV). Each seninf interface also has a test pattern
++  generator.
++
++properties:
++  compatible:
++    const: mediatek,mt6878-seninf
++
++  reg:
++    items:
++      - description: seninf interfaces, muxes and cam muxes
++      - description: CSI PHYs and CSI-2 MACs
++
++  reg-names:
++    items:
++      - const: seninf
++      - const: csi-rx
++
++  interrupts:
++    items:
++      - description: sensor interface (CSI-2 and mux status)
++      - description: timestamp recorder
++
++  interrupt-names:
++    items:
++      - const: seninf
++      - const: tsrec
++
++  clocks:
++    items:
++      - description: camsys main SENINF gate
++      - description: camsys main CAM gate
++      - description: camsys main CAMTG gate
++      - description: CSI receiver clock of CSI port 0 (seninf 1 and 2)
++      - description: CSI receiver clock of CSI port 1 (seninf 3 and 4)
++      - description: CSI receiver clock of CSI port 2 (seninf 5 and 6)
++
++  clock-names:
++    items:
++      - const: seninf
++      - const: cam
++      - const: camtg
++      - const: csi0
++      - const: csi1
++      - const: csi2
++
++  power-domains:
++    items:
++      - description: CAM_MAIN
++      - description: CSI_RX
++
++  nvmem-cells:
++    minItems: 1
++    maxItems: 3
++    description:
++      PHY calibration words (high-speed termination codes) of the CSI
++      ports, one 32-bit cell each.
++
++  nvmem-cell-names:
++    minItems: 1
++    maxItems: 3
++    items:
++      enum: [csi0, csi1, csi2]
++
++  ports:
++    $ref: /schemas/graph.yaml#/properties/ports
++
++    description:
++      Ports 0 to 2 are the CSI ports 0 to 2. Port 3 + n is the output of
++      CSI port n toward a CAMSV engine; a CSI port is used when its
++      output port is connected.
++
++    patternProperties:
++      "^port@[0-2]$":
++        $ref: /schemas/graph.yaml#/$defs/port-base
++        unevaluatedProperties: false
++        description: CSI port input, connected to an image sensor.
++
++        properties:
++          endpoint:
++            $ref: video-interfaces.yaml#
++            unevaluatedProperties: false
++
++            properties:
++              bus-type:
++                enum:
++                  - 1 # MEDIA_BUS_TYPE_CSI2_CPHY
++                  - 4 # MEDIA_BUS_TYPE_CSI2_DPHY
++
++              data-lanes:
++                description:
++                  Number of D-PHY data lanes (2 or 4) or C-PHY trios
++                  (1 to 3). The lanes are used in the fixed hardware
++                  order; reordering is not supported.
++                minItems: 1
++                maxItems: 4
++
++              link-frequencies: true
++
++              mediatek,cphy-settle-ns:
++                $ref: /schemas/types.yaml#/definitions/uint32-array
++                description:
++                  Fixed C-PHY high-speed settle time in ns for each entry
++                  of link-frequencies, in the same order. 0 selects the
++                  default settle time.
++
++            required:
++              - bus-type
++              - data-lanes
++
++            dependencies:
++              mediatek,cphy-settle-ns: [ link-frequencies ]
++
++      "^port@[3-5]$":
++        $ref: /schemas/graph.yaml#/properties/port
++        description: Output of CSI port (n - 3), connected to a CAMSV engine.
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - interrupts
++  - interrupt-names
++  - clocks
++  - clock-names
++  - power-domains
++  - ports
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/clock/mediatek,mt6878-clock.h>
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++    #include <dt-bindings/interrupt-controller/irq.h>
++    #include <dt-bindings/media/video-interfaces.h>
++    #include <dt-bindings/power/mediatek,mt6878-power.h>
++
++    seninf@1a00e000 {
++        compatible = "mediatek,mt6878-seninf";
++        reg = <0x1a00e000 0x18000>, <0x11c80000 0x30000>;
++        reg-names = "seninf", "csi-rx";
++        interrupts = <GIC_SPI 152 IRQ_TYPE_LEVEL_HIGH>,
++                     <GIC_SPI 149 IRQ_TYPE_LEVEL_HIGH>;
++        interrupt-names = "seninf", "tsrec";
++        clocks = <&camsys_main CLK_CAM_MAIN_SENINF>,
++                 <&camsys_main CLK_CAM_MAIN_CAM>,
++                 <&camsys_main CLK_CAM_MAIN_CAMTG>,
++                 <&topckgen CLK_TOP_SENINF_SEL>,
++                 <&topckgen CLK_TOP_SENINF1_SEL>,
++                 <&topckgen CLK_TOP_SENINF2_SEL>;
++        clock-names = "seninf", "cam", "camtg", "csi0", "csi1", "csi2";
++        power-domains = <&spm MT6878_POWER_DOMAIN_CAM_MAIN>,
++                        <&spm MT6878_POWER_DOMAIN_CSI_RX>;
++
++        ports {
++            #address-cells = <1>;
++            #size-cells = <0>;
++
++            port@2 {
++                reg = <2>;
++
++                seninf_csi2_in: endpoint {
++                    bus-type = <MEDIA_BUS_TYPE_CSI2_CPHY>;
++                    data-lanes = <0 1 2>;
++                    link-frequencies = /bits/ 64 <574000000 377000000>;
++                    mediatek,cphy-settle-ns = <73 76>;
++                    remote-endpoint = <&sensor_out>;
++                };
++            };
++
++            port@5 {
++                reg = <5>;
++
++                seninf_csi2_out: endpoint {
++                    remote-endpoint = <&camsv1_in>;
++                };
++            };
++        };
++    };
+-- 
+2.56.0
+

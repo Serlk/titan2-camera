@@ -1,0 +1,5027 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:22:48 +0300
+Subject: [PATCH 02/12] media: mediatek: camsv: Add MT6878 CAMSV capture driver
+
+A V4L2 capture driver for the CAMSV engine of MT6878. One engine, one tag
+(tag 2, the plain RAW image), one video node with a media sink pad; the
+source (a seninf subdev) is linked through the DT graph when its driver
+binds, and its stream is enabled with the capture.
+
+The command queue (CQ) builder writes 12-byte little-endian descriptors
+(control word plus an unaligned 64-bit value pointer) from the start of a
+DMA area and the written values from its end; long writes are split into
+511-word chunks, address/value pair lists into runs of consecutive
+registers, lists end with an END descriptor and are aligned to 16 bytes.
+On top of it the per-tag configuration and frame commands, the common
+channel configuration and the tag grouping are composed. The builder is
+pure data code with a safe profile that rejects what the descriptor
+format cannot express, and a failed composition never changes the
+session. KUnit tests cover the encoding, the space accounting, the
+alignment, a full first-frame composition and the rejections.
+
+Every buffer is one job: its CQ (configuration on the first job, the
+output address and commit on every job) is composed into a coherent
+slot, bound to the job's cookie and launched. The binding is released at
+the start of frame whose active cookie matches, and only then is the next
+job launched, so at most one set of outer settings is pending. The four
+IRQ handlers take a snapshot under one raw spinlock and queue it in a
+kfifo; their common threaded handler drains it as the single consumer,
+runs the cookie automaton and returns buffers with vb2. Reset errors are
+reported: a timeout fails the runtime resume, and on stream off it marks
+the engine wedged since its DMA may still be running. The engine is used
+behind the MM IOMMU only. There is no SMI clamp in mainline, and no
+QoS/DVFS; DMA FIFO thresholds use the MT6878 values of the ISP7SP driver.
+
+Based on mtk_cam-sv.c, mtk_cam-sv-regs.h, mtk_cam-engine*.h and
+mtk_cam-plat-mt6878.c of MediaTek's ISP7SP camsys driver (GPL-2.0), with
+the command queue and the engine handling written from a clean-room
+behavioural specification; no code of the factory firmware was used.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/media/platform/mediatek/Kconfig       |    1 +
+ drivers/media/platform/mediatek/Makefile      |    1 +
+ drivers/media/platform/mediatek/camsv/Kconfig |   34 +
+ .../media/platform/mediatek/camsv/Makefile    |    6 +
+ .../mediatek/camsv/mtk-camsv-cq-test.c        |  728 +++++++++++
+ .../platform/mediatek/camsv/mtk-camsv-cq.c    | 1120 +++++++++++++++++
+ .../platform/mediatek/camsv/mtk-camsv-cq.h    |  224 ++++
+ .../platform/mediatek/camsv/mtk-camsv-drv.c   |  386 ++++++
+ .../platform/mediatek/camsv/mtk-camsv-hw.c    |  983 +++++++++++++++
+ .../platform/mediatek/camsv/mtk-camsv-regs.h  |  137 ++
+ .../platform/mediatek/camsv/mtk-camsv-video.c |  985 +++++++++++++++
+ .../media/platform/mediatek/camsv/mtk-camsv.h |  273 ++++
+ 12 files changed, 4878 insertions(+)
+ create mode 100644 drivers/media/platform/mediatek/camsv/Kconfig
+ create mode 100644 drivers/media/platform/mediatek/camsv/Makefile
+ create mode 100644 drivers/media/platform/mediatek/camsv/mtk-camsv-cq-test.c
+ create mode 100644 drivers/media/platform/mediatek/camsv/mtk-camsv-cq.c
+ create mode 100644 drivers/media/platform/mediatek/camsv/mtk-camsv-cq.h
+ create mode 100644 drivers/media/platform/mediatek/camsv/mtk-camsv-drv.c
+ create mode 100644 drivers/media/platform/mediatek/camsv/mtk-camsv-hw.c
+ create mode 100644 drivers/media/platform/mediatek/camsv/mtk-camsv-regs.h
+ create mode 100644 drivers/media/platform/mediatek/camsv/mtk-camsv-video.c
+ create mode 100644 drivers/media/platform/mediatek/camsv/mtk-camsv.h
+
+diff --git a/drivers/media/platform/mediatek/Kconfig b/drivers/media/platform/mediatek/Kconfig
+index 84104e2cd024..17f5c62311d1 100644
+--- a/drivers/media/platform/mediatek/Kconfig
++++ b/drivers/media/platform/mediatek/Kconfig
+@@ -2,6 +2,7 @@
+ 
+ comment "Mediatek media platform drivers"
+ 
++source "drivers/media/platform/mediatek/camsv/Kconfig"
+ source "drivers/media/platform/mediatek/jpeg/Kconfig"
+ source "drivers/media/platform/mediatek/mdp/Kconfig"
+ source "drivers/media/platform/mediatek/vcodec/Kconfig"
+diff --git a/drivers/media/platform/mediatek/Makefile b/drivers/media/platform/mediatek/Makefile
+index 38e6ba917fe5..bb701e03d268 100644
+--- a/drivers/media/platform/mediatek/Makefile
++++ b/drivers/media/platform/mediatek/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0-only
++obj-y += camsv/
+ obj-y += jpeg/
+ obj-y += mdp/
+ obj-y += vcodec/
+diff --git a/drivers/media/platform/mediatek/camsv/Kconfig b/drivers/media/platform/mediatek/camsv/Kconfig
+new file mode 100644
+index 000000000000..5b4f57471a6b
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camsv/Kconfig
+@@ -0,0 +1,34 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config VIDEO_MEDIATEK_CAMSV
++	tristate "MediaTek MT6878 CAMSV capture driver"
++	depends on V4L_PLATFORM_DRIVERS
++	depends on VIDEO_DEV
++	select MEDIA_CONTROLLER
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on PM
++	select MFD_SYSCON
++	select VIDEOBUF2_DMA_CONTIG
++	select V4L2_FWNODE
++	select VIDEO_V4L2_SUBDEV_API
++	select VIDEO_MEDIATEK_CAMSV_CQ
++	help
++	  Support for the CAMSV ("camera simple") capture engine of the
++	  MediaTek MT6878 SoC. It writes the image of a sensor interface
++	  (seninf) tag straight to memory and exposes it as a V4L2 video
++	  capture node.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called mtk-camsv-mt6878.
++
++config VIDEO_MEDIATEK_CAMSV_CQ
++	tristate
++
++config VIDEO_MEDIATEK_CAMSV_CQ_KUNIT_TEST
++	tristate "KUnit tests for the MediaTek CAMSV CQ builder" if !KUNIT_ALL_TESTS
++	depends on KUNIT && VIDEO_MEDIATEK_CAMSV_CQ
++	default KUNIT_ALL_TESTS
++	help
++	  Unit tests of the CAMSV command queue builder (descriptor format,
++	  splitting, alignment, composition and the safe profile checks).
++
++	  If unsure, say N.
+diff --git a/drivers/media/platform/mediatek/camsv/Makefile b/drivers/media/platform/mediatek/camsv/Makefile
+new file mode 100644
+index 000000000000..c1e2f942403a
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camsv/Makefile
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-$(CONFIG_VIDEO_MEDIATEK_CAMSV_CQ) += mtk-camsv-cq.o
++obj-$(CONFIG_VIDEO_MEDIATEK_CAMSV_CQ_KUNIT_TEST) += mtk-camsv-cq-test.o
++
++mtk-camsv-mt6878-y := mtk-camsv-drv.o mtk-camsv-hw.o mtk-camsv-video.o
++obj-$(CONFIG_VIDEO_MEDIATEK_CAMSV) += mtk-camsv-mt6878.o
+diff --git a/drivers/media/platform/mediatek/camsv/mtk-camsv-cq-test.c b/drivers/media/platform/mediatek/camsv/mtk-camsv-cq-test.c
+new file mode 100644
+index 000000000000..f05e713a0daa
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camsv/mtk-camsv-cq-test.c
+@@ -0,0 +1,728 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * KUnit tests for the MT6878 CAMSV CQ builder.
++ *
++ * The vectors follow the test cases of the specification the builder
++ * was written from.
++ *
++ * Copyright (c) 2026 serlk
++ */
++
++#include <kunit/test.h>
++#include <linux/module.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "mtk-camsv-cq.h"
++
++#define AREA_DMA	0x40000000ULL
++#define AREA_SIZE	4096
++
++#define C3		0x1a100000
++#define D3		0x1a110000
++#define C4		0x1a101000
++
++struct cq_pair {
++	u32 reg;
++	u32 val;
++	u32 desc;	/* index of the descriptor that carried it */
++};
++
++static u8 *cq_area(struct kunit *test, size_t size)
++{
++	u8 *p = kunit_kzalloc(test, size, GFP_KERNEL);
++
++	KUNIT_ASSERT_NOT_NULL(test, p);
++	return p;
++}
++
++static u32 desc_ctrl(const u8 *cpu, size_t off)
++{
++	return get_unaligned_le32(cpu + off);
++}
++
++static u64 desc_data(const u8 *cpu, size_t off)
++{
++	return get_unaligned_le64(cpu + off + 4);
++}
++
++/*
++ * Expand the list at @off (at most @len bytes, stops at END) into
++ * register/value pairs. Returns the number of pairs, or -1 if no END was
++ * found within @len.
++ */
++static int cq_collect(struct kunit *test, u8 *cpu, dma_addr_t dma,
++		      size_t size, size_t off, size_t len,
++		      struct cq_pair *out, int max)
++{
++	struct camsv_cq_builder view;
++	size_t pos;
++	int n = 0;
++	u32 d = 0;
++
++	KUNIT_ASSERT_EQ(test, camsv_cq_builder_init(&view, cpu, dma, size), 0);
++
++	for (pos = off; pos + CAMSV_CQ_DESC_SIZE <= off + len;
++	     pos += CAMSV_CQ_DESC_SIZE, d++) {
++		struct camsv_cq_cmd cmd;
++		u32 k;
++
++		KUNIT_ASSERT_EQ(test, camsv_cq_decode(&view, pos, &cmd), 0);
++		if (cmd.op == CAMSV_CQ_OP_END) {
++			KUNIT_EXPECT_EQ(test, cmd.data, 0ULL);
++			return n;
++		}
++		KUNIT_ASSERT_EQ(test, cmd.op, (u32)CAMSV_CQ_OP_WRITE);
++		for (k = 0; k < cmd.count; k++) {
++			u8 *v = camsv_cq_dma_to_cpu(&view, cmd.data + 4 * k);
++
++			KUNIT_ASSERT_NOT_NULL(test, v);
++			KUNIT_ASSERT_LT(test, n, max);
++			out[n].reg = cmd.reg + 4 * k;
++			out[n].val = get_unaligned_le32(v);
++			out[n].desc = d;
++			n++;
++		}
++	}
++	return -1;
++}
++
++static int cq_find(const struct cq_pair *p, int n, u32 reg, int from)
++{
++	int i;
++
++	for (i = from; i < n; i++)
++		if (p[i].reg == reg)
++			return i;
++	return -1;
++}
++
++/* one value at 0x1a100548 */
++static void cq_test_single_write(struct kunit *test)
++{
++	struct camsv_cq_builder b;
++	u8 *cpu = cq_area(test, 64);
++	u32 val = 0xdeadbeef;
++
++	KUNIT_ASSERT_EQ(test, camsv_cq_builder_init(&b, cpu, AREA_DMA, 64), 0);
++	KUNIT_ASSERT_EQ(test, camsv_cq_write(&b, 0x1a100548, &val, 1), 0);
++
++	KUNIT_EXPECT_EQ(test, desc_ctrl(cpu, 0), 0x80000548U);
++	KUNIT_EXPECT_EQ(test, desc_data(cpu, 0), AREA_DMA + 60);
++	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cpu + 60), 0xdeadbeefU);
++	KUNIT_EXPECT_EQ(test, camsv_cq_desc_bytes(&b), (size_t)12);
++	KUNIT_EXPECT_EQ(test, camsv_cq_value_bytes(&b), (size_t)4);
++	KUNIT_EXPECT_FALSE(test, b.failed);
++}
++
++/* 511 values in one descriptor, 512 in two */
++static void cq_test_split(struct kunit *test)
++{
++	struct camsv_cq_builder b;
++	u8 *cpu = cq_area(test, AREA_SIZE);
++	u32 *vals;
++
++	vals = kunit_kcalloc(test, 512, sizeof(*vals), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, vals);
++
++	KUNIT_ASSERT_EQ(test, camsv_cq_builder_init(&b, cpu, AREA_DMA, AREA_SIZE), 0);
++	KUNIT_ASSERT_EQ(test, camsv_cq_write(&b, 0x1a100548, vals, 511), 0);
++	KUNIT_EXPECT_EQ(test, desc_ctrl(cpu, 0), 0x81fe0548U);
++	KUNIT_EXPECT_EQ(test, camsv_cq_desc_bytes(&b), (size_t)12);
++
++	KUNIT_ASSERT_EQ(test, camsv_cq_builder_init(&b, cpu, AREA_DMA, AREA_SIZE), 0);
++	KUNIT_ASSERT_EQ(test, camsv_cq_write(&b, 0x1a100548, vals, 512), 0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_desc_bytes(&b), (size_t)24);
++	KUNIT_EXPECT_EQ(test, desc_ctrl(cpu, 0), 0x81fe0548U);
++	/* second chunk: register + 2044, one value */
++	KUNIT_EXPECT_EQ(test, desc_ctrl(cpu, 12), 0x80000548U + 2044);
++	KUNIT_EXPECT_EQ(test, desc_data(cpu, 12), desc_data(cpu, 0) + 2044);
++}
++
++/* a 16-byte area is full after one copied value */
++static void cq_test_area_16(struct kunit *test)
++{
++	struct camsv_cq_builder b;
++	u8 *cpu = cq_area(test, 16);
++	u32 val = 1;
++
++	KUNIT_ASSERT_EQ(test, camsv_cq_builder_init(&b, cpu, AREA_DMA, 16), 0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_write(&b, C3 + 0x548, &val, 1), 0);
++	KUNIT_EXPECT_EQ(test, b.desc_end, b.payload_begin);
++	KUNIT_EXPECT_EQ(test, camsv_cq_add_end(&b), -ENOMEM);
++	/* the previous write is kept */
++	KUNIT_EXPECT_EQ(test, camsv_cq_desc_bytes(&b), (size_t)12);
++	KUNIT_EXPECT_EQ(test, desc_ctrl(cpu, 0), 0x80000548U);
++}
++
++/* a 12-byte area fails at the descriptor, the value bytes stay used */
++static void cq_test_area_12(struct kunit *test)
++{
++	struct camsv_cq_builder b;
++	u8 *cpu = cq_area(test, 12);
++	u32 val = 1;
++
++	KUNIT_ASSERT_EQ(test, camsv_cq_builder_init(&b, cpu, AREA_DMA, 12), 0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_write(&b, C3 + 0x548, &val, 1), -ENOMEM);
++	KUNIT_EXPECT_EQ(test, camsv_cq_desc_bytes(&b), (size_t)0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_value_bytes(&b), (size_t)4);
++	KUNIT_EXPECT_TRUE(test, b.failed);
++}
++
++/* zero lengths */
++static void cq_test_zero_length(struct kunit *test)
++{
++	struct camsv_cq_builder b;
++	u8 *cpu = cq_area(test, 64);
++	u32 val = 0;
++
++	KUNIT_ASSERT_EQ(test, camsv_cq_builder_init(&b, cpu, AREA_DMA, 64), 0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_write_ref(&b, C3, AREA_DMA, 0), 0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_write_pairs(&b, &val, 0), 0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_desc_bytes(&b), (size_t)0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_write(&b, C3, &val, 0), -ENOMEM);
++	KUNIT_EXPECT_NULL(test, camsv_cq_reserve(&b, 0));
++
++	KUNIT_EXPECT_EQ(test, camsv_cq_builder_init(&b, NULL, AREA_DMA, 64), -EINVAL);
++	KUNIT_EXPECT_EQ(test, camsv_cq_builder_init(&b, cpu, AREA_DMA, 0), -EINVAL);
++}
++
++/* next list on a 16-byte boundary, gap untouched */
++static void cq_test_alignment(struct kunit *test)
++{
++	static const size_t gap[] = { 0, 12, 24, 36 };
++	u8 *cpu = cq_area(test, 128);
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(gap); i++) {
++		struct camsv_cq_builder b;
++		u8 copy[128];
++
++		memset(cpu, 0xa5, 128);
++		memcpy(copy, cpu, sizeof(copy));
++		KUNIT_ASSERT_EQ(test, camsv_cq_builder_init(&b, cpu,
++							    AREA_DMA + 4 * i, 128), 0);
++		KUNIT_EXPECT_EQ(test, camsv_cq_align_next(&b), 0);
++		KUNIT_EXPECT_EQ(test, camsv_cq_desc_bytes(&b), gap[i]);
++		KUNIT_EXPECT_MEMEQ(test, cpu, copy, sizeof(copy));
++	}
++}
++
++/* pairs A, A+4, A+12 make two runs; order and duplicates kept */
++static void cq_test_pairs(struct kunit *test)
++{
++	const u32 a = C3 + 0x548;
++	const u32 pairs[] = { a, 10, a + 4, 11, a + 12, 12 };
++	const u32 dup[] = { a, 1, a, 2 };
++	struct camsv_cq_builder b;
++	u8 *cpu = cq_area(test, AREA_SIZE);
++	u64 data;
++
++	KUNIT_ASSERT_EQ(test, camsv_cq_builder_init(&b, cpu, AREA_DMA, AREA_SIZE), 0);
++	KUNIT_ASSERT_EQ(test, camsv_cq_write_pairs(&b, pairs, ARRAY_SIZE(pairs)), 0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_desc_bytes(&b), (size_t)24);
++
++	KUNIT_EXPECT_EQ(test, desc_ctrl(cpu, 0), 0x80010548U);
++	data = desc_data(cpu, 0) - AREA_DMA;
++	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cpu + data), 10U);
++	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cpu + data + 4), 11U);
++
++	KUNIT_EXPECT_EQ(test, desc_ctrl(cpu, 12), 0x80000554U);
++	data = desc_data(cpu, 12) - AREA_DMA;
++	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cpu + data), 12U);
++
++	KUNIT_ASSERT_EQ(test, camsv_cq_builder_init(&b, cpu, AREA_DMA, AREA_SIZE), 0);
++	KUNIT_ASSERT_EQ(test, camsv_cq_write_pairs(&b, dup, ARRAY_SIZE(dup)), 0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_desc_bytes(&b), (size_t)24);
++
++	/* odd word count has no contract */
++	KUNIT_EXPECT_EQ(test, camsv_cq_write_pairs(&b, pairs, 3), -EINVAL);
++}
++
++/* Safe profile: no aliasing of registers outside the descriptor window */
++static void cq_test_reject_window(struct kunit *test)
++{
++	struct camsv_cq_builder b;
++	u8 *cpu = cq_area(test, 64);
++	u32 val = 0;
++
++	KUNIT_ASSERT_EQ(test, camsv_cq_builder_init(&b, cpu, AREA_DMA, 64), 0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_write(&b, 0x1a200000, &val, 1), -EINVAL);
++	KUNIT_EXPECT_EQ(test, camsv_cq_write(&b, 0x19fffffc, &val, 1), -EINVAL);
++	KUNIT_EXPECT_EQ(test, camsv_cq_write(&b, C3 + 2, &val, 1), -EINVAL);
++	KUNIT_EXPECT_EQ(test, camsv_cq_write_ref(&b, 0x1a1ffffc, AREA_DMA, 2),
++			-EINVAL);
++	KUNIT_EXPECT_EQ(test, camsv_cq_desc_bytes(&b), (size_t)0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_value_bytes(&b), (size_t)0);
++}
++
++static void cq_test_formats(struct kunit *test)
++{
++	static const struct {
++		u32 in, hw;
++		bool unpack;
++	} tbl[] = {
++		{ 0x00, 0, false }, { 0x4c, 0, false },
++		{ 0x01, 1, false }, { 0x4d, 1, false }, { 0x05, 1, true },
++		{ 0x02, 2, false }, { 0x4e, 2, false }, { 0x06, 2, true },
++		{ 0x03, 4, false }, { 0x4f, 4, false }, { 0x07, 4, true },
++		{ 0x0f, 3, false }, { 0x12, 3, false },
++		{ 0x50, 8, false }, { 0x04, 0, false }, { 0x99, 0, false },
++	};
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(tbl); i++) {
++		bool unpack;
++
++		KUNIT_EXPECT_EQ(test, camsv_cq_format_hw(tbl[i].in, &unpack),
++				tbl[i].hw);
++		KUNIT_EXPECT_EQ(test, unpack, tbl[i].unpack);
++	}
++	KUNIT_EXPECT_EQ(test, camsv_cq_format_word(0x4c), 0x06000000U);
++	KUNIT_EXPECT_EQ(test, camsv_cq_format_word(0x4d), 0x06810001U);
++	KUNIT_EXPECT_EQ(test, camsv_cq_format_word(0x4e), 0x06820002U);
++	KUNIT_EXPECT_EQ(test, camsv_cq_format_word(0x4f), 0x06830004U);
++	KUNIT_EXPECT_EQ(test, camsv_cq_format_word(0x05), 0x41U);
++}
++
++/* One channel (h = 3), tag 2, first-frame configuration plus one frame. */
++static void cq_setup_single(struct camsv_cq_state *s, u32 in_fmt,
++			    u32 out_fmt, u16 w, u16 h, u16 stride, u64 dma)
++{
++	struct camsv_cq_tag cfg = {
++		.tag_id = 2,
++		.tag_order = 0,
++		.pixel_mode = 3,
++		.input_format = in_fmt,
++		.crop_width = w,
++		.crop_height = h,
++	};
++
++	camsv_cq_state_init(s);
++	camsv_cq_config_begin(s);
++	WARN_ON(camsv_cq_config_add(s, 0, 0, 3, &cfg, true, false, false));
++	camsv_cq_frame_begin(s, 0x12345);
++	WARN_ON(camsv_cq_frame_set_output(s, 3, 2, out_fmt, stride, dma,
++					  (u64)stride * h));
++}
++
++static void cq_test_full_sequence(struct kunit *test)
++{
++	static const struct {
++		u32 reg, val;
++	} exp[] = {
++		/* configuration */
++		{ C3 + 0x5c8, 0x0fa00000 }, { C3 + 0x5cc, 0x0bb80000 },
++		{ C3 + 0x5d4, 1 }, { C3 + 0x5dc, 1 }, { C3 + 0x5c0, 0x8000 },
++		{ D3 + 0x290, 0x13900010 }, { D3 + 0xa90, 0x10 },
++		/* frame */
++		{ C3 + 0x5d4, 8 }, { D3 + 0x290, 0x13900010 },
++		{ D3 + 0x280, 0x23456000 }, { D3 + 0x284, 1 },
++		{ D3 + 0x298, 0 }, { D3 + 0x29c, 0 }, { D3 + 0x2a0, 0 },
++		{ D3 + 0x2a4, 0 }, { C3 + 0x5c0, 0x8080 },
++		/* common configuration */
++		{ C3 + 0x140, 1 }, { C3 + 0x18c, 3 }, { C3 + 0x170, 0x20 },
++		{ C3 + 0x144, 0 }, { C3 + 0x040, 4 }, { C3 + 0x044, 4 },
++		{ D3 + 0xf30, 0x404 }, { C3 + 0x344, 0xf0000 },
++		{ C3 + 0x34c, 0x1c001 }, { C3 + 0x35c, 0x400 },
++		{ C3 + 0x36c, 0x11111111 },
++		/* routing */
++		{ C3 + 0x1d4, 0 }, { C3 + 0x1d8, 0 },
++		/* grouping, first frame: no mode write */
++		{ C3 + 0x1b8, 4 }, { C3 + 0x1bc, 0 }, { C3 + 0x1c0, 0 },
++		{ C3 + 0x1c4, 0 }, { C3 + 0x1cc, 4 }, { C3 + 0x1c8, 4 },
++		/* cookies */
++		{ C3 + 0x57c, 0x12345 }, { C3 + 0x5bc, 0x12345 },
++		{ C3 + 0x5fc, 0x12345 }, { C3 + 0x63c, 0x12345 },
++		{ C3 + 0x67c, 0x12345 }, { C3 + 0x6bc, 0x12345 },
++		{ C3 + 0x6fc, 0x12345 }, { C3 + 0x73c, 0x12345 },
++	};
++	struct camsv_cq_state *s, *scratch;
++	struct cq_pair got[64];
++	u8 *cpu = cq_area(test, AREA_SIZE);
++	u32 off, len;
++	unsigned int i;
++	int n;
++
++	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
++	scratch = kunit_kzalloc(test, sizeof(*scratch), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	KUNIT_ASSERT_NOT_NULL(test, scratch);
++
++	cq_setup_single(s, CAMSV_CQ_FMT_BAYER10, CAMSV_CQ_FMT_BAYER10_MIPI,
++			4000, 3000, 5008, 0x123456000ULL);
++	KUNIT_ASSERT_EQ(test, camsv_cq_compose_single(s, scratch, cpu, AREA_DMA,
++						      AREA_SIZE, &off, &len), 0);
++	KUNIT_EXPECT_EQ(test, off, 0U);
++	KUNIT_EXPECT_EQ(test, len, (u32)(ARRAY_SIZE(exp) + 1) * 12);
++
++	n = cq_collect(test, cpu, AREA_DMA, AREA_SIZE, off, len, got,
++		       ARRAY_SIZE(got));
++	KUNIT_ASSERT_EQ(test, n, (int)ARRAY_SIZE(exp));
++	for (i = 0; i < ARRAY_SIZE(exp); i++) {
++		KUNIT_EXPECT_EQ_MSG(test, got[i].reg, exp[i].reg, "pair %u", i);
++		KUNIT_EXPECT_EQ_MSG(test, got[i].val, exp[i].val, "pair %u", i);
++		/* every write is its own descriptor */
++		KUNIT_EXPECT_EQ(test, got[i].desc, i);
++	}
++
++	/* flags were consumed, first_frame cleared, caches updated */
++	KUNIT_EXPECT_FALSE(test, s->ch[0].tags[0].config_pending);
++	KUNIT_EXPECT_FALSE(test, s->ch[0].tags[0].frame_pending);
++	KUNIT_EXPECT_FALSE(test, s->ch[0].first_frame);
++	KUNIT_EXPECT_EQ(test, s->ch[0].cached_groups[0], 4U);
++	KUNIT_EXPECT_EQ(test, s->cached_first, 4U);
++	KUNIT_EXPECT_EQ(test, s->cached_last, 4U);
++}
++
++/* compressed output 0x4d, stride 100, height 10 */
++static void cq_test_compressed(struct kunit *test)
++{
++	const u64 dma = 0x80000000ULL;
++	struct camsv_cq_state *s, *scratch;
++	struct cq_pair got[96];
++	u8 *cpu = cq_area(test, AREA_SIZE);
++	u32 off, len;
++	int n, i;
++
++	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
++	scratch = kunit_kzalloc(test, sizeof(*scratch), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	KUNIT_ASSERT_NOT_NULL(test, scratch);
++
++	cq_setup_single(s, 0x4d, 0x4d, 64, 10, 100, dma);
++	KUNIT_ASSERT_EQ(test, camsv_cq_compose_single(s, scratch, cpu, AREA_DMA,
++						      AREA_SIZE, &off, &len), 0);
++	n = cq_collect(test, cpu, AREA_DMA, AREA_SIZE, off, len, got,
++		       ARRAY_SIZE(got));
++	KUNIT_ASSERT_GT(test, n, 0);
++
++	i = cq_find(got, n, D3 + 0x280, 0);
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_EXPECT_EQ(test, got[i].val, (u32)(dma + 4096));
++
++	i = cq_find(got, n, D3 + 0xa80, 0);
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_EXPECT_EQ(test, got[i].val, (u32)(dma + 5136));
++
++	/* geometry from the width, in configuration and frame */
++	i = cq_find(got, n, D3 + 0xa90, 0);
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_EXPECT_EQ(test, got[i].val, 0x00100010U);
++	i = cq_find(got, n, D3 + 0xa90, i + 1);
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_EXPECT_EQ(test, got[i].val, 0x00100010U);
++
++	i = cq_find(got, n, C3 + 0x5d4, 0);
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_EXPECT_EQ(test, got[i].val, 0x06810001U);
++}
++
++/* ring off -> four zero registers; ring on for tag < 4 */
++static void cq_test_ring(struct kunit *test)
++{
++	struct camsv_cq_state *s, *scratch;
++	struct cq_pair got[64];
++	u8 *cpu = cq_area(test, AREA_SIZE);
++	u32 off, len;
++	int n, i;
++
++	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
++	scratch = kunit_kzalloc(test, sizeof(*scratch), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	KUNIT_ASSERT_NOT_NULL(test, scratch);
++
++	cq_setup_single(s, 1, 1, 640, 480, 800, 0x900000000ULL);
++	KUNIT_ASSERT_EQ(test, camsv_cq_compose_single(s, scratch, cpu, AREA_DMA,
++						      AREA_SIZE, &off, &len), 0);
++	n = cq_collect(test, cpu, AREA_DMA, AREA_SIZE, off, len, got,
++		       ARRAY_SIZE(got));
++	for (i = 0; i < 4; i++) {
++		int k = cq_find(got, n, D3 + 0x298 + 4 * i, 0);
++
++		KUNIT_ASSERT_GE(test, k, 0);
++		KUNIT_EXPECT_EQ(test, got[k].val, 0U);
++	}
++
++	cq_setup_single(s, 1, 1, 640, 480, 800, 0x900000000ULL);
++	s->ring_enabled = true;
++	s->ring_start_offset = 0x100;
++	KUNIT_ASSERT_EQ(test, camsv_cq_compose_single(s, scratch, cpu, AREA_DMA,
++						      AREA_SIZE, &off, &len), 0);
++	n = cq_collect(test, cpu, AREA_DMA, AREA_SIZE, off, len, got,
++		       ARRAY_SIZE(got));
++	i = cq_find(got, n, D3 + 0x298, 0);
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_EXPECT_EQ(test, got[i].val, 1U);
++	KUNIT_EXPECT_EQ(test, got[i + 1].val, 800U * 480);
++	KUNIT_EXPECT_EQ(test, got[i + 2].val, 0x00000100U);
++	KUNIT_EXPECT_EQ(test, got[i + 3].val, 0x80000009U);
++	/* the 4096 offset only applies to compressed data, not the ring */
++	i = cq_find(got, n, D3 + 0x280, 0);
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_EXPECT_EQ(test, got[i].val, 0U);
++}
++
++/* the repeated commit is a second descriptor, not a 2-word write */
++static void cq_test_repeat_commit(struct kunit *test)
++{
++	struct camsv_cq_state *s, *scratch;
++	struct cq_pair got[64];
++	u8 *cpu = cq_area(test, AREA_SIZE);
++	u32 off, len;
++	int n, i;
++
++	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
++	scratch = kunit_kzalloc(test, sizeof(*scratch), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	KUNIT_ASSERT_NOT_NULL(test, scratch);
++
++	cq_setup_single(s, 1, 1, 640, 480, 800, 0x1000000ULL);
++	s->repeat_commit = true;
++	KUNIT_ASSERT_EQ(test, camsv_cq_compose_single(s, scratch, cpu, AREA_DMA,
++						      AREA_SIZE, &off, &len), 0);
++	n = cq_collect(test, cpu, AREA_DMA, AREA_SIZE, off, len, got,
++		       ARRAY_SIZE(got));
++
++	i = cq_find(got, n, C3 + 0x5c0, 0);		/* config 0x8000 */
++	i = cq_find(got, n, C3 + 0x5c0, i + 1);		/* frame commit */
++	KUNIT_ASSERT_GE(test, i, 0);
++	KUNIT_ASSERT_LT(test, i + 1, n);
++	KUNIT_EXPECT_EQ(test, got[i].val, 0x8080U);
++	KUNIT_EXPECT_EQ(test, got[i + 1].reg, (u32)(C3 + 0x5c0));
++	KUNIT_EXPECT_EQ(test, got[i + 1].val, 0x8080U);
++	KUNIT_EXPECT_NE(test, got[i].desc, got[i + 1].desc);
++}
++
++/* 0x320a is in T and may be in E, never in M */
++static void cq_test_scenario_320a(struct kunit *test)
++{
++	struct camsv_cq_state s;
++
++	camsv_cq_state_init(&s);
++	s.scenario = 0x320a;
++	s.exposure_count = 1;
++	s.previous_exposure_count = 1;
++	KUNIT_EXPECT_TRUE(test, camsv_cq_is_special_order(&s));
++	KUNIT_EXPECT_TRUE(test, camsv_cq_is_special_group(&s));
++	KUNIT_EXPECT_FALSE(test, camsv_cq_is_merged(&s));
++	KUNIT_EXPECT_FALSE(test, camsv_cq_is_exp_change(&s));
++	s.exposure_count = 2;
++	KUNIT_EXPECT_TRUE(test, camsv_cq_is_exp_change(&s));
++
++	s.scenario = 0;
++	s.software_feature = 1;
++	KUNIT_EXPECT_TRUE(test, camsv_cq_is_merged(&s));
++	KUNIT_EXPECT_TRUE(test, camsv_cq_is_special_group(&s));
++	KUNIT_EXPECT_FALSE(test, camsv_cq_is_special_order(&s));
++}
++
++static void cq_setup_two(struct camsv_cq_state *s, bool first)
++{
++	struct camsv_cq_tag a = { .tag_id = 2, .pixel_mode = 3,
++				  .input_format = 1,
++				  .crop_width = 64, .crop_height = 8 };
++	struct camsv_cq_tag b = { .tag_id = 0, .pixel_mode = 3,
++				  .input_format = 1,
++				  .crop_width = 64, .crop_height = 8 };
++
++	camsv_cq_config_begin(s);
++	WARN_ON(camsv_cq_config_add(s, 0, 0, 3, &a, first, false, false));
++	WARN_ON(camsv_cq_config_add(s, 1, 0, 4, &b, first, false, false));
++	camsv_cq_frame_begin(s, 7);
++}
++
++/* the first/last cache is shared by both channels */
++static void cq_test_shared_cache(struct kunit *test)
++{
++	struct camsv_cq_state *s;
++	struct camsv_cq_result res;
++	struct cq_pair got[96];
++	u8 *cpu = cq_area(test, AREA_SIZE);
++	int n;
++
++	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s);
++
++	camsv_cq_state_init(s);
++	cq_setup_two(s, true);
++	KUNIT_ASSERT_FALSE(test, camsv_cq_compose(s, cpu, AREA_DMA, AREA_SIZE, &res));
++	KUNIT_EXPECT_EQ(test, s->cached_first, 1U);
++	KUNIT_EXPECT_GT(test, res.sv_offset[1], 0U);
++
++	/* second configuration: same groups per channel, suppress allowed */
++	cq_setup_two(s, false);
++	KUNIT_ASSERT_FALSE(test, camsv_cq_compose(s, cpu, AREA_DMA, AREA_SIZE, &res));
++
++	n = cq_collect(test, cpu, AREA_DMA, AREA_SIZE, res.sv_offset[0],
++		       res.sv_size[0], got, ARRAY_SIZE(got));
++	KUNIT_ASSERT_GT(test, n, 0);
++	KUNIT_EXPECT_GE(test, cq_find(got, n, C3 + 0x1b8, 0), 0);
++	n = cq_collect(test, cpu, AREA_DMA, AREA_SIZE, res.sv_offset[1],
++		       res.sv_size[1], got, ARRAY_SIZE(got));
++	KUNIT_ASSERT_GT(test, n, 0);
++	KUNIT_EXPECT_GE(test, cq_find(got, n, C4 + 0x1b8, 0), 0);
++
++	/* control: one channel alone is suppressed the second time */
++	camsv_cq_state_init(s);
++	cq_setup_single(s, 1, 1, 64, 8, 80, 0x1000000ULL);
++	KUNIT_ASSERT_FALSE(test, camsv_cq_compose(s, cpu, AREA_DMA, AREA_SIZE, &res));
++	{
++		struct camsv_cq_tag cfg = { .tag_id = 2, .pixel_mode = 3,
++					    .input_format = 1,
++					    .crop_width = 64, .crop_height = 8 };
++
++		camsv_cq_config_begin(s);
++		KUNIT_ASSERT_EQ(test, camsv_cq_config_add(s, 0, 0, 3, &cfg, false,
++							  false, false), 0);
++	}
++	KUNIT_ASSERT_FALSE(test, camsv_cq_compose(s, cpu, AREA_DMA, AREA_SIZE, &res));
++	n = cq_collect(test, cpu, AREA_DMA, AREA_SIZE, res.sv_offset[0],
++		       res.sv_size[0], got, ARRAY_SIZE(got));
++	KUNIT_ASSERT_GT(test, n, 0);
++	KUNIT_EXPECT_LT(test, cq_find(got, n, C3 + 0x1b8, 0), 0);
++}
++
++/*
++ * out of space at every step. The composition fails, the flags it
++ * reached are consumed and first_frame is cleared; the kernel wrapper
++ * returns an error and leaves the session untouched.
++ */
++static void cq_test_enomem_injection(struct kunit *test)
++{
++	struct camsv_cq_state *s, *ref, *scratch;
++	struct camsv_cq_result res;
++	u8 *cpu = cq_area(test, AREA_SIZE);
++	const size_t need = 44 * 12 + 43 * 4;
++	u32 off, len;
++	size_t size;
++
++	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
++	ref = kunit_kzalloc(test, sizeof(*ref), GFP_KERNEL);
++	scratch = kunit_kzalloc(test, sizeof(*scratch), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	KUNIT_ASSERT_NOT_NULL(test, ref);
++	KUNIT_ASSERT_NOT_NULL(test, scratch);
++
++	for (size = 4; size < need; size += 4) {
++		cq_setup_single(s, 1, 0x50, 4000, 3000, 5008, 0x1000000ULL);
++		*ref = *s;
++
++		KUNIT_EXPECT_EQ_MSG(test, camsv_cq_compose_single(s, scratch, cpu,
++								  AREA_DMA, size,
++								  &off, &len),
++				    -ENOMEM, "size %zu", size);
++		KUNIT_EXPECT_MEMEQ(test, s, ref, sizeof(*s));
++
++		KUNIT_EXPECT_TRUE_MSG(test, camsv_cq_compose(s, cpu, AREA_DMA,
++							     size, &res),
++				      "size %zu", size);
++		KUNIT_EXPECT_FALSE(test, s->ch[0].tags[0].config_pending);
++		KUNIT_EXPECT_FALSE(test, s->ch[0].tags[0].frame_pending);
++		KUNIT_EXPECT_FALSE(test, s->ch[0].first_frame);
++	}
++
++	cq_setup_single(s, 1, 0x50, 4000, 3000, 5008, 0x1000000ULL);
++	KUNIT_EXPECT_EQ(test, camsv_cq_compose_single(s, scratch, cpu, AREA_DMA,
++						      need, &off, &len), 0);
++	KUNIT_EXPECT_EQ(test, len, 44U * 12);
++}
++
++/* Kernel profile: one device, channel 0, standalone list */
++static void cq_test_single_rejects(struct kunit *test)
++{
++	struct camsv_cq_tag cfg = { .tag_id = 2, .pixel_mode = 3,
++				    .input_format = 1,
++				    .crop_width = 64, .crop_height = 8 };
++	struct camsv_cq_state *s, *scratch;
++	u8 *cpu = cq_area(test, AREA_SIZE);
++	u32 off, len;
++
++	s = kunit_kzalloc(test, sizeof(*s), GFP_KERNEL);
++	scratch = kunit_kzalloc(test, sizeof(*scratch), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, s);
++	KUNIT_ASSERT_NOT_NULL(test, scratch);
++
++	/* channel 1 only */
++	camsv_cq_state_init(s);
++	camsv_cq_config_begin(s);
++	KUNIT_ASSERT_EQ(test, camsv_cq_config_add(s, 1, 0, 4, &cfg, true,
++						  false, false), 0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_compose_single(s, scratch, cpu, AREA_DMA,
++						      AREA_SIZE, &off, &len),
++			-EINVAL);
++
++	/* two non-empty channels */
++	camsv_cq_state_init(s);
++	cq_setup_two(s, true);
++	KUNIT_EXPECT_EQ(test, camsv_cq_compose_single(s, scratch, cpu, AREA_DMA,
++						      AREA_SIZE, &off, &len),
++			-EINVAL);
++
++	/* merged two-channel layout is rejected by the state check */
++	s->scenario = 0x101;
++	KUNIT_EXPECT_EQ(test, camsv_cq_check_state(s), -EINVAL);
++
++	/* merged list on one channel: nothing would terminate it */
++	cq_setup_single(s, 1, 1, 64, 8, 80, 0x1000000ULL);
++	s->scenario = 0x101;
++	KUNIT_EXPECT_EQ(test, camsv_cq_check_state(s), 0);
++	KUNIT_EXPECT_EQ(test, camsv_cq_compose_single(s, scratch, cpu, AREA_DMA,
++						      AREA_SIZE, &off, &len),
++			-EINVAL);
++
++	/* unsupported hardware id and tag */
++	KUNIT_EXPECT_EQ(test, camsv_cq_config_add(s, 0, 0, 9, &cfg, true,
++						  false, false), -EINVAL);
++	cq_setup_single(s, 1, 1, 64, 8, 80, 0x1000000ULL);
++	s->ch[0].channel_id = 2;
++	KUNIT_EXPECT_EQ(test, camsv_cq_check_state(s), -EINVAL);
++	cq_setup_single(s, 1, 1, 64, 8, 80, 0x1000000ULL);
++	s->ch[0].tags[0].tag_id = 8;
++	KUNIT_EXPECT_EQ(test, camsv_cq_check_state(s), -EINVAL);
++
++	/* geometry overflow */
++	cq_setup_single(s, 1, 1, 64, 8, 80, 0x1000000ULL);
++	s->ch[0].tags[0].crop_x = 0xfff0;
++	KUNIT_EXPECT_EQ(test, camsv_cq_check_state(s), -EINVAL);
++
++	/* nothing pending: empty answer, no error */
++	cq_setup_single(s, 1, 1, 64, 8, 80, 0x1000000ULL);
++	KUNIT_ASSERT_EQ(test, camsv_cq_compose_single(s, scratch, cpu, AREA_DMA,
++						      AREA_SIZE, &off, &len), 0);
++	KUNIT_ASSERT_EQ(test, camsv_cq_compose_single(s, scratch, cpu, AREA_DMA,
++						      AREA_SIZE, &off, &len), 0);
++	KUNIT_EXPECT_EQ(test, len, 0U);
++}
++
++static struct kunit_case camsv_cq_test_cases[] = {
++	KUNIT_CASE(cq_test_single_write),
++	KUNIT_CASE(cq_test_split),
++	KUNIT_CASE(cq_test_area_16),
++	KUNIT_CASE(cq_test_area_12),
++	KUNIT_CASE(cq_test_zero_length),
++	KUNIT_CASE(cq_test_alignment),
++	KUNIT_CASE(cq_test_pairs),
++	KUNIT_CASE(cq_test_reject_window),
++	KUNIT_CASE(cq_test_formats),
++	KUNIT_CASE(cq_test_full_sequence),
++	KUNIT_CASE(cq_test_compressed),
++	KUNIT_CASE(cq_test_ring),
++	KUNIT_CASE(cq_test_repeat_commit),
++	KUNIT_CASE(cq_test_scenario_320a),
++	KUNIT_CASE(cq_test_shared_cache),
++	KUNIT_CASE(cq_test_enomem_injection),
++	KUNIT_CASE(cq_test_single_rejects),
++	{}
++};
++
++static struct kunit_suite camsv_cq_test_suite = {
++	.name = "mtk-camsv-cq",
++	.test_cases = camsv_cq_test_cases,
++};
++
++kunit_test_suite(camsv_cq_test_suite);
++
++MODULE_IMPORT_NS("MTK_CAMSV_CQ");
++MODULE_DESCRIPTION("KUnit tests for the MediaTek MT6878 CAMSV CQ builder");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/mediatek/camsv/mtk-camsv-cq.c b/drivers/media/platform/mediatek/camsv/mtk-camsv-cq.c
+new file mode 100644
+index 000000000000..a116d88baf79
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camsv/mtk-camsv-cq.c
+@@ -0,0 +1,1120 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * MediaTek MT6878 CAMSV command queue (CQ) builder.
++ *
++ * Written from a clean-room behavioural specification; no code of the
++ * factory firmware was used.
++ *
++ * Copyright (c) 2026 serlk
++ */
++
++#include <linux/align.h>
++#include <linux/bits.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/kernel.h>
++#include <linux/limits.h>
++#include <linux/module.h>
++#include <linux/overflow.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "mtk-camsv-cq.h"
++
++#define CAMSV_CQ_NS	"MTK_CAMSV_CQ"
++
++/* Register offsets used by the composition. */
++#define CQ_C_DMA_EN		0x040
++#define CQ_C_DMA_EN_LOW		0x044
++#define CQ_C_SEN_MODE		0x140
++#define CQ_C_SUB_PERIOD		0x144
++#define CQ_C_ERR_CTL		0x170
++#define CQ_C_TIME_STAMP_CTL	0x18c
++#define CQ_C_GROUP(g)		(0x1b8 + 4 * (g))
++#define CQ_C_LAST_TAG		0x1c8
++#define CQ_C_FIRST_TAG		0x1cc
++#define CQ_C_DCIF_SET		0x1d4
++#define CQ_C_DCIF_SEL		0x1d8
++#define CQ_C_DONE_EN		0x344
++#define CQ_C_ERR_EN		0x34c
++#define CQ_C_SOF_EN		0x35c
++#define CQ_C_CHANNEL_EN		0x36c
++#define CQ_C_FBC0(t)		(0x540 + 0x40 * (t))
++#define CQ_C_GRAB_PXL(t)	(0x548 + 0x40 * (t))
++#define CQ_C_GRAB_LIN(t)	(0x54c + 0x40 * (t))
++#define CQ_C_FORMAT(t)		(0x554 + 0x40 * (t))
++#define CQ_C_CONFIG(t)		(0x55c + 0x40 * (t))
++#define CQ_C_COOKIE(t)		(0x57c + 0x40 * (t))
++
++#define CQ_D_ADDR(t)		(0x200 + 0x40 * (t))
++#define CQ_D_ADDR_MSB(t)	(0x204 + 0x40 * (t))
++#define CQ_D_BASIC(t)		(0x210 + 0x40 * (t))
++#define CQ_D_RING_EN(t)		(0x218 + 0x40 * (t))
++#define CQ_D_RING_SIZE(t)	(0x21c + 0x40 * (t))
++#define CQ_D_RING_ADDR(t)	(0x220 + 0x40 * (t))
++#define CQ_D_RING_ADDR_MSB(t)	(0x224 + 0x40 * (t))
++#define CQ_D_AUX_ADDR(t)	(0xa00 + 0x40 * (t))
++#define CQ_D_AUX_ADDR_MSB(t)	(0xa04 + 0x40 * (t))
++#define CQ_D_AUX_GEOM(t)	(0xa10 + 0x40 * (t))
++#define CQ_D_TAG_EN		0xf30
++
++#define CQ_FBC_CONFIG		0x8000
++#define CQ_FBC_FRAME		0x8080
++
++static u32 cq_c_base(u32 h)
++{
++	return 0x1a100000 + 0x1000 * (h - CAMSV_CQ_HW_ID_MIN);
++}
++
++static u32 cq_d_base(u32 h)
++{
++	return cq_c_base(h) + 0x10000;
++}
++
++static bool cq_hw_id_ok(u32 h)
++{
++	return h >= CAMSV_CQ_HW_ID_MIN && h <= CAMSV_CQ_HW_ID_MAX;
++}
++
++static size_t cq_free(const struct camsv_cq_builder *b)
++{
++	return b->payload_begin - b->desc_end;
++}
++
++/*
++ * Safe profile: the descriptor encodes 21 address bits below the fixed
++ * 0x1a000000 prefix; anything outside that window (or unaligned) is
++ * rejected instead of being silently aliased.
++ */
++static bool cq_reg_range_ok(u32 reg, size_t n)
++{
++	u64 last;
++
++	if (reg & 3 || reg < CAMSV_CQ_REG_PREFIX)
++		return false;
++	last = (u64)reg + 4 * ((u64)n - 1);
++	return last <= CAMSV_CQ_REG_LAST;
++}
++
++int camsv_cq_builder_init(struct camsv_cq_builder *b, void *cpu,
++			  dma_addr_t dma, size_t size)
++{
++	dma_addr_t last;
++
++	if (!cpu || !size)
++		return -EINVAL;
++	/* Integration requirement: the DMA range must not wrap. */
++	if (check_add_overflow(dma, (dma_addr_t)(size - 1), &last))
++		return -EINVAL;
++
++	b->cpu = cpu;
++	b->dma = dma;
++	b->capacity = size;
++	b->desc_end = 0;
++	b->payload_begin = size;
++	b->failed = false;
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_builder_init, CAMSV_CQ_NS);
++
++/* Arithmetic translation inside the area, 0/NULL outside. */
++dma_addr_t camsv_cq_cpu_to_dma(const struct camsv_cq_builder *b,
++			       const void *cpu)
++{
++	const u8 *p = cpu;
++
++	if (p < b->cpu || (size_t)(p - b->cpu) >= b->capacity)
++		return 0;
++	return b->dma + (p - b->cpu);
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_cpu_to_dma, CAMSV_CQ_NS);
++
++void *camsv_cq_dma_to_cpu(const struct camsv_cq_builder *b, dma_addr_t dma)
++{
++	if (dma < b->dma || dma - b->dma >= b->capacity)
++		return NULL;
++	return b->cpu + (dma - b->dma);
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_dma_to_cpu, CAMSV_CQ_NS);
++
++/* Values are taken from the end of the area. */
++void *camsv_cq_reserve(struct camsv_cq_builder *b, size_t n)
++{
++	if (!n || n > cq_free(b))
++		return NULL;
++	b->payload_begin -= n;
++	return b->cpu + b->payload_begin;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_reserve, CAMSV_CQ_NS);
++
++static void cq_put_desc(struct camsv_cq_builder *b, u32 ctrl, u64 data)
++{
++	u8 *p = b->cpu + b->desc_end;
++
++	put_unaligned_le32(ctrl, p);
++	put_unaligned_le64(data, p + 4);
++	b->desc_end += CAMSV_CQ_DESC_SIZE;
++}
++
++static u32 cq_write_ctrl(u32 reg, u32 count)
++{
++	return (reg & 0xffff) | ((count - 1) << 16) |
++	       (CAMSV_CQ_OP_WRITE << 25) | (((reg >> 16) & 0x1f) << 27);
++}
++
++/* Descriptors referring to values that already exist. */
++int camsv_cq_write_ref(struct camsv_cq_builder *b, u32 reg, dma_addr_t vals,
++		       size_t n)
++{
++	if (!n)
++		return 0;
++	if (n > SIZE_MAX / 4 || !cq_reg_range_ok(reg, n)) {
++		b->failed = true;
++		return -EINVAL;
++	}
++
++	while (n) {
++		u32 len = min_t(size_t, n, CAMSV_CQ_MAX_WORDS);
++
++		if (cq_free(b) < CAMSV_CQ_DESC_SIZE) {
++			/* Chunks written so far stay (no rollback). */
++			b->failed = true;
++			return -ENOMEM;
++		}
++		cq_put_desc(b, cq_write_ctrl(reg, len), vals);
++		reg += 4 * len;
++		vals += 4 * len;
++		n -= len;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_write_ref, CAMSV_CQ_NS);
++
++static int cq_copy_and_ref(struct camsv_cq_builder *b, u32 reg,
++			   const u32 *vals, size_t stride, size_t n)
++{
++	u8 *p;
++	size_t i;
++
++	p = camsv_cq_reserve(b, 4 * n);
++	if (!p) {
++		b->failed = true;
++		return -ENOMEM;
++	}
++	for (i = 0; i < n; i++)
++		put_unaligned_le32(vals[i * stride], p + 4 * i);
++
++	return camsv_cq_write_ref(b, reg, camsv_cq_cpu_to_dma(b, p), n);
++}
++
++/* Copy the values into the area, then describe them. */
++int camsv_cq_write(struct camsv_cq_builder *b, u32 reg, const u32 *vals,
++		   size_t n)
++{
++	if (!n) {
++		/* Zero bytes cannot be reserved: -ENOMEM, unlike the reservation of a value. */
++		b->failed = true;
++		return -ENOMEM;
++	}
++	if (n > SIZE_MAX / 4 || !cq_reg_range_ok(reg, n)) {
++		b->failed = true;
++		return -EINVAL;
++	}
++	return cq_copy_and_ref(b, reg, vals, 1, n);
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_write, CAMSV_CQ_NS);
++
++/*
++ * @m is the number of u32 words (address, value, ...).
++ * Maximal runs of consecutive addresses become one value array each; no
++ * sorting, no de-duplication.
++ */
++int camsv_cq_write_pairs(struct camsv_cq_builder *b, const u32 *pairs,
++			 size_t m)
++{
++	size_t npairs, i;
++
++	if (!m)
++		return 0;
++	if (m & 1) {
++		b->failed = true;
++		return -EINVAL;
++	}
++
++	npairs = m / 2;
++	for (i = 0; i < npairs; i++) {
++		size_t start = i;
++		int ret;
++
++		while (i + 1 < npairs &&
++		       pairs[2 * (i + 1)] == (u32)(pairs[2 * i] + 4))
++			i++;
++
++		if (!cq_reg_range_ok(pairs[2 * start], i - start + 1)) {
++			b->failed = true;
++			return -EINVAL;
++		}
++		ret = cq_copy_and_ref(b, pairs[2 * start], &pairs[2 * start + 1],
++				      2, i - start + 1);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_write_pairs, CAMSV_CQ_NS);
++
++int camsv_cq_add_end(struct camsv_cq_builder *b)
++{
++	if (cq_free(b) < CAMSV_CQ_DESC_SIZE) {
++		b->failed = true;
++		return -ENOMEM;
++	}
++	cq_put_desc(b, CAMSV_CQ_END_CTRL, 0);
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_add_end, CAMSV_CQ_NS);
++
++/*
++ * Move the descriptor end so that the next list starts on a
++ * 16-byte DMA boundary. The gap is left as it is.
++ */
++int camsv_cq_align_next(struct camsv_cq_builder *b)
++{
++	dma_addr_t addr = camsv_cq_cpu_to_dma(b, b->cpu + b->desc_end);
++	size_t k, next;
++
++	if (b->desc_end >= b->capacity)
++		addr = 0;
++	/* Safe profile: a base not aligned to 4 never reaches a boundary. */
++	if (addr & 3) {
++		b->failed = true;
++		return -EINVAL;
++	}
++	for (k = 0; k < 4; k++)
++		if (!((addr + CAMSV_CQ_DESC_SIZE * k) & 15))
++			break;
++
++	next = b->desc_end + CAMSV_CQ_DESC_SIZE * k;
++	if (next > b->payload_begin) {
++		b->failed = true;
++		return -ENOMEM;
++	}
++	b->desc_end = next;
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_align_next, CAMSV_CQ_NS);
++
++size_t camsv_cq_desc_bytes(const struct camsv_cq_builder *b)
++{
++	return b->desc_end;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_desc_bytes, CAMSV_CQ_NS);
++
++size_t camsv_cq_value_bytes(const struct camsv_cq_builder *b)
++{
++	return b->capacity - b->payload_begin;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_value_bytes, CAMSV_CQ_NS);
++
++/*
++ * Safe form: bounds are checked before the control word is
++ * read. The caller stops at CAMSV_CQ_OP_END and must not interpret the
++ * area behind it.
++ */
++int camsv_cq_decode(const struct camsv_cq_builder *b, size_t offset,
++		    struct camsv_cq_cmd *cmd)
++{
++	const u8 *p;
++	u32 ctrl;
++
++	if (offset > b->capacity ||
++	    b->capacity - offset < CAMSV_CQ_DESC_SIZE)
++		return -ERANGE;
++
++	p = b->cpu + offset;
++	ctrl = get_unaligned_le32(p);
++	cmd->op = (ctrl >> 25) & 3;
++	cmd->count = ((ctrl >> 16) & 0x1ff) + 1;
++	cmd->reg = CAMSV_CQ_REG_PREFIX | ((ctrl >> 27) << 16) | (ctrl & 0xffff);
++	cmd->data = get_unaligned_le64(p + 4);
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_decode, CAMSV_CQ_NS);
++
++u32 camsv_cq_format_hw(u32 format, bool *unpack)
++{
++	*unpack = false;
++
++	switch (format) {
++	case 0x00:
++	case 0x4c:
++		return 0;
++	case 0x01:
++	case 0x4d:
++		return 1;
++	case 0x05:
++		*unpack = true;
++		return 1;
++	case 0x02:
++	case 0x4e:
++		return 2;
++	case 0x06:
++		*unpack = true;
++		return 2;
++	case 0x03:
++	case 0x4f:
++		return 4;
++	case 0x07:
++		*unpack = true;
++		return 4;
++	case 0x0f ... 0x12:
++		return 3;
++	case 0x50:
++		return 8;
++	default:
++		/* Unknown codes encode as 0; callers filter formats first. */
++		return 0;
++	}
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_format_hw, CAMSV_CQ_NS);
++
++bool camsv_cq_format_is_compressed(u32 format)
++{
++	return format >= CAMSV_CQ_FMT_COMP_FIRST &&
++	       format <= CAMSV_CQ_FMT_COMP_LAST;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_format_is_compressed, CAMSV_CQ_NS);
++
++u32 camsv_cq_format_word(u32 format)
++{
++	bool unpack;
++	u32 word;
++
++	word = camsv_cq_format_hw(format, &unpack);
++	/*
++	 * TODO: the specification puts the unpack flag in bit 6; the
++	 * public ISP7SP register header has UNPACK_MODE at bit 4 of the
++	 * format register. The spec value is used.
++	 */
++	if (unpack)
++		word |= BIT(6);
++
++	if (camsv_cq_format_is_compressed(format)) {
++		word |= 0x06000000;
++		switch (format) {
++		case 0x4d:
++			word |= 0x00810000;
++			break;
++		case 0x4e:
++			word |= 0x00820000;
++			break;
++		case 0x4f:
++			word |= 0x00830000;
++			break;
++		default:
++			break;
++		}
++	}
++	return word;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_format_word, CAMSV_CQ_NS);
++
++static u32 cq_comp_geometry(u16 width)
++{
++	return 0x10 | (((u32)width * 1024 + 0xffc00) & 0x07f00000);
++}
++
++static bool cq_scenario_in(u32 scenario, const u32 *set, size_t n)
++{
++	size_t i;
++
++	for (i = 0; i < n; i++)
++		if (set[i] == scenario)
++			return true;
++	return false;
++}
++
++static const u32 cq_set_merged[] = {
++	0x101, 0x1005, 0x100e, 0x1106, 0x2104, 0x3008, 0x3109,
++};
++
++static const u32 cq_set_exp[] = {
++	0x1005, 0x100e, 0x1106, 0x1207, 0x3008, 0x3109, 0x320a,
++};
++
++static const u32 cq_set_order[] = {
++	0x3008, 0x3109, 0x320a,
++};
++
++static const u32 cq_set_route[] = {
++	0x101, 0x1005, 0x100e, 0x1106, 0x2104,
++};
++
++bool camsv_cq_is_merged(const struct camsv_cq_state *s)
++{
++	return cq_scenario_in(s->scenario, cq_set_merged,
++			      ARRAY_SIZE(cq_set_merged)) ||
++	       (s->scenario == 0 && s->software_feature == 1);
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_is_merged, CAMSV_CQ_NS);
++
++bool camsv_cq_is_exp_change(const struct camsv_cq_state *s)
++{
++	if (s->exposure_count == s->previous_exposure_count)
++		return false;
++	return cq_scenario_in(s->scenario, cq_set_exp, ARRAY_SIZE(cq_set_exp)) ||
++	       (s->scenario == 0 && s->software_feature == 1);
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_is_exp_change, CAMSV_CQ_NS);
++
++bool camsv_cq_is_special_order(const struct camsv_cq_state *s)
++{
++	return cq_scenario_in(s->scenario, cq_set_order,
++			      ARRAY_SIZE(cq_set_order));
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_is_special_order, CAMSV_CQ_NS);
++
++bool camsv_cq_is_special_group(const struct camsv_cq_state *s)
++{
++	return cq_scenario_in(s->scenario, cq_set_exp, ARRAY_SIZE(cq_set_exp)) ||
++	       s->software_feature == 1;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_is_special_group, CAMSV_CQ_NS);
++
++/* State preparation, reduced. */
++void camsv_cq_state_init(struct camsv_cq_state *s)
++{
++	memset(s, 0, sizeof(*s));
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_state_init, CAMSV_CQ_NS);
++
++void camsv_cq_config_begin(struct camsv_cq_state *s)
++{
++	unsigned int ch;
++
++	s->exposure_count = 0;
++	s->previous_exposure_count = 0;
++	s->scenario = 0;
++	s->ring_enabled = false;
++	s->ring_start_offset = 0;
++
++	/* Tag entries and per-channel flags; caches and ids are kept. */
++	for (ch = 0; ch < CAMSV_CQ_NUM_CHANNELS; ch++) {
++		memset(s->ch[ch].tags, 0, sizeof(s->ch[ch].tags));
++		s->ch[ch].first_frame = false;
++		s->ch[ch].dual_output = false;
++		s->ch[ch].suppress_last_metadata = false;
++	}
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_config_begin, CAMSV_CQ_NS);
++
++int camsv_cq_config_add(struct camsv_cq_state *s, unsigned int ch,
++			unsigned int index, u32 channel_id,
++			const struct camsv_cq_tag *cfg, bool first_frame,
++			bool dual_output, bool suppress_last_metadata)
++{
++	struct camsv_cq_channel *c;
++	struct camsv_cq_tag *e;
++
++	if (ch >= CAMSV_CQ_NUM_CHANNELS || index >= CAMSV_CQ_NUM_TAGS)
++		return -EINVAL;
++	/*
++	 * The message filter accepts 3..18; the builder can only address
++	 * 3..8, so the safe profile rejects the rest here.
++	 */
++	if (!cq_hw_id_ok(channel_id) || cfg->tag_id >= CAMSV_CQ_NUM_TAGS)
++		return -EINVAL;
++
++	c = &s->ch[ch];
++	e = &c->tags[index];
++	e->valid = true;
++	e->config_pending = true;
++	e->tag_id = cfg->tag_id;
++	e->tag_order = cfg->tag_order;
++	e->input_format = cfg->input_format;
++	e->pixel_mode = cfg->pixel_mode;
++	e->crop_x = cfg->crop_x;
++	e->crop_y = cfg->crop_y;
++	e->crop_width = cfg->crop_width;
++	e->crop_height = cfg->crop_height;
++
++	/* The last accepted entry wins. */
++	c->channel_id = channel_id;
++	c->first_frame = first_frame;
++	c->dual_output = dual_output;
++	c->suppress_last_metadata = suppress_last_metadata;
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_config_add, CAMSV_CQ_NS);
++
++void camsv_cq_frame_begin(struct camsv_cq_state *s, u32 cookie)
++{
++	unsigned int ch, i;
++
++	for (ch = 0; ch < CAMSV_CQ_NUM_CHANNELS; ch++) {
++		for (i = 0; i < CAMSV_CQ_NUM_TAGS; i++) {
++			struct camsv_cq_tag *e = &s->ch[ch].tags[i];
++
++			e->output_format = 0;
++			e->output_stride = 0;
++			e->output_dma = 0;
++			e->output_size = 0;
++		}
++	}
++	s->frame_cookie = cookie;
++	s->exposure_count = 1;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_frame_begin, CAMSV_CQ_NS);
++
++int camsv_cq_frame_set_output(struct camsv_cq_state *s, u32 channel_id,
++			      u8 tag_id, u32 format, u16 stride,
++			      u64 dma, u64 size)
++{
++	unsigned int ch, i;
++
++	if (!cq_hw_id_ok(channel_id))
++		return -EINVAL;
++
++	for (ch = 0; ch < CAMSV_CQ_NUM_CHANNELS; ch++) {
++		if (s->ch[ch].channel_id != channel_id)
++			continue;
++		for (i = 0; i < CAMSV_CQ_NUM_TAGS; i++) {
++			struct camsv_cq_tag *e = &s->ch[ch].tags[i];
++
++			if (e->tag_id != tag_id)
++				continue;
++			e->frame_pending = true;
++			e->output_format = format;
++			e->output_stride = stride;
++			e->output_dma = dma;
++			e->output_size = size;
++			return 0;
++		}
++	}
++	return -ENOENT;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_frame_set_output, CAMSV_CQ_NS);
++
++/* One register write; returns true on error. */
++static bool cq_w(struct camsv_cq_builder *b, u32 reg, u32 val)
++{
++	return camsv_cq_write(b, reg, &val, 1) != 0;
++}
++
++/* Grouping table for tag_id < 4 under G; -1 excludes the tag. */
++static int cq_special_group(unsigned int t, u32 exp, bool order)
++{
++	switch (t) {
++	case 0:
++		return exp >= 2 ? 0 : -1;
++	case 1:
++		if (exp == 2)
++			return order ? 0 : -1;
++		return exp == 3 ? 1 : -1;
++	default:
++		return exp == 1 ? 0 : 2;
++	}
++}
++
++/* Returns false on success or no change, true on error. */
++bool camsv_cq_group_tags(struct camsv_cq_builder *b, struct camsv_cq_state *s,
++			 unsigned int ch, bool suppress_unchanged,
++			 bool write_mode)
++{
++	struct camsv_cq_channel *c = &s->ch[ch];
++	bool g_set = camsv_cq_is_special_group(s);
++	bool t_set = camsv_cq_is_special_order(s);
++	u32 groups[CAMSV_CQ_NUM_GROUPS] = { };
++	u32 exp = s->exposure_count;
++	u32 f = 0, l = 0, first, last, base;
++	unsigned int i;
++
++	if (!cq_hw_id_ok(c->channel_id))
++		return false;
++	base = cq_c_base(c->channel_id);
++
++	for (i = 0; i < CAMSV_CQ_NUM_TAGS; i++) {
++		const struct camsv_cq_tag *e = &c->tags[i];
++		unsigned int t = e->tag_id;
++		int group;
++
++		if (!e->valid || t >= CAMSV_CQ_NUM_TAGS)
++			continue;
++		/*
++		 * TODO: the grouping rule is read as both skip rules
++		 * applying to tag_id 4..7 only.
++		 */
++		if (t >= 4) {
++			if (!e->crop_width || !e->crop_height)
++				continue;
++			if (e->tag_order == 2 &&
++			    (exp == 1 || c->suppress_last_metadata))
++				continue;
++		}
++
++		if (g_set && t < 4)
++			group = cq_special_group(t, exp, t_set);
++		else
++			group = e->tag_order <= 2 ? e->tag_order : -1;
++		if (group < 0)
++			continue;
++
++		groups[group] |= BIT(t);
++		if (group == 0 && (!f || BIT(t) < f))
++			f = BIT(t);
++		if (group == 2 && (!l || BIT(t) < l))
++			l = BIT(t);
++	}
++
++	if (t_set) {
++		if (exp == 1 && s->vsync_order == 0) {
++			if (groups[0] & BIT(2))
++				f = BIT(2);
++			if (groups[0] & BIT(3))
++				l = BIT(3);
++		} else if (exp == 1 && s->vsync_order == 1) {
++			if (groups[0] & BIT(2))
++				l = BIT(2);
++			if (groups[0] & BIT(3))
++				f = BIT(3);
++		} else if (exp == 2 && s->vsync_order == 0) {
++			if (groups[0] & BIT(0))
++				f = BIT(0);
++			if (groups[2] & BIT(3))
++				l = BIT(3);
++		} else if (exp == 2 && s->vsync_order == 1) {
++			if (groups[0] & BIT(1))
++				f = BIT(1);
++			if (groups[2] & BIT(2))
++				l = BIT(2);
++		}
++	}
++
++	first = f ? f : l;
++	last = l ? l : first;
++
++	if (suppress_unchanged &&
++	    !memcmp(groups, c->cached_groups, sizeof(groups)) &&
++	    first == s->cached_first && last == s->cached_last)
++		return false;
++
++	/* Caches are updated before any command is written. */
++	memcpy(c->cached_groups, groups, sizeof(groups));
++	s->cached_first = first;
++	s->cached_last = last;
++
++	if (write_mode) {
++		u32 mode = 3;
++
++		for (i = 0; i < CAMSV_CQ_NUM_TAGS; i++) {
++			if (!c->tags[i].valid)
++				continue;
++			if (c->tags[i].pixel_mode == 4)
++				mode = 0x13;
++			break;
++		}
++		/*
++		 * A failure of this write is not part of the result; the
++		 * builder's sticky failure flag still blocks publication.
++		 */
++		cq_w(b, base + CQ_C_SEN_MODE, mode);
++	}
++
++	for (i = 0; i < CAMSV_CQ_NUM_GROUPS; i++)
++		if (cq_w(b, base + CQ_C_GROUP(i), groups[i]))
++			return true;
++	if (cq_w(b, base + CQ_C_FIRST_TAG, first))
++		return true;
++	if (cq_w(b, base + CQ_C_LAST_TAG, last))
++		return true;
++	return false;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_group_tags, CAMSV_CQ_NS);
++
++struct cq_cfg_masks {
++	u32 tags;
++	u32 err;
++	u32 sof;
++};
++
++/* Returns true on a write error. */
++static bool cq_compose_config(struct camsv_cq_builder *b,
++			      const struct camsv_cq_channel *c,
++			      const struct camsv_cq_tag *e,
++			      struct cq_cfg_masks *m)
++{
++	u32 cb = cq_c_base(c->channel_id), db = cq_d_base(c->channel_id);
++	unsigned int t = e->tag_id;
++	u32 geom = 0x10;
++
++	if (cq_w(b, cb + CQ_C_GRAB_PXL(t),
++		 (u32)e->crop_x | ((u32)(e->crop_x + e->crop_width) << 16)))
++		return true;
++	if (cq_w(b, cb + CQ_C_GRAB_LIN(t),
++		 (u32)e->crop_y | ((u32)(e->crop_y + e->crop_height) << 16)))
++		return true;
++	if (cq_w(b, cb + CQ_C_FORMAT(t), camsv_cq_format_word(e->input_format)))
++		return true;
++	if (cq_w(b, cb + CQ_C_CONFIG(t), c->dual_output ? 0 : 1))
++		return true;
++	if (cq_w(b, cb + CQ_C_FBC0(t), CQ_FBC_CONFIG))
++		return true;
++	if (cq_w(b, db + CQ_D_BASIC(t), ((u32)e->output_stride << 16) | 0x10))
++		return true;
++	/*
++	 * TODO: the specification does not say whether the input or the
++	 * output format selects the compressed geometry; the input format
++	 * of the configuration entry is used.
++	 */
++	if (camsv_cq_format_is_compressed(e->input_format))
++		geom = cq_comp_geometry(e->crop_width);
++	if (cq_w(b, db + CQ_D_AUX_GEOM(t), geom))
++		return true;
++
++	m->tags |= BIT(t);
++	m->err |= 0x700 << (3 * t);
++	m->sof |= 4 << (4 * t);
++	return false;
++}
++
++/* Returns true on a write error. */
++static bool cq_compose_frame(struct camsv_cq_builder *b,
++			     const struct camsv_cq_state *s,
++			     const struct camsv_cq_channel *c,
++			     const struct camsv_cq_tag *e)
++{
++	u32 cb = cq_c_base(c->channel_id), db = cq_d_base(c->channel_id);
++	unsigned int t = e->tag_id;
++	bool ring = s->ring_enabled && t < 4;
++	bool comp = camsv_cq_format_is_compressed(e->output_format);
++	u64 data = e->output_dma, aux = 0, ring_addr = 0;
++	u32 ring_size = 0, ring_hi = 0;
++	bool err;
++
++	if (comp) {
++		u32 off = CAMSV_CQ_COMP_HEADER_SIZE +
++			  ALIGN((u32)e->output_stride, 8) * (u32)e->crop_height;
++
++		data = e->output_dma + CAMSV_CQ_COMP_HEADER_SIZE;
++		aux = e->output_dma + off;
++	}
++	if (ring) {
++		ring_addr = e->output_dma + s->ring_start_offset;
++		ring_size = lower_32_bits(e->output_size);
++		ring_hi = 0x80000000 | (upper_32_bits(ring_addr) & 0xf);
++	}
++
++	if (cq_w(b, cb + CQ_C_FORMAT(t), camsv_cq_format_word(e->output_format)) ||
++	    cq_w(b, db + CQ_D_BASIC(t), ((u32)e->output_stride << 16) | 0x10) ||
++	    cq_w(b, db + CQ_D_ADDR(t), lower_32_bits(data)) ||
++	    cq_w(b, db + CQ_D_ADDR_MSB(t), upper_32_bits(data)) ||
++	    cq_w(b, db + CQ_D_RING_EN(t), ring ? 1 : 0) ||
++	    cq_w(b, db + CQ_D_RING_SIZE(t), ring_size) ||
++	    cq_w(b, db + CQ_D_RING_ADDR(t), lower_32_bits(ring_addr)) ||
++	    cq_w(b, db + CQ_D_RING_ADDR_MSB(t), ring_hi))
++		return true;
++
++	if (comp &&
++	    (cq_w(b, db + CQ_D_AUX_GEOM(t), cq_comp_geometry(e->crop_width)) ||
++	     cq_w(b, db + CQ_D_AUX_ADDR(t), lower_32_bits(aux)) ||
++	     cq_w(b, db + CQ_D_AUX_ADDR_MSB(t), upper_32_bits(aux))))
++		return true;
++
++	/* The repeated commit is attempted even if the first one failed. */
++	err = cq_w(b, cb + CQ_C_FBC0(t), CQ_FBC_FRAME);
++	if (s->repeat_commit)
++		err |= cq_w(b, cb + CQ_C_FBC0(t), CQ_FBC_FRAME);
++	return err;
++}
++
++static u32 cq_route_select(const struct camsv_cq_state *s)
++{
++	if (camsv_cq_is_special_order(s))
++		return 1;
++	if (!cq_scenario_in(s->scenario, cq_set_route,
++			    ARRAY_SIZE(cq_set_route)) &&
++	    !(s->scenario == 0 && s->software_feature == 1) &&
++	    s->previous_exposure_count <= 1)
++		return 0;
++
++	switch (s->route_source_id) {
++	case 3:
++		return 1;
++	case 6:
++		return 2;
++	case 7:
++		return 3;
++	default:
++		return 0;
++	}
++}
++
++/*
++ * Configuration, frame and common commands for one channel. *err accumulates; *active reports
++ * whether the channel produced or was due to produce commands.
++ */
++static void cq_compose_channel(struct camsv_cq_builder *b,
++			       struct camsv_cq_state *s, unsigned int ch,
++			       bool *err, bool *active)
++{
++	struct camsv_cq_channel *c = &s->ch[ch];
++	bool exp_change = camsv_cq_is_exp_change(s);
++	bool had_config = false, had_frame = false;
++	struct cq_cfg_masks m = { };
++	u32 cb = 0, db = 0;
++	unsigned int i;
++
++	if (cq_hw_id_ok(c->channel_id)) {
++		cb = cq_c_base(c->channel_id);
++		db = cq_d_base(c->channel_id);
++	}
++
++	for (i = 0; i < CAMSV_CQ_NUM_TAGS; i++) {
++		struct camsv_cq_tag *e = &c->tags[i];
++
++		if (e->config_pending) {
++			e->config_pending = false;
++			had_config = true;
++			if (!*err)
++				*err = cq_compose_config(b, c, e, &m);
++		}
++		if (e->frame_pending) {
++			e->frame_pending = false;
++			had_frame = true;
++			if (!*err)
++				*err = cq_compose_frame(b, s, c, e);
++		}
++	}
++
++	/* common configuration, first part */
++	if (had_config && !*err) {
++		u32 mode = 1, low = m.tags & 0xf;
++
++		for (i = 0; i < CAMSV_CQ_NUM_TAGS; i++) {
++			if (!c->tags[i].valid)
++				continue;
++			if (c->tags[i].pixel_mode == 4)
++				mode = 0x11;
++			break;
++		}
++		*err = cq_w(b, cb + CQ_C_SEN_MODE, mode) ||
++		       cq_w(b, cb + CQ_C_TIME_STAMP_CTL, 3) ||
++		       cq_w(b, cb + CQ_C_ERR_CTL, 0x20) ||
++		       cq_w(b, cb + CQ_C_SUB_PERIOD, 0) ||
++		       cq_w(b, cb + CQ_C_DMA_EN, m.tags) ||
++		       cq_w(b, cb + CQ_C_DMA_EN_LOW, low) ||
++		       cq_w(b, db + CQ_D_TAG_EN, low | (low << 8)) ||
++		       cq_w(b, cb + CQ_C_DONE_EN, 0x000f0000) ||
++		       cq_w(b, cb + CQ_C_ERR_EN, 1 | m.err) ||
++		       cq_w(b, cb + CQ_C_SOF_EN, m.sof) ||
++		       cq_w(b, cb + CQ_C_CHANNEL_EN, 0x11111111);
++	}
++
++	/* common configuration, second part */
++	if (had_config || exp_change) {
++		bool first = c->first_frame;
++
++		c->first_frame = false;
++		if (!*err) {
++			u32 dcif = (camsv_cq_is_merged(s) ||
++				    s->previous_exposure_count > 1) ? 3 : 0;
++
++			*err = cq_w(b, cb + CQ_C_DCIF_SET, dcif) ||
++			       cq_w(b, cb + CQ_C_DCIF_SEL, cq_route_select(s));
++		}
++		if (!*err) {
++			if (first)
++				*err = camsv_cq_group_tags(b, s, ch, false, false);
++			else if (exp_change || c->suppress_last_metadata)
++				*err = camsv_cq_group_tags(b, s, ch, false, true);
++			else
++				*err = camsv_cq_group_tags(b, s, ch, true, true);
++		}
++	}
++
++	*active = had_config || had_frame || exp_change;
++}
++
++/*
++ * Both channels, in order. Returns false on success, true
++ * on any error; @res is only meaningful on success.
++ *
++ * This is the established behavior, including the known overwrite of a
++ * merged two-channel composition. Kernel users go through
++ * camsv_cq_compose_single(), which rejects such states first.
++ */
++bool camsv_cq_compose(struct camsv_cq_state *s, void *cpu, dma_addr_t dma,
++		      size_t size, struct camsv_cq_result *res)
++{
++	bool merged = camsv_cq_is_merged(s);
++	size_t desc_off = 0, val_used = 0;
++	bool err = false, write_failed = false;
++	unsigned int ch, t;
++
++	memset(res, 0, sizeof(*res));
++
++	for (ch = 0; ch < CAMSV_CQ_NUM_CHANNELS; ch++) {
++		struct camsv_cq_builder b = { };
++		size_t cap = 0, desc, vals;
++		bool active = false;
++
++		if (desc_off + val_used < size)
++			cap = size - desc_off - val_used;
++		if (!err)
++			err = camsv_cq_builder_init(&b, (u8 *)cpu + desc_off,
++						    dma + desc_off, cap) != 0;
++
++		cq_compose_channel(&b, s, ch, &err, &active);
++
++		if (active && !err) {
++			u32 cb = cq_hw_id_ok(s->ch[ch].channel_id) ?
++				 cq_c_base(s->ch[ch].channel_id) : 0;
++
++			for (t = 0; t < CAMSV_CQ_NUM_TAGS && !err; t++)
++				err = cq_w(&b, cb + CQ_C_COOKIE(t),
++					   s->frame_cookie);
++		}
++
++		if (!merged) {
++			if (active && !err)
++				err = camsv_cq_add_end(&b) != 0;
++			res->sv_offset[ch] = desc_off;
++			res->sv_size[ch] = b.desc_end;
++			if (!err && b.capacity)
++				err = camsv_cq_align_next(&b) != 0;
++			desc = camsv_cq_desc_bytes(&b);
++			vals = b.capacity ? camsv_cq_value_bytes(&b) : 0;
++			desc_off += desc;
++			val_used += vals;
++		} else {
++			res->sv_offset[ch] = 0;
++			res->sv_size[ch] = 0;
++			res->merged_desc_bytes += camsv_cq_desc_bytes(&b);
++			res->merged_value_bytes += b.capacity ?
++						   camsv_cq_value_bytes(&b) : 0;
++		}
++		write_failed |= b.failed;
++	}
++
++	res->desc_bytes = desc_off;
++	res->value_bytes = val_used;
++	res->write_failed = write_failed;
++	return err;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_compose, CAMSV_CQ_NS);
++
++static bool cq_channel_has_work(const struct camsv_cq_channel *c)
++{
++	unsigned int i;
++
++	for (i = 0; i < CAMSV_CQ_NUM_TAGS; i++)
++		if (c->tags[i].config_pending || c->tags[i].frame_pending)
++			return true;
++	return false;
++}
++
++/*
++ * Safe profile checks (register window, grouping, configuration and frame
++ * commands, merged layout), done before
++ * anything is changed. Returns 0 or -EINVAL.
++ */
++int camsv_cq_check_state(const struct camsv_cq_state *s)
++{
++	bool exp_change = camsv_cq_is_exp_change(s);
++	bool active[CAMSV_CQ_NUM_CHANNELS];
++	unsigned int ch, i;
++
++	for (ch = 0; ch < CAMSV_CQ_NUM_CHANNELS; ch++) {
++		const struct camsv_cq_channel *c = &s->ch[ch];
++		bool used = exp_change;
++
++		for (i = 0; i < CAMSV_CQ_NUM_TAGS; i++) {
++			const struct camsv_cq_tag *e = &c->tags[i];
++			u32 off;
++
++			if (!e->valid && !e->config_pending && !e->frame_pending)
++				continue;
++			used = true;
++			if (e->tag_id >= CAMSV_CQ_NUM_TAGS)
++				return -EINVAL;
++			if ((u32)e->crop_x + e->crop_width > 0xffff ||
++			    (u32)e->crop_y + e->crop_height > 0xffff)
++				return -EINVAL;
++			if (!e->frame_pending)
++				continue;
++			if (camsv_cq_format_is_compressed(e->output_format) &&
++			    (check_mul_overflow(ALIGN((u32)e->output_stride, 8),
++						(u32)e->crop_height, &off) ||
++			     check_add_overflow(off, (u32)CAMSV_CQ_COMP_HEADER_SIZE,
++						&off)))
++				return -EINVAL;
++			if (s->ring_enabled && e->tag_id < 4) {
++				u64 ring;
++
++				/* The ring address field holds 36 bits. */
++				if (check_add_overflow(e->output_dma,
++						       (u64)s->ring_start_offset,
++						       &ring) ||
++				    ring >> 36)
++					return -EINVAL;
++			}
++		}
++		if (used && !cq_hw_id_ok(c->channel_id))
++			return -EINVAL;
++		active[ch] = exp_change || cq_channel_has_work(c);
++	}
++
++	/* The merged layout overwrites the first channel. */
++	if (camsv_cq_is_merged(s) && active[0] && active[1])
++		return -EINVAL;
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_check_state, CAMSV_CQ_NS);
++
++/*
++ * Kernel profile: one CAMSV device, channel 0 only, standalone list.
++ * The composition runs on @scratch, and @s is only updated when a
++ * complete list was built, so a failure leaves the session as it was and
++ * nothing partial can be published. On success *@offset and *@len describe
++ * channel 0's list inside the area (*@len may be 0: nothing to apply).
++ */
++int camsv_cq_compose_single(struct camsv_cq_state *s,
++			    struct camsv_cq_state *scratch,
++			    void *cpu, dma_addr_t dma, size_t size,
++			    u32 *offset, u32 *len)
++{
++	struct camsv_cq_result res;
++	u64 end;
++	int ret;
++
++	ret = camsv_cq_check_state(s);
++	if (ret)
++		return ret;
++	/* A merged list needs a following RAW stage to be terminated. */
++	if (camsv_cq_is_merged(s))
++		return -EINVAL;
++	/* The kernel applies element 0 only: channel 1 must stay empty. */
++	if (camsv_cq_is_exp_change(s) || cq_channel_has_work(&s->ch[1]))
++		return -EINVAL;
++
++	*scratch = *s;
++	if (camsv_cq_compose(scratch, cpu, dma, size, &res) || res.write_failed)
++		return -ENOMEM;
++	if (res.sv_size[1])
++		return -EINVAL;
++	/* CQ fetch interface: 16-bit size field, 35-bit address. */
++	if (res.sv_size[0] > 0xffff)
++		return -E2BIG;
++	end = (u64)dma + res.sv_offset[0] + res.sv_size[0];
++	if (res.sv_size[0] && end > BIT_ULL(35))
++		return -ERANGE;
++
++	*s = *scratch;
++	*offset = res.sv_offset[0];
++	*len = res.sv_size[0];
++	return 0;
++}
++EXPORT_SYMBOL_NS_GPL(camsv_cq_compose_single, CAMSV_CQ_NS);
++
++MODULE_DESCRIPTION("MediaTek MT6878 CAMSV command queue builder");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/mediatek/camsv/mtk-camsv-cq.h b/drivers/media/platform/mediatek/camsv/mtk-camsv-cq.h
+new file mode 100644
+index 000000000000..ca5e7c8a6755
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camsv/mtk-camsv-cq.h
+@@ -0,0 +1,224 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * MediaTek MT6878 CAMSV command queue (CQ) builder.
++ *
++ * Pure data code: it fills a caller-provided CPU/DMA buffer with CAMSV
++ * register write descriptors. It never touches hardware, allocates memory
++ * or takes locks; the caller serializes access to the state.
++ *
++ * Copyright (c) 2026 serlk
++ */
++
++#ifndef _MTK_CAMSV_CQ_H
++#define _MTK_CAMSV_CQ_H
++
++#include <linux/types.h>
++
++/* One descriptor: __le32 control word followed by an unaligned __le64. */
++#define CAMSV_CQ_DESC_SIZE		12
++/* Largest chunk a single descriptor is built for (the format allows 512). */
++#define CAMSV_CQ_MAX_WORDS		511
++
++#define CAMSV_CQ_OP_WRITE		0
++#define CAMSV_CQ_OP_SKIP		1
++#define CAMSV_CQ_OP_END			3
++#define CAMSV_CQ_END_CTRL		0x06000000
++
++/* Register window a descriptor can address. */
++#define CAMSV_CQ_REG_PREFIX		0x1a000000
++#define CAMSV_CQ_REG_LAST		0x1a1ffffc
++
++#define CAMSV_CQ_NUM_CHANNELS		2
++#define CAMSV_CQ_NUM_TAGS		8
++#define CAMSV_CQ_NUM_GROUPS		4
++
++/* Supported hardware identifiers h of a channel. */
++#define CAMSV_CQ_HW_ID_MIN		3
++#define CAMSV_CQ_HW_ID_MAX		8
++
++/* Protocol format codes used by this driver (see camsv_cq_format_hw()). */
++#define CAMSV_CQ_FMT_BAYER8		0x00
++#define CAMSV_CQ_FMT_BAYER10		0x01
++#define CAMSV_CQ_FMT_BAYER12		0x02
++#define CAMSV_CQ_FMT_BAYER14		0x03
++#define CAMSV_CQ_FMT_BAYER16		0x04
++#define CAMSV_CQ_FMT_BAYER10_UNPACKED	0x05
++#define CAMSV_CQ_FMT_BAYER12_UNPACKED	0x06
++#define CAMSV_CQ_FMT_BAYER14_UNPACKED	0x07
++#define CAMSV_CQ_FMT_YUYV		0x0f
++#define CAMSV_CQ_FMT_VYUY		0x12
++#define CAMSV_CQ_FMT_COMP_FIRST		0x4c
++#define CAMSV_CQ_FMT_COMP_LAST		0x4f
++#define CAMSV_CQ_FMT_BAYER10_MIPI	0x50
++
++/* Offset of the data plane inside a compressed output buffer. */
++#define CAMSV_CQ_COMP_HEADER_SIZE	4096
++
++/**
++ * struct camsv_cq_builder - one CQ area, used from both ends
++ * @cpu: CPU mapping of the area
++ * @dma: address of the same area for the CQ fetcher
++ * @capacity: size in bytes
++ * @desc_end: first free byte of the descriptor region (grows upwards)
++ * @payload_begin: lowest used byte of the value region (grows downwards)
++ * @failed: set by any operation that ran out of space or was rejected;
++ *	    never cleared. A list with @failed set must not be published.
++ *
++ * Invariant: 0 <= @desc_end <= @payload_begin <= @capacity.
++ */
++struct camsv_cq_builder {
++	u8 *cpu;
++	dma_addr_t dma;
++	size_t capacity;
++	size_t desc_end;
++	size_t payload_begin;
++	bool failed;
++};
++
++/**
++ * struct camsv_cq_cmd - one decoded descriptor
++ * @op: operation code (bits 25..26)
++ * @reg: register address (only meaningful for writes)
++ * @count: number of 32-bit values (1..512)
++ * @data: DMA address of the values
++ */
++struct camsv_cq_cmd {
++	u32 op;
++	u32 reg;
++	u32 count;
++	u64 data;
++};
++
++/**
++ * struct camsv_cq_tag - per-tag configuration and frame state
++ */
++struct camsv_cq_tag {
++	bool valid;
++	bool config_pending;
++	bool frame_pending;
++	u8 tag_id;
++	u8 tag_order;
++	u8 pixel_mode;
++	u32 input_format;
++	u16 crop_x;
++	u16 crop_y;
++	u16 crop_width;
++	u16 crop_height;
++	/* frame */
++	u32 output_format;
++	u16 output_stride;
++	u64 output_dma;
++	u64 output_size;
++};
++
++/**
++ * struct camsv_cq_channel - one logical channel (eight tag entries)
++ */
++struct camsv_cq_channel {
++	u32 channel_id;
++	bool first_frame;
++	bool dual_output;
++	bool suppress_last_metadata;
++	struct camsv_cq_tag tags[CAMSV_CQ_NUM_TAGS];
++	u32 cached_groups[CAMSV_CQ_NUM_GROUPS];
++};
++
++/**
++ * struct camsv_cq_state - builder session state for both channels
++ *
++ * @cached_first and @cached_last are shared by both channels.
++ */
++struct camsv_cq_state {
++	struct camsv_cq_channel ch[CAMSV_CQ_NUM_CHANNELS];
++	u32 cached_first;
++	u32 cached_last;
++	u32 frame_cookie;
++	u32 exposure_count;
++	u32 previous_exposure_count;
++	u32 scenario;
++	u32 software_feature;
++	u32 route_source_id;
++	u32 vsync_order;
++	bool ring_enabled;
++	u32 ring_start_offset;
++	bool repeat_commit;
++};
++
++/**
++ * struct camsv_cq_result - placement of the composed lists
++ * @sv_offset: per channel offset of the standalone list in the area
++ * @sv_size: per channel size in bytes of the standalone list (incl. END,
++ *	     excluding the alignment gap behind it)
++ * @desc_bytes: standalone descriptor bytes used (incl. alignment gaps)
++ * @value_bytes: standalone value bytes used
++ * @merged_desc_bytes: descriptor bytes accounted to a merged list
++ * @merged_value_bytes: value bytes accounted to a merged list
++ * @write_failed: at least one builder operation failed, including ones
++ *		  whose failure the composition result does not report
++ */
++struct camsv_cq_result {
++	u32 sv_offset[CAMSV_CQ_NUM_CHANNELS];
++	u32 sv_size[CAMSV_CQ_NUM_CHANNELS];
++	u32 desc_bytes;
++	u32 value_bytes;
++	u32 merged_desc_bytes;
++	u32 merged_value_bytes;
++	bool write_failed;
++};
++
++/* Low level builder. */
++int camsv_cq_builder_init(struct camsv_cq_builder *b, void *cpu,
++			  dma_addr_t dma, size_t size);
++dma_addr_t camsv_cq_cpu_to_dma(const struct camsv_cq_builder *b,
++			       const void *cpu);
++void *camsv_cq_dma_to_cpu(const struct camsv_cq_builder *b, dma_addr_t dma);
++void *camsv_cq_reserve(struct camsv_cq_builder *b, size_t n);
++int camsv_cq_write_ref(struct camsv_cq_builder *b, u32 reg, dma_addr_t vals,
++		       size_t n);
++int camsv_cq_write(struct camsv_cq_builder *b, u32 reg, const u32 *vals,
++		   size_t n);
++int camsv_cq_write_pairs(struct camsv_cq_builder *b, const u32 *pairs,
++			 size_t m);
++int camsv_cq_add_end(struct camsv_cq_builder *b);
++int camsv_cq_align_next(struct camsv_cq_builder *b);
++size_t camsv_cq_desc_bytes(const struct camsv_cq_builder *b);
++size_t camsv_cq_value_bytes(const struct camsv_cq_builder *b);
++int camsv_cq_decode(const struct camsv_cq_builder *b, size_t offset,
++		    struct camsv_cq_cmd *cmd);
++
++/* Formats. */
++u32 camsv_cq_format_hw(u32 format, bool *unpack);
++u32 camsv_cq_format_word(u32 format);
++bool camsv_cq_format_is_compressed(u32 format);
++
++/* Scenario predicates. */
++bool camsv_cq_is_merged(const struct camsv_cq_state *s);
++bool camsv_cq_is_exp_change(const struct camsv_cq_state *s);
++bool camsv_cq_is_special_order(const struct camsv_cq_state *s);
++bool camsv_cq_is_special_group(const struct camsv_cq_state *s);
++
++/* State preparation. */
++void camsv_cq_state_init(struct camsv_cq_state *s);
++void camsv_cq_config_begin(struct camsv_cq_state *s);
++int camsv_cq_config_add(struct camsv_cq_state *s, unsigned int ch,
++			unsigned int index, u32 channel_id,
++			const struct camsv_cq_tag *cfg, bool first_frame,
++			bool dual_output, bool suppress_last_metadata);
++void camsv_cq_frame_begin(struct camsv_cq_state *s, u32 cookie);
++int camsv_cq_frame_set_output(struct camsv_cq_state *s, u32 channel_id,
++			      u8 tag_id, u32 format, u16 stride,
++			      u64 dma, u64 size);
++
++/* Composition. */
++bool camsv_cq_group_tags(struct camsv_cq_builder *b, struct camsv_cq_state *s,
++			 unsigned int ch, bool suppress_unchanged,
++			 bool write_mode);
++bool camsv_cq_compose(struct camsv_cq_state *s, void *cpu, dma_addr_t dma,
++		      size_t size, struct camsv_cq_result *res);
++int camsv_cq_check_state(const struct camsv_cq_state *s);
++int camsv_cq_compose_single(struct camsv_cq_state *s,
++			    struct camsv_cq_state *scratch,
++			    void *cpu, dma_addr_t dma, size_t size,
++			    u32 *offset, u32 *len);
++
++#endif /* _MTK_CAMSV_CQ_H */
+diff --git a/drivers/media/platform/mediatek/camsv/mtk-camsv-drv.c b/drivers/media/platform/mediatek/camsv/mtk-camsv-drv.c
+new file mode 100644
+index 000000000000..565b28d955e9
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camsv/mtk-camsv-drv.c
+@@ -0,0 +1,386 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6878 CAMSV capture driver: probe and power management.
++ *
++ * Resource layout (six register windows, four IRQs, clocks) and the
++ * runtime PM sequence follow mtk_camsv_of_probe() and the runtime PM
++ * callbacks of mtk_cam-sv.c of the MediaTek ISP7SP camsys driver
++ * (kernel_modules/mtkcam/camsys/isp7sp/cam, GPL-2.0).
++ *
++ * Copyright (c) 2019 MediaTek Inc.
++ * Copyright (c) 2026 serlk
++ */
++
++#include <linux/dma-mapping.h>
++#include <linux/iommu.h>
++#include <linux/kfifo.h>
++#include <linux/mfd/syscon.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/pm_runtime.h>
++#include <linux/property.h>
++
++#include "mtk-camsv.h"
++
++unsigned int mtk_camsv_debug;
++module_param_named(debug, mtk_camsv_debug, uint, 0644);
++MODULE_PARM_DESC(debug,
++		 "bit 0: log CQ addresses, lists and buffers; bit 1: register dumps at stream start, 1 s later, on timeout and at stop");
++
++static bool camsv_cq_low;
++module_param_named(cq_low, camsv_cq_low, bool, 0444);
++MODULE_PARM_DESC(cq_low,
++		 "experiment: CQ area from pages below 4 GiB physical, streaming DMA mapping");
++
++/* Order of enabling; disabled in reverse. */
++static const char * const camsv_clk_names[CAMSV_NUM_CLKS] = {
++	"cam", "larb", "camsv-top", "gals0", "gals1", "camsv",
++	"cam-sel", "camtm-sel",
++};
++
++static const char * const camsv_irq_names[CAMSV_NUM_IRQS] = {
++	[CAMSV_IRQ_DONE] = "done",
++	[CAMSV_IRQ_ERR] = "err",
++	[CAMSV_IRQ_SOF] = "sof",
++	[CAMSV_IRQ_CQ_DONE] = "cq-done",
++};
++
++static const irq_handler_t camsv_irq_handlers[CAMSV_NUM_IRQS] = {
++	[CAMSV_IRQ_DONE] = mtk_camsv_irq_done,
++	[CAMSV_IRQ_ERR] = mtk_camsv_irq_err,
++	[CAMSV_IRQ_SOF] = mtk_camsv_irq_sof,
++	[CAMSV_IRQ_CQ_DONE] = mtk_camsv_irq_cq_done,
++};
++
++static const char * const camsv_reg_names[] = {
++	"base", "dma", "scq", "inner", "inner-dma", "inner-scq",
++};
++
++/*
++ * Debug: where the CQ area sits in the IOMMU domain. Prints the domain's
++ * aperture, the physical page behind every CQ page as the domain's own
++ * page table has it, and which 64 KiB steps of the 16 MiB below the
++ * aperture end are mapped (to see what holds the IOVAs above the area).
++ * CPU-side page table walks only; no hardware access.
++ */
++static void camsv_debug_iommu(struct mtk_camsv_dev *cam)
++{
++	struct iommu_domain *dom = iommu_get_domain_for_dev(cam->dev);
++	dma_addr_t start = 0, top;
++	bool in_run = false;
++	unsigned int i;
++	u32 off;
++
++	if (!dom) {
++		dev_info(cam->dev, "iommu: no domain\n");
++		return;
++	}
++	dev_info(cam->dev, "iommu: domain type 0x%x aperture %pad..%pad\n",
++		 dom->type, &dom->geometry.aperture_start,
++		 &dom->geometry.aperture_end);
++
++	for (i = 0; i < CAMSV_CQ_SLOTS; i++) {
++		dma_addr_t a = cam->cq_dma + i * CAMSV_CQ_SLOT_SIZE;
++		phys_addr_t pa = iommu_iova_to_phys(dom, a);
++
++		dev_info(cam->dev, "iommu: cq slot %u %pad -> %pa\n", i, &a, &pa);
++	}
++
++	/* 64 KiB steps over the top 16 MiB; runs of mapped steps are printed */
++	top = dom->geometry.aperture_end;
++	for (off = 0; off <= SZ_16M; off += SZ_64K) {
++		dma_addr_t iova = top - SZ_16M + 1 + off;
++		bool mapped = off < SZ_16M && iommu_iova_to_phys(dom, iova);
++
++		if (mapped && !in_run) {
++			start = iova;
++			in_run = true;
++		} else if (!mapped && in_run) {
++			dma_addr_t end = iova - 1;
++			phys_addr_t pa = iommu_iova_to_phys(dom, start);
++
++			dev_info(cam->dev, "iommu: mapped %pad..%pad (first page -> %pa)\n",
++				 &start, &end, &pa);
++			in_run = false;
++		}
++	}
++}
++
++/*
++ * Freed with the device unless a stop reset timed out: then the engine
++ * may still fetch from it, and it is leaked on purpose.
++ */
++static void camsv_free_cq(void *data)
++{
++	struct mtk_camsv_dev *cam = data;
++
++	if (cam->wedged) {
++		dev_warn(cam->dev, "leaking CQ memory of a wedged engine\n");
++		return;
++	}
++	if (cam->cq_page) {
++		dma_unmap_page(cam->dev, cam->cq_dma, CAMSV_CQ_AREA_SIZE,
++			       DMA_TO_DEVICE);
++		__free_pages(cam->cq_page, get_order(CAMSV_CQ_AREA_SIZE));
++		return;
++	}
++	dma_free_coherent(cam->dev, CAMSV_CQ_AREA_SIZE, cam->cq_cpu, cam->cq_dma);
++}
++
++/*
++ * Experiment (cq_low): the CQ area from ZONE_DMA32 pages behind a
++ * streaming mapping; each list is synced to the device before its launch.
++ */
++static int camsv_alloc_cq_low(struct mtk_camsv_dev *cam)
++{
++	unsigned int order = get_order(CAMSV_CQ_AREA_SIZE);
++	struct page *page;
++	dma_addr_t dma;
++
++	page = alloc_pages(GFP_KERNEL | GFP_DMA32 | __GFP_ZERO, order);
++	if (!page)
++		return -ENOMEM;
++	dma = dma_map_page(cam->dev, page, 0, CAMSV_CQ_AREA_SIZE, DMA_TO_DEVICE);
++	if (dma_mapping_error(cam->dev, dma)) {
++		__free_pages(page, order);
++		return -ENOMEM;
++	}
++	cam->cq_page = page;
++	cam->cq_cpu = page_address(page);
++	cam->cq_dma = dma;
++	return 0;
++}
++
++static int mtk_camsv_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	void __iomem **regs[ARRAY_SIZE(camsv_reg_names)];
++	struct mtk_camsv_dev *cam;
++	phys_addr_t cq_pa;
++	unsigned int i;
++	u32 id;
++	int ret;
++
++	cam = devm_kzalloc(dev, sizeof(*cam), GFP_KERNEL);
++	if (!cam)
++		return -ENOMEM;
++	cam->dev = dev;
++	platform_set_drvdata(pdev, cam);
++
++	ret = device_property_read_u32(dev, "mediatek,camsv-id", &id);
++	if (ret || id > CAMSV_MAX_HW_ID)
++		return dev_err_probe(dev, -EINVAL, "invalid mediatek,camsv-id\n");
++	cam->hw_id = id;
++	cam->cq_hw_id = id + CAMSV_CQ_HW_ID_MIN;
++	cam->engine_mask = BIT(id);
++
++	regs[0] = &cam->base;
++	regs[1] = &cam->base_dma;
++	regs[2] = &cam->base_scq;
++	regs[3] = &cam->inner;
++	regs[4] = &cam->inner_dma;
++	regs[5] = &cam->inner_scq;
++	for (i = 0; i < ARRAY_SIZE(camsv_reg_names); i++) {
++		*regs[i] = devm_platform_ioremap_resource_byname(pdev,
++								 camsv_reg_names[i]);
++		if (IS_ERR(*regs[i]))
++			return PTR_ERR(*regs[i]);
++	}
++
++	cam->camsys = syscon_regmap_lookup_by_phandle(dev->of_node,
++						      "mediatek,camsys");
++	if (IS_ERR(cam->camsys))
++		return dev_err_probe(dev, PTR_ERR(cam->camsys),
++				     "no camsys main syscon\n");
++
++	for (i = 0; i < CAMSV_NUM_CLKS; i++)
++		cam->clks[i].id = camsv_clk_names[i];
++	ret = devm_clk_bulk_get(dev, CAMSV_NUM_CLKS, cam->clks);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get clocks\n");
++
++	/*
++	 * The engine reaches memory only through its SMI larb, and mainline
++	 * sets up a larb (and the SMI sub-commons and common above it) only
++	 * as part of the MM IOMMU path. Without it the first CQ fetch never
++	 * completes and the CQ DMA cannot even be reset (observed on Titan 2,
++	 * 2026-11-07), which leaves the engine wedged; so refuse to probe.
++	 */
++	if (!device_iommu_mapped(dev))
++		return dev_err_probe(dev, -ENODEV,
++				     "not behind the MM IOMMU: the CQ and the write DMA need their larb ports in \"iommus\" and the larb, SMI and M4U nodes enabled\n");
++
++	/*
++	 * The CQ fetcher takes 35 bits and the ring field 36, so 34 bits fit
++	 * all of them; the IOVA region of the camera larbs is 0 ~ 4 GiB.
++	 */
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(34));
++	if (ret)
++		return dev_err_probe(dev, ret, "no usable DMA mask\n");
++
++	raw_spin_lock_init(&cam->hw_lock);
++	spin_lock_init(&cam->buf_lock);
++	INIT_KFIFO(cam->events);
++	atomic_set(&cam->fifo_overflow, 0);
++	INIT_LIST_HEAD(&cam->pending_bufs);
++	INIT_LIST_HEAD(&cam->inflight_bufs);
++	init_completion(&cam->setting_done);
++	ret = devm_mutex_init(dev, &cam->hw_mutex);
++	if (ret)
++		return ret;
++	ret = devm_mutex_init(dev, &cam->vlock);
++	if (ret)
++		return ret;
++
++	if (camsv_cq_low) {
++		ret = camsv_alloc_cq_low(cam);
++		if (ret)
++			return ret;
++		cq_pa = page_to_phys(cam->cq_page);
++		dev_info(dev, "cq_low: CQ area at physical %pa\n", &cq_pa);
++	} else {
++		cam->cq_cpu = dma_alloc_coherent(dev, CAMSV_CQ_AREA_SIZE,
++						 &cam->cq_dma, GFP_KERNEL);
++		if (!cam->cq_cpu)
++			return -ENOMEM;
++	}
++	ret = devm_add_action_or_reset(dev, camsv_free_cq, cam);
++	if (ret)
++		return ret;
++	if (mtk_camsv_debug & CAMSV_DBG_CQ) {
++		dev_info(dev, "CQ area %pad, %u slots of %u bytes\n", &cam->cq_dma,
++			 CAMSV_CQ_SLOTS, CAMSV_CQ_SLOT_SIZE);
++		camsv_debug_iommu(cam);
++	} else {
++		dev_dbg(dev, "CQ area %pad\n", &cam->cq_dma);
++	}
++
++	/* Enabled by runtime resume only (no unbalanced enable_irq()). */
++	for (i = 0; i < CAMSV_NUM_IRQS; i++) {
++		ret = platform_get_irq_byname(pdev, camsv_irq_names[i]);
++		if (ret < 0)
++			return ret;
++		cam->irq[i] = ret;
++
++		ret = devm_request_threaded_irq(dev, cam->irq[i],
++						camsv_irq_handlers[i],
++						mtk_camsv_irq_thread,
++						IRQF_NO_AUTOEN, dev_name(dev), cam);
++		if (ret)
++			return dev_err_probe(dev, ret, "failed to request %s IRQ\n",
++					     camsv_irq_names[i]);
++	}
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	return mtk_camsv_video_register(cam);
++}
++
++static void mtk_camsv_remove(struct platform_device *pdev)
++{
++	struct mtk_camsv_dev *cam = platform_get_drvdata(pdev);
++
++	mtk_camsv_video_unregister(cam);
++}
++
++static void camsv_clks_disable(struct mtk_camsv_dev *cam, unsigned int n)
++{
++	while (n--)
++		clk_disable_unprepare(cam->clks[n].clk);
++}
++
++static int mtk_camsv_runtime_suspend(struct device *dev)
++{
++	struct mtk_camsv_dev *cam = dev_get_drvdata(dev);
++
++	/* Behavior change: the IRQs follow the power state. */
++	mtk_camsv_hw_irqs(cam, false);
++	/*
++	 * TODO: QoS / bandwidth votes and the DVFS "golden" setting
++	 * are dropped here on the original; no mainline provider exists.
++	 */
++	camsv_clks_disable(cam, CAMSV_NUM_CLKS);
++	return 0;
++}
++
++static int mtk_camsv_runtime_resume(struct device *dev)
++{
++	struct mtk_camsv_dev *cam = dev_get_drvdata(dev);
++	unsigned int i;
++	int ret;
++
++	/* The IRQs are off, so nothing produces or consumes events now. */
++	kfifo_reset(&cam->events);
++	atomic_set(&cam->fifo_overflow, 0);
++
++	for (i = 0; i < CAMSV_NUM_CLKS; i++) {
++		ret = clk_prepare_enable(cam->clks[i].clk);
++		if (ret) {
++			dev_err(dev, "failed to enable clock %s: %d\n",
++				cam->clks[i].id, ret);
++			camsv_clks_disable(cam, i);
++			return ret;
++		}
++	}
++
++	/* Behavior change: a reset timeout fails the resume. */
++	ret = mtk_camsv_hw_top_reset(cam);
++	if (ret) {
++		camsv_clks_disable(cam, CAMSV_NUM_CLKS);
++		return ret;
++	}
++
++	mtk_camsv_hw_irqs(cam, true);
++	return 0;
++}
++
++/* Conservative: system sleep is refused while capturing or wedged. */
++static int mtk_camsv_suspend(struct device *dev)
++{
++	struct mtk_camsv_dev *cam = dev_get_drvdata(dev);
++	bool busy;
++
++	mutex_lock(&cam->hw_mutex);
++	busy = cam->active || cam->wedged;
++	mutex_unlock(&cam->hw_mutex);
++	if (busy)
++		return -EBUSY;
++
++	return pm_runtime_force_suspend(dev);
++}
++
++static int mtk_camsv_resume(struct device *dev)
++{
++	return pm_runtime_force_resume(dev);
++}
++
++static const struct dev_pm_ops mtk_camsv_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(mtk_camsv_suspend, mtk_camsv_resume)
++	RUNTIME_PM_OPS(mtk_camsv_runtime_suspend, mtk_camsv_runtime_resume,
++		       NULL)
++};
++
++static const struct of_device_id mtk_camsv_of_match[] = {
++	{ .compatible = "mediatek,mt6878-camsv" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, mtk_camsv_of_match);
++
++static struct platform_driver mtk_camsv_driver = {
++	.probe = mtk_camsv_probe,
++	.remove = mtk_camsv_remove,
++	.driver = {
++		.name = CAMSV_DRV_NAME,
++		.of_match_table = mtk_camsv_of_match,
++		.pm = pm_ptr(&mtk_camsv_pm_ops),
++	},
++};
++module_platform_driver(mtk_camsv_driver);
++
++MODULE_IMPORT_NS("MTK_CAMSV_CQ");
++MODULE_DESCRIPTION("MediaTek MT6878 CAMSV capture driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/mediatek/camsv/mtk-camsv-hw.c b/drivers/media/platform/mediatek/camsv/mtk-camsv-hw.c
+new file mode 100644
+index 000000000000..0ae0caeec339
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camsv/mtk-camsv-hw.c
+@@ -0,0 +1,983 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT6878 CAMSV hardware control: CQ setup and launch, stream
++ * on/off, resets, IRQ snapshots and the threaded event consumer.
++ *
++ * Ported from mtk_cam-sv.c (reset, CQ configuration/launch, stream on/off,
++ * IRQ handlers, frame state machine) and mtk_cam-plat-mt6878.c (DMA FIFO
++ * thresholds) of the MediaTek ISP7SP camsys driver
++ * (kernel_modules/mtkcam/camsys/isp7sp/cam, GPL-2.0), reworked after a
++ * clean-room behavioural specification: single
++ * serialized consumer, explicit reset errors, balanced IRQ enabling.
++ *
++ * Copyright (c) 2019-2023 MediaTek Inc.
++ * Copyright (c) 2026 serlk
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bitops.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/kfifo.h>
++#include <linux/minmax.h>
++#include <linux/pm_runtime.h>
++#include <linux/regmap.h>
++#include <linux/timekeeping.h>
++
++#include "mtk-camsv.h"
++
++#define CAMSV_RESET_POLL_US		1
++#define CAMSV_RESET_TIMEOUT_US		100000
++
++static void camsv_rmw(void __iomem *reg, u32 mask, u32 val)
++{
++	u32 v = readl_relaxed(reg);
++
++	writel_relaxed((v & ~mask) | (val & mask), reg);
++}
++
++/* ------------------------------------------------------------------ */
++/* DMA FIFO thresholds (mtk_cam-plat-mt6878.c, get_sv_dma_th_setting)  */
++
++struct camsv_dma_fifo {
++	u32 img;	/* image FIFO size, port 1 */
++	u32 len;	/* length FIFO size, port 1 */
++	u32 lb_img;	/* lower bound used for the urgent level */
++	u32 lb_len;
++};
++
++/* Indexed by mediatek,camsv-id; the second ports are 0 on MT6878. */
++static const struct camsv_dma_fifo camsv_mt6878_fifo[CAMSV_MAX_HW_ID + 1] = {
++	{ 3412, 128, 682, 26 },
++	{ 2304, 128, 460, 26 },
++	{ 0, 0, 0, 0 },
++	{ 0, 0, 0, 0 },
++	{ 352, 0, 70, 0 },
++	{ 0, 0, 0, 0 },
++};
++
++#define CAMSV_CQ_FIFO		64
++
++static u32 camsv_fifo_th(u32 size, u32 hi, u32 lo)
++{
++	return (((size * hi / 10) & 0xfff) << 16) | ((size * lo / 10) & 0xfff);
++}
++
++struct camsv_th {
++	u32 urgent, ultra, pultra, dvfs;
++};
++
++static struct camsv_th camsv_th_for(u32 size, u32 lower_bound)
++{
++	struct camsv_th th = {
++		.urgent = BIT(31) | camsv_fifo_th(max(size, lower_bound), 4, 3),
++		.ultra = BIT(28) | camsv_fifo_th(size, 2, 1),
++		.pultra = BIT(28) | camsv_fifo_th(size, 2, 1),
++		.dvfs = BIT(31) | camsv_fifo_th(size, 1, 0),
++	};
++
++	return th;
++}
++
++static void camsv_write_th(void __iomem *d, u32 con1, u32 con2, u32 con3,
++			   u32 con4, const struct camsv_th *th)
++{
++	writel_relaxed(th->urgent, d + con3);
++	writel_relaxed(th->ultra, d + con2);
++	writel_relaxed(th->pultra, d + con1);
++	writel_relaxed(th->dvfs, d + con4);
++}
++
++static void camsv_dma_config(struct mtk_camsv_dev *cam)
++{
++	const struct camsv_dma_fifo *f = &camsv_mt6878_fifo[cam->hw_id];
++	struct camsv_th img = camsv_th_for(f->img, f->lb_img);
++	struct camsv_th img2 = camsv_th_for(0, f->lb_img);
++	struct camsv_th len = camsv_th_for(f->len, f->lb_len);
++	struct camsv_th len2 = camsv_th_for(0, f->lb_len);
++	struct camsv_th cq = camsv_th_for(CAMSV_CQ_FIFO, CAMSV_CQ_FIFO);
++	void __iomem *d = cam->base_dma;
++	void __iomem *q = cam->base_scq;
++	unsigned int i;
++
++	camsv_write_th(d, CAMSVDMA_CON1_IMG, CAMSVDMA_CON2_IMG,
++		       CAMSVDMA_CON3_IMG, CAMSVDMA_CON4_IMG, &img);
++	if (cam->hw_id <= 3)
++		camsv_write_th(d, CAMSVDMA_CON1_LEN, CAMSVDMA_CON2_LEN,
++			       CAMSVDMA_CON3_LEN, CAMSVDMA_CON4_LEN, &len);
++	if (cam->hw_id <= 1) {
++		camsv_write_th(d, CAMSVDMA_CON1_IMG2, CAMSVDMA_CON2_IMG2,
++			       CAMSVDMA_CON3_IMG2, CAMSVDMA_CON4_IMG2, &img2);
++		camsv_write_th(d, CAMSVDMA_CON1_LEN2, CAMSVDMA_CON2_LEN2,
++			       CAMSVDMA_CON3_LEN2, CAMSVDMA_CON4_LEN2, &len2);
++	}
++	writel_relaxed(0xfff, d + CAMSVDMA_STG1_EN_CTRL);
++	writel_relaxed(0xfff, d + CAMSVDMA_STG1_INIT_MODE_CTRL);
++	if (cam->hw_id <= 1) {
++		writel_relaxed(0xfff, d + CAMSVDMA_STG2_EN_CTRL);
++		writel_relaxed(0xfff, d + CAMSVDMA_STG2_INIT_MODE_CTRL);
++	}
++
++	/* CQ fetch FIFOs: size, pre-ultra, ultra, urgent, DVFS */
++	for (i = 0; i < 2; i++) {
++		void __iomem *c = q + (i ? CAMSVCQ_M2_CQI_ORIRDMA_CON(0) :
++					   CAMSVCQ_M1_CQI_ORIRDMA_CON(0));
++
++		writel_relaxed((0x10 << 24) | CAMSV_CQ_FIFO, c);
++		writel_relaxed(cq.pultra, c + 4);
++		writel_relaxed(cq.ultra, c + 8);
++		writel_relaxed(cq.urgent, c + 12);
++		writel_relaxed(cq.dvfs, c + 16);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* CQ configuration */
++
++static void camsv_cq_config(struct mtk_camsv_dev *cam, bool subsample)
++{
++	void __iomem *q = cam->base_scq;
++
++	camsv_rmw(q + CAMSVCQ_CQ_EN, CAMSVCQ_CQ_EN_DB_EN, CAMSVCQ_CQ_EN_DB_EN);
++	camsv_rmw(q + CAMSVCQ_CQ_EN, CAMSVCQ_CQ_EN_STAGGER_MODE, 0);
++	camsv_rmw(q + CAMSVCQ_CQ_EN, CAMSVCQ_CQ_EN_SUBSAMPLE_EN,
++		  subsample ? CAMSVCQ_CQ_EN_SUBSAMPLE_EN : 0);
++	camsv_rmw(q + CAMSVCQ_CQ_SUB_EN, CAMSVCQ_CQ_SUB_EN_DB_EN,
++		  CAMSVCQ_CQ_SUB_EN_DB_EN);
++	writel_relaxed(0xffffffff, q + CAMSVCQ_SCQ_START_PERIOD);
++	camsv_rmw(q + CAMSVCQ_SUB_THR0_CTL, CAMSVCQ_SUB_THR0_MODE,
++		  FIELD_PREP(CAMSVCQ_SUB_THR0_MODE, 1));
++	camsv_rmw(q + CAMSVCQ_SUB_THR0_CTL, CAMSVCQ_SUB_THR0_EN,
++		  CAMSVCQ_SUB_THR0_EN);
++	camsv_rmw(q + CAMSVCQ_INT_0_EN, CAMSVCQ_INT_SUB_THR_DONE_EN,
++		  CAMSVCQ_INT_SUB_THR_DONE_EN);
++	wmb(); /* configuration before the first launch */
++}
++
++static void camsv_cq_disable(struct mtk_camsv_dev *cam)
++{
++	camsv_rmw(cam->base_scq + CAMSVCQ_SUB_THR0_CTL, CAMSVCQ_SUB_THR0_EN, 0);
++}
++
++void mtk_camsv_hw_dev_config(struct mtk_camsv_dev *cam)
++{
++	camsv_dma_config(cam);
++	camsv_cq_config(cam, false);
++}
++
++/*
++ * Size, address high, address low, then
++ * start. The caller has published the CQ memory (coherent; writel()
++ * orders those stores before the start write) and bound the job.
++ */
++void mtk_camsv_hw_apply_cq(struct mtk_camsv_dev *cam, dma_addr_t addr,
++			   u32 size)
++{
++	void __iomem *q = cam->base_scq;
++
++	if (!size)
++		return;
++
++	writel_relaxed(size, q + CAMSVCQ_SUB_THR0_DESC_SIZE);
++	writel_relaxed(upper_32_bits(addr), q + CAMSVCQ_SUB_THR0_BASEADDR_MSB);
++	writel_relaxed(lower_32_bits(addr), q + CAMSVCQ_SUB_THR0_BASEADDR);
++	writel(CAMSVCQ_THR0_START, q + CAMSVCQ_THR_START);
++	wmb(); /* launch before anything that follows */
++}
++
++/* ------------------------------------------------------------------ */
++/* Resets */
++
++/*
++ * TODO: both resets run under an SMI common (id 31) clamp on
++ * the original platform. Mainline has no such interface, so no
++ * isolation is done here; this is an open question.
++ */
++static int camsv_reset(struct mtk_camsv_dev *cam)
++{
++	void __iomem *c = cam->base, *d = cam->base_dma, *q = cam->base_scq;
++	u32 val;
++	int ret;
++
++	writel(0, d + CAMSVDMA_SW_RST_CTL);
++	writel(CAMSVDMA_SW_RST_REQ, d + CAMSVDMA_SW_RST_CTL);
++	wmb(); /* request before polling */
++	ret = readl_poll_timeout(d + CAMSVDMA_SW_RST_CTL, val,
++				 val & CAMSVDMA_SW_RST_RDY,
++				 CAMSV_RESET_POLL_US, CAMSV_RESET_TIMEOUT_US);
++	if (ret) {
++		dev_err(cam->dev, "DMA reset timeout (sen_mode 0x%08x rst 0x%08x)\n",
++			readl(c + CAMSV_SEN_MODE), val);
++		return ret;
++	}
++
++	/* DMA is idle: DCM back on, central software reset. */
++	writel(0, c + CAMSV_DCM_DIS);
++	writel(0, c + CAMSV_SW_CTL);
++	writel(1, c + CAMSV_SW_CTL);
++	writel(0, d + CAMSVDMA_SW_RST_CTL);
++	writel(0, c + CAMSV_SW_CTL);
++	wmb(); /* central reset before the CQ reset */
++
++	writel(0, q + CAMSVCQ_SW_RST_CTL);
++	writel(1, q + CAMSVCQ_SW_RST_CTL);
++	wmb(); /* request before polling */
++	ret = readl_poll_timeout(q + CAMSVCQ_SW_RST_CTL, val,
++				 val & CAMSVCQ_SW_RST_RDY,
++				 CAMSV_RESET_POLL_US, CAMSV_RESET_TIMEOUT_US);
++	if (ret) {
++		dev_err(cam->dev, "CQ DMA reset timeout (sen_mode 0x%08x rst 0x%08x)\n",
++			readl(c + CAMSV_SEN_MODE), val);
++		return ret;
++	}
++	writel(0, q + CAMSVCQ_SW_RST_CTL);
++	wmb(); /* CQ DMA reset released */
++
++	camsv_rmw(q + CAMSVCQ_CQ_EN, CAMSVCQ_CQ_EN_RESET, CAMSVCQ_CQ_EN_RESET);
++	camsv_rmw(q + CAMSVCQ_CQ_SUB_EN, CAMSVCQ_CQ_SUB_EN_RESET,
++		  CAMSVCQ_CQ_SUB_EN_RESET);
++	camsv_rmw(q + CAMSVCQ_CQ_SUB_EN, CAMSVCQ_CQ_SUB_EN_RESET, 0);
++	camsv_rmw(q + CAMSVCQ_CQ_EN, CAMSVCQ_CQ_EN_RESET, 0);
++	wmb(); /* reset sequence complete */
++
++	return 0;
++}
++
++/* Reset through the camsys main block, used after power-up. */
++int mtk_camsv_hw_top_reset(struct mtk_camsv_dev *cam)
++{
++	void __iomem *q = cam->base_scq;
++	u32 val;
++	int ret;
++
++	writel(0, q + CAMSVCQ_SW_RST_CTL);
++	writel(1, q + CAMSVCQ_SW_RST_CTL);
++	wmb(); /* request before polling */
++	ret = readl_poll_timeout(q + CAMSVCQ_SW_RST_CTL, val,
++				 val & CAMSVCQ_SW_RST_RDY,
++				 CAMSV_RESET_POLL_US, CAMSV_RESET_TIMEOUT_US);
++	if (ret) {
++		dev_err(cam->dev, "CQ stop timeout (sen_mode 0x%08x rst 0x%08x)\n",
++			readl(cam->base + CAMSV_SEN_MODE), val);
++		return ret;
++	}
++	writel(0, q + CAMSVCQ_SW_RST_CTL);
++
++	regmap_write(cam->camsys, CAM_MAIN_SW_RST_1, 0);
++	regmap_write(cam->camsys, CAM_MAIN_SW_RST_1,
++		     CAM_MAIN_SW_RST_CAMSV(cam->hw_id));
++	regmap_write(cam->camsys, CAM_MAIN_SW_RST_1, 0);
++	wmb(); /* reset pulse complete */
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Stream on/off */
++
++static void camsv_central_enable(struct mtk_camsv_dev *cam)
++{
++	camsv_rmw(cam->base + CAMSV_SEN_MODE, CAMSV_SEN_MODE_CMOS_EN,
++		  CAMSV_SEN_MODE_CMOS_EN);
++	camsv_rmw(cam->base + CAMSV_VF_CON, CAMSV_VF_CON_VFDATA_EN,
++		  CAMSV_VF_CON_VFDATA_EN);
++}
++
++static int camsv_central_disable(struct mtk_camsv_dev *cam)
++{
++	void __iomem *c = cam->base;
++	unsigned int t;
++	int ret;
++
++	/* DMA DCM off before the DMA reset */
++	writel_relaxed(1, c + CAMSV_DCM_DIS);
++
++	writel_relaxed(0, c + CAMSV_DONE_STATUS_EN);
++	writel_relaxed(0, c + CAMSV_ERR_STATUS_EN);
++	writel_relaxed(0, c + CAMSV_SOF_STATUS_EN);
++
++	/* clear the active windows of all tags */
++	for (t = 0; t < CAMSV_NUM_TAGS; t++) {
++		writel_relaxed(0, cam->inner + CAMSV_GRAB_PXL_TAG(t));
++		writel_relaxed(0, cam->inner + CAMSV_GRAB_LIN_TAG(t));
++	}
++
++	camsv_rmw(c + CAMSV_SEN_MODE, CAMSV_SEN_MODE_TG_MODE_OFF,
++		  CAMSV_SEN_MODE_TG_MODE_OFF);
++	camsv_rmw(c + CAMSV_VF_CON, CAMSV_VF_CON_VFDATA_EN, 0);
++
++	camsv_rmw(c + CAMSV_PATH_CFG, CAMSV_PATH_CFG_SYNC_VF_EN_DB_LOAD_DIS,
++		  CAMSV_PATH_CFG_SYNC_VF_EN_DB_LOAD_DIS);
++	camsv_rmw(c + CAMSV_PATH_CFG, CAMSV_PATH_CFG_SYNC_VF_EN_DB_LOAD_DIS, 0);
++
++	camsv_rmw(c + CAMSV_SEN_MODE, CAMSV_SEN_MODE_CMOS_EN, 0);
++
++	ret = camsv_reset(cam);
++
++	writel_relaxed(0, c + CAMSV_DMA_EN_IMG);
++	writel_relaxed(0, c + CAMSV_DCIF_SET);
++	writel_relaxed(0, c + CAMSV_DCIF_SEL);
++
++	camsv_rmw(c + CAMSV_MODULE_DB, CAMSV_MODULE_DB_CAM_DB_EN, 0);
++	camsv_rmw(c + CAMSV_MODULE_DB, CAMSV_MODULE_DB_CAM_DB_EN,
++		  CAMSV_MODULE_DB_CAM_DB_EN);
++
++	return ret;
++}
++
++static int camsv_tag_stream(struct mtk_camsv_dev *cam, unsigned int t,
++			    bool on)
++{
++	int ret = 0;
++
++	if (on) {
++		cam->streaming_count++;
++		if (cam->streaming_count == cam->expected_count)
++			camsv_central_enable(cam);
++		return 0;
++	}
++
++	if (!cam->streaming_count)
++		return 0;
++	if (cam->streaming_count == cam->expected_count) {
++		camsv_cq_disable(cam);
++		ret = camsv_central_disable(cam);
++	}
++	writel_relaxed(0, cam->base + CAMSV_FBC0_TAG(t));
++	cam->streaming_count--;
++	return ret;
++}
++
++/*
++ * @tags and @count are only used when switching on; off uses the saved
++ * mask. Safe profile: @count must equal the number of tags and nothing
++ * may be enabled already. Returns the first reset error on stream off.
++ */
++int mtk_camsv_hw_stream(struct mtk_camsv_dev *cam, bool on, u32 tags,
++			unsigned int count)
++{
++	unsigned int t;
++	int ret = 0, r;
++
++	if (on) {
++		if (!tags || tags & ~GENMASK(CAMSV_NUM_TAGS - 1, 0) ||
++		    count != hweight32(tags) || cam->streaming_count)
++			return -EINVAL;
++		cam->enabled_tags = tags;
++		cam->expected_count = count;
++	}
++
++	for (t = 0; t < CAMSV_NUM_TAGS; t++) {
++		if (!(cam->enabled_tags & BIT(t)))
++			continue;
++		r = camsv_tag_stream(cam, t, on);
++		if (r && !ret)
++			ret = r;
++	}
++	return ret;
++}
++
++/*
++ * Stop path: the normal tag stream off; if the tags were never switched
++ * on (a failed start), the CQ thread is disabled and the engine reset.
++ * Returns -ETIMEDOUT when the engine could not be proven idle.
++ */
++int mtk_camsv_hw_stop(struct mtk_camsv_dev *cam)
++{
++	if (cam->streaming_count)
++		return mtk_camsv_hw_stream(cam, false, 0, 0);
++
++	camsv_cq_disable(cam);
++	return camsv_reset(cam);
++}
++
++/* The four IRQs are enabled while powered and disabled otherwise. */
++void mtk_camsv_hw_irqs(struct mtk_camsv_dev *cam, bool on)
++{
++	unsigned int i;
++
++	if (cam->irqs_enabled == on)
++		return;
++	for (i = 0; i < CAMSV_NUM_IRQS; i++) {
++		if (on)
++			enable_irq(cam->irq[i]);
++		else
++			disable_irq(cam->irq[i]);
++	}
++	cam->irqs_enabled = on;
++}
++
++/* ------------------------------------------------------------------ */
++/* Diagnostics (module parameter "debug")                              */
++
++/* The CQ address registers, outer and active copy. Caller: powered. */
++void mtk_camsv_hw_dump_cq_regs(struct mtk_camsv_dev *cam)
++{
++	void __iomem *q = cam->base_scq, *iq = cam->inner_scq;
++
++	dev_info(cam->dev,
++		 "scq outer: desc_size 0x%08x base 0x%08x_%08x cq_en 0x%08x sub_en 0x%08x thr0_ctl 0x%08x int_en 0x%08x\n",
++		 readl(q + CAMSVCQ_SUB_THR0_DESC_SIZE),
++		 readl(q + CAMSVCQ_SUB_THR0_BASEADDR_MSB),
++		 readl(q + CAMSVCQ_SUB_THR0_BASEADDR),
++		 readl(q + CAMSVCQ_CQ_EN), readl(q + CAMSVCQ_CQ_SUB_EN),
++		 readl(q + CAMSVCQ_SUB_THR0_CTL), readl(q + CAMSVCQ_INT_0_EN));
++	dev_info(cam->dev,
++		 "scq inner: desc_size 0x%08x base 0x%08x_%08x cq_en 0x%08x sub_en 0x%08x thr0_ctl 0x%08x\n",
++		 readl(iq + CAMSVCQ_SUB_THR0_DESC_SIZE),
++		 readl(iq + CAMSVCQ_SUB_THR0_BASEADDR_MSB),
++		 readl(iq + CAMSVCQ_SUB_THR0_BASEADDR),
++		 readl(iq + CAMSVCQ_CQ_EN), readl(iq + CAMSVCQ_CQ_SUB_EN),
++		 readl(iq + CAMSVCQ_SUB_THR0_CTL));
++}
++
++static void camsv_dump_central(struct mtk_camsv_dev *cam, const char *name,
++			       void __iomem *c)
++{
++	dev_info(cam->dev,
++		 "%s: sen_mode 0x%08x vf_con 0x%08x path_cfg 0x%08x module_db 0x%08x dma_en 0x%08x/0x%08x dcif 0x%x/0x%x sub_period 0x%x err_ctl 0x%x ts_ctl 0x%x\n",
++		 name, readl(c + CAMSV_SEN_MODE), readl(c + CAMSV_VF_CON),
++		 readl(c + CAMSV_PATH_CFG), readl(c + CAMSV_MODULE_DB),
++		 readl(c + CAMSV_DMA_EN_IMG), readl(c + CAMSV_DMA_EN_LOW),
++		 readl(c + CAMSV_DCIF_SET), readl(c + CAMSV_DCIF_SEL),
++		 readl(c + CAMSV_SUB_PERIOD), readl(c + CAMSV_ERR_CTL),
++		 readl(c + CAMSV_TIME_STAMP_CTL));
++	dev_info(cam->dev,
++		 "%s: group 0x%x 0x%x 0x%x 0x%x first 0x%x last 0x%x en: done 0x%08x err 0x%08x sof 0x%08x channel 0x%08x\n",
++		 name, readl(c + CAMSV_GROUP_TAG(0)), readl(c + CAMSV_GROUP_TAG(1)),
++		 readl(c + CAMSV_GROUP_TAG(2)), readl(c + CAMSV_GROUP_TAG(3)),
++		 readl(c + CAMSV_FIRST_TAG), readl(c + CAMSV_LAST_TAG),
++		 readl(c + CAMSV_DONE_STATUS_EN), readl(c + CAMSV_ERR_STATUS_EN),
++		 readl(c + CAMSV_SOF_STATUS_EN), readl(c + CAMSV_CHANNEL_EN));
++}
++
++static void camsv_dump_tag(struct mtk_camsv_dev *cam, const char *name,
++			   void __iomem *c, void __iomem *d, unsigned int t)
++{
++	dev_info(cam->dev,
++		 "%s tag %u: fbc 0x%08x/0x%08x grab 0x%08x/0x%08x vf_st 0x%08x fmt 0x%08x cfg 0x%08x cookie 0x%08x wdma 0x%08x_%08x basic 0x%08x\n",
++		 name, t, readl(c + CAMSV_FBC0_TAG(t)), readl(c + CAMSV_FBC1_TAG(t)),
++		 readl(c + CAMSV_GRAB_PXL_TAG(t)), readl(c + CAMSV_GRAB_LIN_TAG(t)),
++		 readl(c + CAMSV_VF_ST_TAG(t)), readl(c + CAMSV_FORMAT_TAG(t)),
++		 readl(c + CAMSV_CONFIG_TAG(t)), readl(c + CAMSV_FH_SPARE_TAG(t)),
++		 readl(d + CAMSVDMA_ADDR_MSB_TAG(t)), readl(d + CAMSVDMA_ADDR_TAG(t)),
++		 readl(d + CAMSVDMA_BASIC_TAG(t)));
++}
++
++/*
++ * Register dump of the engine. Only done while the device is runtime
++ * active (CAM_MAIN on, clocks enabled); otherwise it says so and reads
++ * nothing.
++ */
++void mtk_camsv_hw_dump(struct mtk_camsv_dev *cam, const char *why)
++{
++	unsigned int t = CAMSV_IMG_TAG;
++
++	if (pm_runtime_get_if_active(cam->dev) <= 0) {
++		dev_info(cam->dev, "dump (%s): powered off, nothing read\n", why);
++		return;
++	}
++
++	dev_info(cam->dev,
++		 "dump (%s): hard irqs done %d err %d sof %d cq-done %d; cq area %pad, last output %pad\n",
++		 why, atomic_read(&cam->irq_count[CAMSV_IRQ_DONE]),
++		 atomic_read(&cam->irq_count[CAMSV_IRQ_ERR]),
++		 atomic_read(&cam->irq_count[CAMSV_IRQ_SOF]),
++		 atomic_read(&cam->irq_count[CAMSV_IRQ_CQ_DONE]),
++		 &cam->cq_dma, &cam->last_out_dma);
++	dev_info(cam->dev,
++		 "status (read may clear): done 0x%08x err 0x%08x/inner 0x%08x sof 0x%08x channel 0x%08x cq_int 0x%08x\n",
++		 readl(cam->base + CAMSV_DONE_STATUS),
++		 readl(cam->base + CAMSV_ERR_STATUS),
++		 readl(cam->inner + CAMSV_ERR_STATUS),
++		 readl(cam->base + CAMSV_SOF_STATUS),
++		 readl(cam->base + CAMSV_CHANNEL_STATUS),
++		 readl(cam->base_scq + CAMSVCQ_INT_0_STATUS));
++
++	camsv_dump_central(cam, "outer", cam->base);
++	camsv_dump_central(cam, "inner", cam->inner);
++	camsv_dump_tag(cam, "outer", cam->base, cam->base_dma, t);
++	camsv_dump_tag(cam, "inner", cam->inner, cam->inner_dma, t);
++
++	/* the frame size monitors show the tag the selector points at */
++	writel(CAMSV_TAG_R_SEL_TAG(t), cam->inner + CAMSV_TAG_R_SEL);
++	dev_info(cam->dev,
++		 "tag %u frame size 0x%08x frame size r 0x%08x; dma tag_en 0x%08x/inner 0x%08x\n",
++		 t, readl(cam->inner + CAMSV_FRMSIZE_ST),
++		 readl(cam->inner + CAMSV_FRMSIZE_ST_R),
++		 readl(cam->base_dma + CAMSVDMA_TAG_EN),
++		 readl(cam->inner_dma + CAMSVDMA_TAG_EN));
++
++	mtk_camsv_hw_dump_cq_regs(cam);
++	pm_runtime_put(cam->dev);
++}
++
++/*
++ * After the CQ-done of the first job: did its register writes land? The
++ * list writes the outer registers (C/D windows), so the start-of-frame
++ * enable, the grab window and the WDMA address of the image tag must read
++ * back as composed. Read only; the caller holds the power reference.
++ */
++bool mtk_camsv_hw_check_applied(struct mtk_camsv_dev *cam, unsigned int tag,
++				u32 width, dma_addr_t out)
++{
++	u32 sof_en = readl(cam->base + CAMSV_SOF_STATUS_EN);
++	u32 grab = readl(cam->base + CAMSV_GRAB_PXL_TAG(tag));
++	u32 lo = readl(cam->base_dma + CAMSVDMA_ADDR_TAG(tag));
++	u32 hi = readl(cam->base_dma + CAMSVDMA_ADDR_MSB_TAG(tag));
++
++	if ((sof_en & CAMSV_SOF_TAG(tag)) && grab == width << 16 &&
++	    lo == lower_32_bits(out) && hi == upper_32_bits(out))
++		return true;
++
++	dev_warn(cam->dev,
++		 "CQ done, but its writes are not visible: sof_en 0x%08x (want bit %u) grab 0x%08x (want 0x%08x) wdma 0x%08x_%08x (want %pad)\n",
++		 sof_en, 2 + 4 * tag, grab, width << 16, hi, lo, &out);
++	return false;
++}
++
++/* ------------------------------------------------------------------ */
++/* Job binding */
++
++void mtk_camsv_state_reset(struct mtk_camsv_dev *cam)
++{
++	unsigned long flags;
++	unsigned int i;
++
++	for (i = 0; i < CAMSV_NUM_IRQS; i++)
++		atomic_set(&cam->irq_count[i], 0);
++
++	cam->fsm.active_cookie = -1;
++	cam->fsm.completed_cookie = -1;
++	cam->used_tags = 0;
++	cam->dropped_tags = 0;
++	cam->handled_tags = 0;
++	cam->streaming_count = 0;
++	cam->expected_count = 0;
++	cam->enabled_tags = 0;
++	cam->sof_seq = 0;
++
++	raw_spin_lock_irqsave(&cam->hw_lock, flags);
++	cam->first_tag = 0;
++	cam->last_tag = 0;
++	memset(cam->active_groups, 0, sizeof(cam->active_groups));
++	cam->tg_cnt = 0;
++	cam->ref_bound = false;
++	cam->expected_cookie = 0;
++	atomic_long_set(&cam->pending_cq, 0);
++	atomic_long_set(&cam->pending_inner, 0);
++	raw_spin_unlock_irqrestore(&cam->hw_lock, flags);
++}
++
++bool mtk_camsv_job_bound(struct mtk_camsv_dev *cam)
++{
++	unsigned long flags;
++	bool bound;
++
++	raw_spin_lock_irqsave(&cam->hw_lock, flags);
++	bound = cam->ref_bound;
++	raw_spin_unlock_irqrestore(&cam->hw_lock, flags);
++	return bound;
++}
++
++/* Must succeed before any MMIO of the launch; -EBUSY if still bound. */
++int mtk_camsv_bind_job(struct mtk_camsv_dev *cam, u32 cookie)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	raw_spin_lock_irqsave(&cam->hw_lock, flags);
++	if (cam->ref_bound) {
++		ret = -EBUSY;
++	} else {
++		WARN_ON(atomic_long_read(&cam->pending_cq));
++		cam->ref_bound = true;
++		cam->expected_cookie = cookie;
++		atomic_long_set(&cam->pending_cq, cam->engine_mask);
++		atomic_long_set(&cam->pending_inner, cam->engine_mask);
++	}
++	raw_spin_unlock_irqrestore(&cam->hw_lock, flags);
++	return ret;
++}
++
++void mtk_camsv_unbind_job(struct mtk_camsv_dev *cam)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&cam->hw_lock, flags);
++	cam->ref_bound = false;
++	atomic_long_set(&cam->pending_cq, 0);
++	atomic_long_set(&cam->pending_inner, 0);
++	raw_spin_unlock_irqrestore(&cam->hw_lock, flags);
++}
++
++/* ------------------------------------------------------------------ */
++/* Hard IRQ handlers */
++
++/* Called with hw_lock held. */
++static bool camsv_push(struct mtk_camsv_dev *cam,
++		       const struct mtk_camsv_event *ev)
++{
++	if (!kfifo_put(&cam->events, *ev)) {
++		/* the new event is lost; no wake-up for it */
++		atomic_set(&cam->fifo_overflow, 1);
++		return false;
++	}
++	return true;
++}
++
++/* Cookie register of the lowest first tag, tag 0 if the mask is empty. */
++static u32 camsv_cookie_reg(u32 first_tag)
++{
++	first_tag &= GENMASK(CAMSV_NUM_TAGS - 1, 0);
++	return CAMSV_FH_SPARE_TAG(first_tag ? __ffs(first_tag) : 0);
++}
++
++static void camsv_snap_cookies(struct mtk_camsv_dev *cam, u32 first_tag,
++			       struct mtk_camsv_event *ev)
++{
++	u32 reg = camsv_cookie_reg(first_tag);
++
++	ev->cookie_outer = readl_relaxed(cam->base + reg);
++	ev->cookie_inner = readl_relaxed(cam->inner + reg);
++	ev->ts_boot_ns = ktime_get_boottime_ns();
++	ev->ts_mono_ns = ktime_get_ns();
++}
++
++/*
++ * TODO: the status registers are only read, never written back,
++ * as on the original; whether they are read-to-clear is not established.
++ */
++irqreturn_t mtk_camsv_irq_done(int irq, void *data)
++{
++	struct mtk_camsv_dev *cam = data;
++	struct mtk_camsv_event ev = { };
++	bool wake = false;
++	unsigned int g;
++	u32 st;
++
++	atomic_inc(&cam->irq_count[CAMSV_IRQ_DONE]);
++	raw_spin_lock(&cam->hw_lock);
++	camsv_snap_cookies(cam, readl_relaxed(cam->inner + CAMSV_FIRST_TAG), &ev);
++	st = readl_relaxed(cam->base + CAMSV_DONE_STATUS);
++
++	for (g = 0; g < CAMSV_NUM_GROUPS; g++)
++		if (st & CAMSV_DONE_SW_GROUP(g))
++			ev.done_tags |= cam->active_groups[g];
++	if (ev.done_tags) {
++		ev.type = CAMSV_EV_DONE;
++		wake = camsv_push(cam, &ev);
++	}
++	raw_spin_unlock(&cam->hw_lock);
++
++	return wake ? IRQ_WAKE_THREAD : IRQ_HANDLED;
++}
++
++irqreturn_t mtk_camsv_irq_err(int irq, void *data)
++{
++	struct mtk_camsv_dev *cam = data;
++	struct mtk_camsv_event ev = { };
++	bool wake = false;
++	unsigned int t;
++	u32 st;
++
++	atomic_inc(&cam->irq_count[CAMSV_IRQ_ERR]);
++	raw_spin_lock(&cam->hw_lock);
++	camsv_snap_cookies(cam, readl_relaxed(cam->inner + CAMSV_FIRST_TAG), &ev);
++	st = readl_relaxed(cam->inner + CAMSV_ERR_STATUS);
++
++	for (t = 0; t < CAMSV_NUM_TAGS; t++)
++		if (st & CAMSV_ERR_TAG(t))
++			ev.err_tags |= BIT(t);
++	ev.err_status = st;
++	if (st) {
++		ev.type = CAMSV_EV_ERROR;
++		wake = camsv_push(cam, &ev);
++	}
++	raw_spin_unlock(&cam->hw_lock);
++
++	return wake ? IRQ_WAKE_THREAD : IRQ_HANDLED;
++}
++
++/* True only if every active tag has an empty FBC. Called under hw_lock. */
++static bool camsv_fbc_empty(struct mtk_camsv_dev *cam, u32 tags)
++{
++	unsigned int t;
++
++	for (t = 0; t < CAMSV_NUM_TAGS; t++) {
++		if (!(tags & BIT(t)))
++			continue;
++		if (readl_relaxed(cam->inner + CAMSV_FBC1_TAG(t)) &
++		    CAMSV_FBC1_FBC_CNT)
++			return false;
++	}
++	return true;
++}
++
++/* Representative (lowest) tag of each non-empty group carries @cookie. */
++static bool camsv_all_groups_inner(struct mtk_camsv_dev *cam, u32 cookie)
++{
++	unsigned int g;
++
++	for (g = 0; g < CAMSV_NUM_GROUPS; g++) {
++		u32 grp = cam->active_groups[g] & GENMASK(CAMSV_NUM_TAGS - 1, 0);
++
++		if (!grp)
++			continue;
++		if (readl_relaxed(cam->inner + CAMSV_FH_SPARE_TAG(__ffs(grp))) !=
++		    cookie)
++			return false;
++	}
++	return true;
++}
++
++irqreturn_t mtk_camsv_irq_sof(int irq, void *data)
++{
++	struct mtk_camsv_dev *cam = data;
++	struct mtk_camsv_event ev = { };
++	u32 sof_st, ch_st, tags = 0, hw_cnt, cnt;
++	bool wake = false;
++	unsigned int t, g;
++
++	atomic_inc(&cam->irq_count[CAMSV_IRQ_SOF]);
++	raw_spin_lock(&cam->hw_lock);
++	cam->first_tag = readl_relaxed(cam->inner + CAMSV_FIRST_TAG);
++	cam->last_tag = readl_relaxed(cam->inner + CAMSV_LAST_TAG);
++	camsv_snap_cookies(cam, cam->first_tag, &ev);
++	sof_st = readl_relaxed(cam->base + CAMSV_SOF_STATUS);
++	ch_st = readl_relaxed(cam->base + CAMSV_CHANNEL_STATUS);
++	for (g = 0; g < CAMSV_NUM_GROUPS; g++) {
++		cam->active_groups[g] =
++			readl_relaxed(cam->inner + CAMSV_GROUP_TAG(g));
++		ev.groups[g] = cam->active_groups[g];
++		tags |= cam->active_groups[g];
++	}
++	ev.first_tag = cam->first_tag;
++	ev.last_tag = cam->last_tag;
++
++	/* 8-bit hardware frame counter, extended in software */
++	hw_cnt = FIELD_GET(CAMSV_VF_ST_TG_CNT,
++			   readl_relaxed(cam->base + CAMSV_VF_ST_TAG(3)));
++	cnt = (cam->tg_cnt & ~0xffU) | hw_cnt;
++	ev.frame_count = cam->tg_cnt;
++
++	for (t = 0; t < CAMSV_NUM_TAGS; t++)
++		if (sof_st & CAMSV_SOF_TAG(t))
++			ev.sof_tags |= BIT(t);
++	if (ev.sof_tags)
++		ev.type |= CAMSV_EV_SOF;
++	ev.fbc_empty = (ev.sof_tags & cam->last_tag) ?
++		       camsv_fbc_empty(cam, tags) : false;
++
++	for (t = 0; t < CAMSV_NUM_TAGS; t++)
++		if (ch_st & CAMSV_SW_ENQ_ERR_TAG(t))
++			ev.drop_tags |= BIT(t);
++	if (ev.drop_tags)
++		ev.type |= CAMSV_EV_DROP;
++
++	cam->tg_cnt = cnt < cam->tg_cnt ? cnt + BIT(8) : cnt;
++
++	if ((ev.sof_tags & cam->last_tag) &&
++	    camsv_all_groups_inner(cam, ev.cookie_inner) &&
++	    cam->ref_bound && cam->expected_cookie == ev.cookie_inner) {
++		/* the job's settings are active: release the binding */
++		atomic_long_andnot(cam->engine_mask, &cam->pending_inner);
++		cam->ref_bound = false;
++		ev.type |= CAMSV_EV_INNER;
++	}
++
++	if (ev.type)
++		wake = camsv_push(cam, &ev);
++	raw_spin_unlock(&cam->hw_lock);
++
++	return wake ? IRQ_WAKE_THREAD : IRQ_HANDLED;
++}
++
++irqreturn_t mtk_camsv_irq_cq_done(int irq, void *data)
++{
++	struct mtk_camsv_dev *cam = data;
++	struct mtk_camsv_event ev = { };
++	bool wake = false;
++	u32 st;
++
++	atomic_inc(&cam->irq_count[CAMSV_IRQ_CQ_DONE]);
++	raw_spin_lock(&cam->hw_lock);
++	camsv_snap_cookies(cam, readl_relaxed(cam->inner + CAMSV_FIRST_TAG), &ev);
++	st = readl_relaxed(cam->base_scq + CAMSVCQ_INT_0_STATUS);
++
++	if ((st & CAMSVCQ_INT_SUB_THR_DONE) && cam->ref_bound) {
++		long prev = atomic_long_fetch_andnot(cam->engine_mask,
++						     &cam->pending_cq);
++
++		/* only the last expected CQ done counts, and only once */
++		if (prev == (long)cam->engine_mask) {
++			ev.type = CAMSV_EV_SETTING_DONE;
++			wake = camsv_push(cam, &ev);
++		}
++	}
++	raw_spin_unlock(&cam->hw_lock);
++
++	return wake ? IRQ_WAKE_THREAD : IRQ_HANDLED;
++}
++
++/* ------------------------------------------------------------------ */
++/* Consumer, mtk_cam-engine_fsm.h automaton */
++
++static bool camsv_fsm_processing(const struct mtk_camsv_fsm *f)
++{
++	return f->active_cookie != f->completed_cookie;
++}
++
++static bool camsv_fsm_hw_done(struct mtk_camsv_fsm *f, s32 *cookie)
++{
++	if (!camsv_fsm_processing(f))
++		return false;	/* repeated done for a completed cookie */
++	f->completed_cookie = f->active_cookie;
++	*cookie = f->active_cookie;
++	return true;
++}
++
++/* At most one recovered completion per call. */
++static bool camsv_fsm_sof(struct mtk_camsv_fsm *f, s32 inner, bool fbc_empty,
++			  s32 *cookie)
++{
++	bool changed = inner != f->active_cookie;
++	bool ret = false;
++
++	/* the active cookie moved on while still in processing: done missed */
++	if (camsv_fsm_processing(f) && changed) {
++		f->completed_cookie = f->active_cookie;
++		*cookie = f->active_cookie;
++		ret = true;
++	}
++	f->active_cookie = inner;
++
++	if (!ret && fbc_empty && camsv_fsm_processing(f)) {
++		f->completed_cookie = f->active_cookie;
++		*cookie = f->active_cookie;
++		ret = true;
++	}
++	return ret;
++}
++
++static void camsv_handle_error(struct mtk_camsv_dev *cam,
++			       const struct mtk_camsv_event *ev)
++{
++	dev_err_ratelimited(cam->dev,
++			    "error status 0x%08x tags 0x%02x cookie 0x%x/0x%x\n",
++			    ev->err_status, ev->err_tags, ev->cookie_inner,
++			    ev->cookie_outer);
++
++	if (!ev->err_tags && (ev->err_status & CAMSV_ERR_DMA_SRAM_FULL))
++		dev_warn_ratelimited(cam->dev, "DMA FIFO full, engine stalled\n");
++
++	/*
++	 * Behavior change: the original only reports errors. Here the frame
++	 * being written for the image tag is returned as an error.
++	 */
++	if (ev->err_tags & BIT(CAMSV_IMG_TAG))
++		mtk_camsv_frame_error(cam, ev->cookie_inner);
++}
++
++static void camsv_handle_event(struct mtk_camsv_dev *cam,
++			       struct mtk_camsv_event *ev)
++{
++	u32 groups = 0;
++	s32 done_cookie = 0, rec_cookie = 0;
++	bool frame_done = false, recovered = false;
++	unsigned int g;
++
++	if (ev->type == CAMSV_EV_ERROR) {
++		camsv_handle_error(cam, ev);
++		return;
++	}
++
++	for (g = 0; g < CAMSV_NUM_GROUPS; g++)
++		groups |= ev->groups[g];
++
++	/* first tag: reset losses, take the used tags from this snapshot */
++	if ((ev->type & CAMSV_EV_SOF) && (ev->sof_tags & ev->first_tag)) {
++		cam->dropped_tags = 0;
++		cam->used_tags = groups;
++	}
++
++	if (ev->type & CAMSV_EV_DROP)
++		cam->dropped_tags |= ev->drop_tags;
++
++	if (ev->type & (CAMSV_EV_DROP | CAMSV_EV_DONE)) {
++		if (ev->type & CAMSV_EV_DONE)
++			cam->handled_tags |= ev->done_tags;
++		cam->handled_tags |= cam->dropped_tags;
++		cam->handled_tags &= cam->used_tags;
++
++		/* one group done does not finish the frame */
++		if (cam->handled_tags == cam->used_tags) {
++			frame_done = camsv_fsm_hw_done(&cam->fsm, &done_cookie);
++			cam->handled_tags = 0;
++		}
++	}
++
++	if ((ev->type & CAMSV_EV_SOF) && (ev->sof_tags & ev->first_tag)) {
++		dev_dbg(cam->dev, "first exposure start, cookie 0x%x\n",
++			ev->cookie_inner);
++		/* frame number of this start of frame, from 0 at stream on */
++		mtk_camsv_frame_sync(cam, cam->sof_seq++);
++	}
++	/*
++	 * The buffer whose settings became active at this start of frame
++	 * gets its frame number. The 8-bit hardware counter read in the hard
++	 * IRQ stayed 0 on the Titan 2 (every buffer had sequence 0), so the
++	 * software count is used for both the event and the buffer.
++	 */
++	ev->frame_count = cam->sof_seq ? cam->sof_seq - 1 : 0;
++
++	if ((ev->type & CAMSV_EV_SOF) && (ev->sof_tags & ev->last_tag) &&
++	    (ev->last_tag & groups))
++		recovered = camsv_fsm_sof(&cam->fsm, (s32)ev->cookie_inner,
++					  ev->fbc_empty, &rec_cookie);
++
++	/* the normal event first, then the recovered done */
++	if (frame_done)
++		mtk_camsv_frame_done(cam, done_cookie);
++	if (ev->type & CAMSV_EV_INNER)
++		mtk_camsv_frame_started(cam, ev->cookie_inner, ev);
++	if (ev->type & CAMSV_EV_SETTING_DONE)
++		complete(&cam->setting_done);
++	/*
++	 * TODO: a recovered done is a heuristic; the buffer
++	 * is returned as DONE like a normal completion.
++	 */
++	if (recovered) {
++		dev_dbg(cam->dev, "recovered done 0x%x (inner 0x%x)\n",
++			rec_cookie, ev->cookie_inner);
++		mtk_camsv_frame_done(cam, rec_cookie);
++	}
++}
++
++/*
++ * Common threaded handler of the four IRQs. They have separate threads,
++ * so the consumer is serialized by hw_mutex: exactly one reader drains
++ * the FIFO and runs the cookie automaton at a time.
++ */
++irqreturn_t mtk_camsv_irq_thread(int irq, void *data)
++{
++	struct mtk_camsv_dev *cam = data;
++	struct mtk_camsv_event ev;
++
++	mutex_lock(&cam->hw_mutex);
++
++	if (atomic_cmpxchg(&cam->fifo_overflow, 1, 0))
++		dev_warn_ratelimited(cam->dev, "IRQ event FIFO overflow\n");
++
++	while (kfifo_get(&cam->events, &ev)) {
++		if (!cam->active)
++			continue;
++		camsv_handle_event(cam, &ev);
++	}
++
++	if (cam->active)
++		mtk_camsv_try_apply(cam);
++
++	mutex_unlock(&cam->hw_mutex);
++	return IRQ_HANDLED;
++}
+diff --git a/drivers/media/platform/mediatek/camsv/mtk-camsv-regs.h b/drivers/media/platform/mediatek/camsv/mtk-camsv-regs.h
+new file mode 100644
+index 000000000000..41461d8e2535
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camsv/mtk-camsv-regs.h
+@@ -0,0 +1,137 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * MediaTek MT6878 CAMSV register definitions.
++ *
++ * Ported from mtk_cam-sv-regs.h of the MediaTek ISP7SP camsys driver
++ * (kernel_modules/mtkcam/camsys/isp7sp/cam, GPL-2.0); the bit-field unions
++ * were converted to masks and only the registers this driver uses are kept.
++ *
++ * Copyright (c) 2019 MediaTek Inc.
++ * Copyright (c) 2026 serlk
++ */
++
++#ifndef _MTK_CAMSV_REGS_H
++#define _MTK_CAMSV_REGS_H
++
++#include <linux/bits.h>
++
++#define CAMSV_NUM_TAGS				8
++#define CAMSV_NUM_GROUPS			4
++
++/* Central block, outer ("base") and active/inner ("inner") windows */
++#define CAMSV_DMA_EN_IMG			0x0040
++#define CAMSV_DMA_EN_LOW			0x0044
++#define CAMSV_DCM_DIS				0x007c
++#define CAMSV_SEN_MODE				0x0140
++#define   CAMSV_SEN_MODE_CMOS_EN		BIT(0)
++#define   CAMSV_SEN_MODE_TG_MODE_OFF		BIT(11)
++#define CAMSV_SUB_PERIOD			0x0144
++#define CAMSV_VF_CON				0x0148
++#define   CAMSV_VF_CON_VFDATA_EN		BIT(0)
++#define CAMSV_PATH_CFG				0x014c
++#define   CAMSV_PATH_CFG_SYNC_VF_EN_DB_LOAD_DIS	BIT(8)
++#define CAMSV_ERR_CTL				0x0170
++/* debug selector of the two frame size monitors below */
++#define CAMSV_TAG_R_SEL				0x0174
++#define   CAMSV_TAG_R_SEL_TAG(t)		(((t) << 22) | ((t) << 27))
++#define CAMSV_FRMSIZE_ST_R			0x0180
++#define CAMSV_FRMSIZE_ST			0x0188
++#define CAMSV_TIME_STAMP_CTL			0x018c
++#define CAMSV_MODULE_DB				0x01b4
++#define   CAMSV_MODULE_DB_CAM_DB_EN		BIT(30)
++#define CAMSV_GROUP_TAG(g)			(0x01b8 + 4 * (g))
++#define CAMSV_LAST_TAG				0x01c8
++#define CAMSV_FIRST_TAG				0x01cc
++#define CAMSV_SW_CTL				0x01d0
++#define CAMSV_DCIF_SET				0x01d4
++#define CAMSV_DCIF_SEL				0x01d8
++
++#define CAMSV_DONE_STATUS_EN			0x0344
++#define CAMSV_DONE_STATUS			0x0348
++#define   CAMSV_DONE_SW_GROUP(g)		BIT(16 + (g))
++#define CAMSV_ERR_STATUS_EN			0x034c
++#define CAMSV_ERR_STATUS			0x0350
++#define   CAMSV_ERR_DMA_SRAM_FULL		BIT(0)
++#define   CAMSV_ERR_TAG(t)			(GENMASK(10, 8) << (3 * (t)))
++#define CAMSV_SOF_STATUS_EN			0x035c
++#define CAMSV_SOF_STATUS			0x0360
++#define   CAMSV_SOF_TAG(t)			BIT(2 + 4 * (t))
++#define CAMSV_CHANNEL_EN			0x036c
++#define CAMSV_CHANNEL_STATUS			0x0370
++#define   CAMSV_SW_ENQ_ERR_TAG(t)		BIT(4 * (t))
++
++/* Per-tag registers, tag t = 0..7 */
++#define CAMSV_TAG_SHIFT				0x40
++#define CAMSV_FBC0_TAG(t)			(0x0540 + CAMSV_TAG_SHIFT * (t))
++#define   CAMSV_FBC0_FBC_EN			BIT(15)
++#define CAMSV_FBC1_TAG(t)			(0x0544 + CAMSV_TAG_SHIFT * (t))
++#define   CAMSV_FBC1_FBC_CNT			GENMASK(19, 16)
++#define CAMSV_GRAB_PXL_TAG(t)			(0x0548 + CAMSV_TAG_SHIFT * (t))
++#define CAMSV_GRAB_LIN_TAG(t)			(0x054c + CAMSV_TAG_SHIFT * (t))
++#define CAMSV_VF_ST_TAG(t)			(0x0550 + CAMSV_TAG_SHIFT * (t))
++#define   CAMSV_VF_ST_TG_CNT			GENMASK(31, 24)
++#define CAMSV_FORMAT_TAG(t)			(0x0554 + CAMSV_TAG_SHIFT * (t))
++#define CAMSV_CONFIG_TAG(t)			(0x055c + CAMSV_TAG_SHIFT * (t))
++#define CAMSV_FH_SPARE_TAG(t)			(0x057c + CAMSV_TAG_SHIFT * (t))
++
++/* DMA top ("dma" window) */
++#define CAMSVDMA_CON1_IMG			0x0000
++#define CAMSVDMA_CON2_IMG			0x0004
++#define CAMSVDMA_CON3_IMG			0x0008
++#define CAMSVDMA_CON4_IMG			0x000c
++#define CAMSVDMA_CON1_LEN			0x0010
++#define CAMSVDMA_CON2_LEN			0x0014
++#define CAMSVDMA_CON3_LEN			0x0018
++#define CAMSVDMA_CON4_LEN			0x001c
++#define CAMSVDMA_SW_RST_CTL			0x0020
++#define   CAMSVDMA_SW_RST_REQ			BIT(0)
++#define   CAMSVDMA_SW_RST_RDY			BIT(1)
++#define CAMSVDMA_CON1_IMG2			0x00e0
++#define CAMSVDMA_CON2_IMG2			0x00e4
++#define CAMSVDMA_CON3_IMG2			0x00e8
++#define CAMSVDMA_CON4_IMG2			0x00ec
++#define CAMSVDMA_CON1_LEN2			0x00f0
++#define CAMSVDMA_CON2_LEN2			0x00f4
++#define CAMSVDMA_CON3_LEN2			0x00f8
++#define CAMSVDMA_CON4_LEN2			0x00fc
++#define CAMSVDMA_ADDR_TAG(t)			(0x0200 + CAMSV_TAG_SHIFT * (t))
++#define CAMSVDMA_ADDR_MSB_TAG(t)		(0x0204 + CAMSV_TAG_SHIFT * (t))
++#define CAMSVDMA_BASIC_TAG(t)			(0x0210 + CAMSV_TAG_SHIFT * (t))
++#define CAMSVDMA_STG1_EN_CTRL			0x0c00
++#define CAMSVDMA_STG1_INIT_MODE_CTRL		0x0c04
++#define CAMSVDMA_STG2_EN_CTRL			0x0c80
++#define CAMSVDMA_STG2_INIT_MODE_CTRL		0x0c84
++#define CAMSVDMA_TAG_EN				0x0f30
++
++/* Command queue ("scq" window) */
++#define CAMSVCQ_SW_RST_CTL			0x0010
++#define   CAMSVCQ_SW_RST_RDY			BIT(1)
++#define CAMSVCQ_THR_START			0x0014
++#define   CAMSVCQ_THR0_START			BIT(0)
++#define CAMSVCQ_INT_0_EN			0x0018
++#define   CAMSVCQ_INT_SUB_THR_DONE_EN		BIT(0)
++#define CAMSVCQ_INT_0_STATUS			0x001c
++#define   CAMSVCQ_INT_SUB_THR_DONE		BIT(0)
++#define CAMSVCQ_CQ_EN				0x0100
++#define   CAMSVCQ_CQ_EN_DB_EN			BIT(4)
++#define   CAMSVCQ_CQ_EN_STAGGER_MODE		BIT(12)
++#define   CAMSVCQ_CQ_EN_RESET			BIT(16)
++#define   CAMSVCQ_CQ_EN_SUBSAMPLE_EN		BIT(21)
++#define CAMSVCQ_SCQ_START_PERIOD		0x0108
++#define CAMSVCQ_CQ_SUB_EN			0x0130
++#define   CAMSVCQ_CQ_SUB_EN_DB_EN		BIT(4)
++#define   CAMSVCQ_CQ_SUB_EN_RESET		BIT(16)
++#define CAMSVCQ_SUB_THR0_CTL			0x0140
++#define   CAMSVCQ_SUB_THR0_EN			BIT(0)
++#define   CAMSVCQ_SUB_THR0_MODE			GENMASK(5, 4)
++#define CAMSVCQ_SUB_THR0_BASEADDR		0x014c
++#define CAMSVCQ_SUB_THR0_BASEADDR_MSB		0x0150
++#define CAMSVCQ_SUB_THR0_DESC_SIZE		0x0158
++#define CAMSVCQ_M1_CQI_ORIRDMA_CON(n)		(0x0520 + 4 * (n))
++#define CAMSVCQ_M2_CQI_ORIRDMA_CON(n)		(0x05a0 + 4 * (n))
++
++/* camsys main (syscon) */
++#define CAM_MAIN_SW_RST_1			0x0058
++#define   CAM_MAIN_SW_RST_CAMSV(id)		(3 << (2 * (id)))
++
++#endif /* _MTK_CAMSV_REGS_H */
+diff --git a/drivers/media/platform/mediatek/camsv/mtk-camsv-video.c b/drivers/media/platform/mediatek/camsv/mtk-camsv-video.c
+new file mode 100644
+index 000000000000..4fba8c3625a4
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camsv/mtk-camsv-video.c
+@@ -0,0 +1,985 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * MediaTek MT6878 CAMSV capture driver: video node, vb2 queue, media
++ * controller and job control (one buffer per CQ job).
++ *
++ * Copyright (c) 2026 serlk
++ */
++
++#include <linux/bitmap.h>
++#include <linux/iommu.h>
++#include <linux/jiffies.h>
++#include <linux/lockdep.h>
++#include <linux/pm_runtime.h>
++#include <linux/property.h>
++#include <linux/timekeeping.h>
++#include <linux/unaligned.h>
++#include <linux/workqueue.h>
++
++#include <media/v4l2-event.h>
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-mc.h>
++#include <media/v4l2-subdev.h>
++#include <media/videobuf2-dma-contig.h>
++
++#include "mtk-camsv.h"
++
++/*
++ * TODO: the hardware size limits of a CAMSV tag are not in the
++ * specification. These bounds are conservative: the width is a multiple
++ * of the 8-pixel bus, and the stride fits the 16-bit stride field.
++ */
++#define CAMSV_MIN_WIDTH		64
++#define CAMSV_MAX_WIDTH		8192
++#define CAMSV_MIN_HEIGHT	16
++#define CAMSV_MAX_HEIGHT	8192
++#define CAMSV_WIDTH_ALIGN	8
++#define CAMSV_HEIGHT_ALIGN	2
++#define CAMSV_STRIDE_ALIGN	16	/* WDMA bus alignment, raw formats */
++#define CAMSV_BUF_ALIGN		16
++
++#define CAMSV_SETTING_TIMEOUT_MS	1000
++
++#define CAMSV_FMT(pix, bus, out, in, bits)				\
++	{								\
++		.fourcc = V4L2_PIX_FMT_##pix,				\
++		.mbus_code = MEDIA_BUS_FMT_##bus,			\
++		.out_fmt = CAMSV_CQ_FMT_##out,				\
++		.in_fmt = CAMSV_CQ_FMT_##in,				\
++		.bpp = bits,						\
++	}
++
++/*
++ * The first entry is the default.
++ *
++ * TODO: the specification leaves the V4L2 mapping of the protocol
++ * format codes open. The codes are taken as the public mtkcam IPI image
++ * formats (camsys/common/mtk_cam-fmt.h: 0 BAYER8, 1 BAYER10, 2 BAYER12,
++ * 5/6 BAYER10/12_UNPACKED, 0x50 BAYER10_MIPI); only formats with a
++ * mainline fourcc are offered (no MediaTek-packed 10/12-bit fourccs).
++ */
++static const struct mtk_camsv_format camsv_formats[] = {
++	CAMSV_FMT(SBGGR10P, SBGGR10_1X10, BAYER10_MIPI, BAYER10, 10),
++	CAMSV_FMT(SGBRG10P, SGBRG10_1X10, BAYER10_MIPI, BAYER10, 10),
++	CAMSV_FMT(SGRBG10P, SGRBG10_1X10, BAYER10_MIPI, BAYER10, 10),
++	CAMSV_FMT(SRGGB10P, SRGGB10_1X10, BAYER10_MIPI, BAYER10, 10),
++	CAMSV_FMT(SBGGR8, SBGGR8_1X8, BAYER8, BAYER8, 8),
++	CAMSV_FMT(SGBRG8, SGBRG8_1X8, BAYER8, BAYER8, 8),
++	CAMSV_FMT(SGRBG8, SGRBG8_1X8, BAYER8, BAYER8, 8),
++	CAMSV_FMT(SRGGB8, SRGGB8_1X8, BAYER8, BAYER8, 8),
++	CAMSV_FMT(SBGGR10, SBGGR10_1X10, BAYER10_UNPACKED, BAYER10, 16),
++	CAMSV_FMT(SGBRG10, SGBRG10_1X10, BAYER10_UNPACKED, BAYER10, 16),
++	CAMSV_FMT(SGRBG10, SGRBG10_1X10, BAYER10_UNPACKED, BAYER10, 16),
++	CAMSV_FMT(SRGGB10, SRGGB10_1X10, BAYER10_UNPACKED, BAYER10, 16),
++	CAMSV_FMT(SBGGR12, SBGGR12_1X12, BAYER12_UNPACKED, BAYER12, 16),
++	CAMSV_FMT(SGBRG12, SGBRG12_1X12, BAYER12_UNPACKED, BAYER12, 16),
++	CAMSV_FMT(SGRBG12, SGRBG12_1X12, BAYER12_UNPACKED, BAYER12, 16),
++	CAMSV_FMT(SRGGB12, SRGGB12_1X12, BAYER12_UNPACKED, BAYER12, 16),
++};
++
++static const struct mtk_camsv_format *camsv_find_format(u32 fourcc)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(camsv_formats); i++)
++		if (camsv_formats[i].fourcc == fourcc)
++			return &camsv_formats[i];
++	return NULL;
++}
++
++static const struct mtk_camsv_format *
++camsv_try_format(struct v4l2_pix_format *pix)
++{
++	const struct mtk_camsv_format *fmt;
++	u32 stride;
++
++	fmt = camsv_find_format(pix->pixelformat);
++	if (!fmt)
++		fmt = &camsv_formats[0];
++
++	pix->pixelformat = fmt->fourcc;
++	pix->width = clamp_t(u32, ALIGN(pix->width, CAMSV_WIDTH_ALIGN),
++			     CAMSV_MIN_WIDTH, CAMSV_MAX_WIDTH);
++	pix->height = clamp_t(u32, ALIGN(pix->height, CAMSV_HEIGHT_ALIGN),
++			      CAMSV_MIN_HEIGHT, CAMSV_MAX_HEIGHT);
++	/* stride as the ISP7SP format helpers compute it for raw formats */
++	stride = ALIGN(DIV_ROUND_UP(pix->width * fmt->bpp, 8),
++		       CAMSV_STRIDE_ALIGN);
++	pix->bytesperline = stride;
++	pix->sizeimage = stride * pix->height;
++	pix->field = V4L2_FIELD_NONE;
++	pix->colorspace = V4L2_COLORSPACE_RAW;
++	pix->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
++	pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	pix->xfer_func = V4L2_XFER_FUNC_NONE;
++	pix->flags = 0;
++	return fmt;
++}
++
++/* ------------------------------------------------------------------ */
++/* Job control                                                         */
++
++static u32 camsv_next_cookie(struct mtk_camsv_dev *cam)
++{
++	/* positive 31-bit cookies, 0 skipped: the automaton starts at -1 */
++	cam->next_cookie = (cam->next_cookie + 1) & 0x7fffffff;
++	if (!cam->next_cookie)
++		cam->next_cookie = 1;
++	return cam->next_cookie;
++}
++
++static void camsv_buf_done(struct mtk_camsv_buffer *buf,
++			   enum vb2_buffer_state state)
++{
++	buf->vb.vb2_buf.timestamp = buf->started ? buf->ts_ns : ktime_get_ns();
++	buf->vb.sequence = buf->sequence;
++	buf->vb.field = V4L2_FIELD_NONE;
++	vb2_buffer_done(&buf->vb.vb2_buf, state);
++}
++
++/*
++ * Check a composed list before it is launched: it lies inside its slot,
++ * ends with exactly one END descriptor, and every value array it points
++ * at lies inside the same slot. With @print, each descriptor is logged
++ * with its register, count, value address and first value.
++ */
++static int camsv_check_list(struct mtk_camsv_dev *cam, void *slot_cpu,
++			    dma_addr_t slot_dma, u32 off, u32 len, bool print)
++{
++	struct camsv_cq_builder b;
++	struct camsv_cq_cmd cmd;
++	u32 pos, end, i;
++	int ret;
++
++	ret = camsv_cq_builder_init(&b, slot_cpu, slot_dma, CAMSV_CQ_SLOT_SIZE);
++	if (ret)
++		return ret;
++	if (!len || len % CAMSV_CQ_DESC_SIZE || off > CAMSV_CQ_SLOT_SIZE ||
++	    len > CAMSV_CQ_SLOT_SIZE - off)
++		return -EINVAL;
++	end = off + len;
++
++	for (pos = off, i = 0; pos < end; pos += CAMSV_CQ_DESC_SIZE, i++) {
++		const u8 *vals;
++
++		ret = camsv_cq_decode(&b, pos, &cmd);
++		if (ret)
++			return ret;
++		if (cmd.op == CAMSV_CQ_OP_END) {
++			if (pos + CAMSV_CQ_DESC_SIZE != end) {
++				dev_err(cam->dev, "CQ list: END at %u of %u bytes\n",
++					pos - off, len);
++				return -EINVAL;
++			}
++			if (print)
++				dev_info(cam->dev, "  cq[%2u] end\n", i);
++			return 0;
++		}
++
++		vals = camsv_cq_dma_to_cpu(&b, cmd.data);
++		if (cmd.op != CAMSV_CQ_OP_WRITE || !vals ||
++		    cmd.data + 4ULL * cmd.count > (u64)slot_dma + CAMSV_CQ_SLOT_SIZE) {
++			dev_err(cam->dev,
++				"CQ list: descriptor %u (op %u reg 0x%08x x%u) points at %#llx, outside its slot %pad\n",
++				i, cmd.op, cmd.reg, cmd.count, cmd.data, &slot_dma);
++			return -EFAULT;
++		}
++		if (print)
++			dev_info(cam->dev, "  cq[%2u] reg 0x%08x x%u at %#llx = 0x%08x\n",
++				 i, cmd.reg, cmd.count, cmd.data,
++				 get_unaligned_le32(vals));
++	}
++
++	dev_err(cam->dev, "CQ list of %u bytes has no END\n", len);
++	return -EINVAL;
++}
++
++/*
++ * Compose and launch the CQ of the next queued buffer, if the previous
++ * job's settings are already active and a CQ slot is free.
++ */
++void mtk_camsv_try_apply(struct mtk_camsv_dev *cam)
++{
++	struct mtk_camsv_buffer *buf;
++	unsigned long flags;
++	dma_addr_t slot_dma, out;
++	void *slot_cpu;
++	u32 cookie, off, len;
++	int slot, ret;
++
++	lockdep_assert_held(&cam->hw_mutex);
++
++	if (!cam->active || cam->wedged || mtk_camsv_job_bound(cam))
++		return;
++
++	slot = find_first_zero_bit(&cam->cq_slots, CAMSV_CQ_SLOTS);
++	if (slot >= CAMSV_CQ_SLOTS)
++		return;
++
++	spin_lock_irqsave(&cam->buf_lock, flags);
++	buf = list_first_entry_or_null(&cam->pending_bufs,
++				       struct mtk_camsv_buffer, list);
++	if (buf)
++		list_del(&buf->list);
++	spin_unlock_irqrestore(&cam->buf_lock, flags);
++	if (!buf)
++		return;
++
++	slot_cpu = cam->cq_cpu + slot * CAMSV_CQ_SLOT_SIZE;
++	slot_dma = cam->cq_dma + slot * CAMSV_CQ_SLOT_SIZE;
++	out = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
++	cookie = camsv_next_cookie(cam);
++
++	camsv_cq_frame_begin(&cam->cq_state, cookie);
++	ret = camsv_cq_frame_set_output(&cam->cq_state, cam->cq_hw_id,
++					CAMSV_IMG_TAG, cam->fmt->out_fmt,
++					cam->pix.bytesperline, out,
++					cam->pix.sizeimage);
++	if (!ret)
++		ret = camsv_cq_compose_single(&cam->cq_state, &cam->cq_scratch,
++					      slot_cpu, slot_dma,
++					      CAMSV_CQ_SLOT_SIZE, &off, &len);
++	if (!ret && !len)
++		ret = -ENODATA;
++	if (!ret)
++		ret = camsv_check_list(cam, slot_cpu, slot_dma, off, len,
++				       mtk_camsv_debug & CAMSV_DBG_CQ);
++	if (ret) {
++		/*
++		 * Nothing was published. A composition error leaves the
++		 * session state unchanged; a rejected list (a builder bug)
++		 * has already consumed the pending configuration.
++		 */
++		dev_err(cam->dev, "CQ composition failed: %d\n", ret);
++		buf->started = false;
++		buf->sequence = 0;
++		camsv_buf_done(buf, VB2_BUF_STATE_ERROR);
++		return;
++	}
++
++	buf->cookie = cookie;
++	buf->slot = slot;
++	buf->error = false;
++	buf->started = false;
++	buf->sequence = 0;
++
++	/* bind before any MMIO of the launch */
++	if (mtk_camsv_bind_job(cam, cookie)) {
++		spin_lock_irqsave(&cam->buf_lock, flags);
++		list_add(&buf->list, &cam->pending_bufs);
++		spin_unlock_irqrestore(&cam->buf_lock, flags);
++		return;
++	}
++
++	set_bit(slot, &cam->cq_slots);
++	spin_lock_irqsave(&cam->buf_lock, flags);
++	list_add_tail(&buf->list, &cam->inflight_bufs);
++	cam->num_inflight++;
++	spin_unlock_irqrestore(&cam->buf_lock, flags);
++
++	cam->last_out_dma = out;
++	if (mtk_camsv_debug & CAMSV_DBG_CQ) {
++		dma_addr_t list = slot_dma + off;
++
++		struct iommu_domain *dom = iommu_get_domain_for_dev(cam->dev);
++		phys_addr_t list_pa = dom ? iommu_iova_to_phys(dom, list) : 0;
++		phys_addr_t out_pa = dom ? iommu_iova_to_phys(dom, out) : 0;
++
++		dev_info(cam->dev,
++			 "job cookie %u: slot %d, list %pad (+%u) -> %pa, %u bytes, output %pad -> %pa (%u bytes, stride %u)\n",
++			 cookie, slot, &list, off, &list_pa, len, &out, &out_pa,
++			 cam->pix.sizeimage, cam->pix.bytesperline);
++	}
++
++	/* publish the CQ memory before the launch */
++	if (cam->cq_page)
++		dma_sync_single_for_device(cam->dev, slot_dma,
++					   CAMSV_CQ_SLOT_SIZE, DMA_TO_DEVICE);
++	dma_wmb();
++	mtk_camsv_hw_apply_cq(cam, slot_dma + off, len);
++
++	if (mtk_camsv_debug & CAMSV_DBG_CQ)
++		mtk_camsv_hw_dump_cq_regs(cam);
++}
++
++static struct mtk_camsv_buffer *
++camsv_find_inflight(struct mtk_camsv_dev *cam, u32 cookie)
++{
++	struct mtk_camsv_buffer *buf;
++
++	list_for_each_entry(buf, &cam->inflight_bufs, list)
++		if (buf->cookie == cookie)
++			return buf;
++	return NULL;
++}
++
++void mtk_camsv_frame_started(struct mtk_camsv_dev *cam, u32 cookie,
++			     const struct mtk_camsv_event *ev)
++{
++	struct mtk_camsv_buffer *buf;
++	unsigned long flags;
++
++	spin_lock_irqsave(&cam->buf_lock, flags);
++	buf = camsv_find_inflight(cam, cookie);
++	if (buf) {
++		buf->started = true;
++		buf->ts_ns = ev->ts_mono_ns;
++		buf->sequence = ev->frame_count;
++	}
++	spin_unlock_irqrestore(&cam->buf_lock, flags);
++}
++
++/*
++ * Start of a frame on the image tag: V4L2_EVENT_FRAME_SYNC on the video
++ * node. The sequence is the one the buffer of this frame gets.
++ */
++void mtk_camsv_frame_sync(struct mtk_camsv_dev *cam, u32 sequence)
++{
++	struct v4l2_event event = {
++		.type = V4L2_EVENT_FRAME_SYNC,
++		.u.frame_sync.frame_sequence = sequence,
++	};
++
++	v4l2_event_queue(&cam->vdev, &event);
++}
++
++void mtk_camsv_frame_error(struct mtk_camsv_dev *cam, u32 cookie)
++{
++	struct mtk_camsv_buffer *buf;
++	unsigned long flags;
++
++	spin_lock_irqsave(&cam->buf_lock, flags);
++	buf = camsv_find_inflight(cam, cookie);
++	if (buf)
++		buf->error = true;
++	spin_unlock_irqrestore(&cam->buf_lock, flags);
++}
++
++/*
++ * Return the buffer of @cookie. Jobs launched before it can no longer
++ * complete (the hardware moved past them) and are returned as errors. A
++ * cookie without a buffer (repeated or spurious done) returns nothing.
++ * Buffers are taken off the list under the lock and returned outside it.
++ */
++void mtk_camsv_frame_done(struct mtk_camsv_dev *cam, u32 cookie)
++{
++	struct mtk_camsv_buffer *buf, *tmp, *match;
++	unsigned long flags;
++	LIST_HEAD(done);
++
++	lockdep_assert_held(&cam->hw_mutex);
++
++	spin_lock_irqsave(&cam->buf_lock, flags);
++	match = camsv_find_inflight(cam, cookie);
++	if (!match) {
++		spin_unlock_irqrestore(&cam->buf_lock, flags);
++		dev_dbg(cam->dev, "done for unknown cookie 0x%x\n", cookie);
++		return;
++	}
++	list_for_each_entry_safe(buf, tmp, &cam->inflight_bufs, list) {
++		list_move_tail(&buf->list, &done);
++		cam->num_inflight--;
++		if (buf == match)
++			break;
++	}
++	spin_unlock_irqrestore(&cam->buf_lock, flags);
++
++	list_for_each_entry_safe(buf, tmp, &done, list) {
++		list_del(&buf->list);
++		clear_bit(buf->slot, &cam->cq_slots);
++		camsv_buf_done(buf, buf == match && !buf->error ?
++				    VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR);
++	}
++}
++
++static void camsv_return_all(struct mtk_camsv_dev *cam,
++			     enum vb2_buffer_state state)
++{
++	struct mtk_camsv_buffer *buf, *tmp;
++	unsigned long flags;
++	LIST_HEAD(all);
++
++	spin_lock_irqsave(&cam->buf_lock, flags);
++	list_splice_tail_init(&cam->inflight_bufs, &all);
++	list_splice_tail_init(&cam->pending_bufs, &all);
++	cam->num_inflight = 0;
++	spin_unlock_irqrestore(&cam->buf_lock, flags);
++
++	bitmap_zero(&cam->cq_slots, CAMSV_CQ_SLOTS);
++	list_for_each_entry_safe(buf, tmp, &all, list) {
++		list_del(&buf->list);
++		vb2_buffer_done(&buf->vb.vb2_buf, state);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* vb2                                                                 */
++
++static int camsv_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
++			     unsigned int *num_planes, unsigned int sizes[],
++			     struct device *alloc_devs[])
++{
++	struct mtk_camsv_dev *cam = vb2_get_drv_priv(q);
++
++	if (*num_planes)
++		return sizes[0] < cam->pix.sizeimage ? -EINVAL : 0;
++
++	*num_planes = 1;
++	sizes[0] = cam->pix.sizeimage;
++	return 0;
++}
++
++static int camsv_buf_prepare(struct vb2_buffer *vb)
++{
++	struct mtk_camsv_dev *cam = vb2_get_drv_priv(vb->vb2_queue);
++	unsigned long size = cam->pix.sizeimage;
++
++	if (vb2_plane_size(vb, 0) < size)
++		return -EINVAL;
++	/*
++	 * TODO: the WDMA address alignment is not specified; the
++	 * stride alignment is required for the start address as well.
++	 */
++	if (vb2_dma_contig_plane_dma_addr(vb, 0) & (CAMSV_BUF_ALIGN - 1))
++		return -EINVAL;
++
++	vb2_set_plane_payload(vb, 0, size);
++
++	if (mtk_camsv_debug & CAMSV_DBG_CQ) {
++		dma_addr_t addr = vb2_dma_contig_plane_dma_addr(vb, 0);
++
++		dev_info(cam->dev, "buffer %u: %pad, %lu bytes\n", vb->index,
++			 &addr, vb2_plane_size(vb, 0));
++	}
++	return 0;
++}
++
++static void camsv_buf_queue(struct vb2_buffer *vb)
++{
++	struct mtk_camsv_dev *cam = vb2_get_drv_priv(vb->vb2_queue);
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
++	struct mtk_camsv_buffer *buf =
++		container_of(vbuf, struct mtk_camsv_buffer, vb);
++	unsigned long flags;
++
++	spin_lock_irqsave(&cam->buf_lock, flags);
++	list_add_tail(&buf->list, &cam->pending_bufs);
++	spin_unlock_irqrestore(&cam->buf_lock, flags);
++
++	mutex_lock(&cam->hw_mutex);
++	mtk_camsv_try_apply(cam);
++	mutex_unlock(&cam->hw_mutex);
++}
++
++static void camsv_source_log_status(struct mtk_camsv_dev *cam)
++{
++	if (cam->source)
++		v4l2_subdev_call(cam->source, core, log_status);
++}
++
++static void camsv_dump_work(struct work_struct *work)
++{
++	struct mtk_camsv_dev *cam =
++		container_of(to_delayed_work(work), struct mtk_camsv_dev,
++			     dump_work);
++
++	mtk_camsv_hw_dump(cam, "1 s after start");
++	camsv_source_log_status(cam);
++}
++
++/*
++ * Stop the engine and give every buffer back. If the stop reset times
++ * out the hardware may still write to memory: the device is marked
++ * wedged, keeps its power reference (no clock gating of a busy master)
++ * and refuses to stream again. vb2 still needs the buffers back.
++ */
++static void camsv_stop(struct mtk_camsv_dev *cam, enum vb2_buffer_state state)
++{
++	int ret;
++
++	cancel_delayed_work_sync(&cam->dump_work);
++	if (mtk_camsv_debug & CAMSV_DBG_DUMP) {
++		mtk_camsv_hw_dump(cam, "stop");
++		if (cam->source_streaming)
++			camsv_source_log_status(cam);
++	}
++
++	mutex_lock(&cam->hw_mutex);
++	cam->active = false;
++	ret = mtk_camsv_hw_stop(cam);
++	mtk_camsv_unbind_job(cam);
++	if (ret) {
++		cam->wedged = true;
++		dev_err(cam->dev,
++			"engine did not stop (%d): device disabled until rebind\n",
++			ret);
++	}
++	camsv_return_all(cam, state);
++	mutex_unlock(&cam->hw_mutex);
++
++	if (cam->source_streaming) {
++		v4l2_subdev_disable_streams(cam->source, cam->source_pad,
++					    BIT_ULL(0));
++		cam->source_streaming = false;
++	}
++
++	if (cam->wedged)
++		mtk_camsv_hw_irqs(cam, false);
++	else
++		pm_runtime_put(cam->dev);
++}
++
++static int camsv_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct mtk_camsv_dev *cam = vb2_get_drv_priv(q);
++	struct camsv_cq_tag cfg = {
++		.tag_id = CAMSV_IMG_TAG,
++		.tag_order = CAMSV_IMG_TAG_ORDER,
++		.pixel_mode = CAMSV_PIXEL_MODE,
++	};
++	struct media_pad *remote;
++	bool bound;
++	int ret;
++
++	if (cam->wedged) {
++		ret = -EIO;
++		goto err_return;
++	}
++
++	ret = video_device_pipeline_start(&cam->vdev, &cam->pipe);
++	if (ret)
++		goto err_return;
++
++	remote = media_pad_remote_pad_unique(&cam->pad);
++	if (IS_ERR(remote)) {
++		ret = PTR_ERR(remote);
++		goto err_pipe;
++	}
++	if (!is_media_entity_v4l2_subdev(remote->entity)) {
++		ret = -EINVAL;
++		goto err_pipe;
++	}
++	cam->source = media_entity_to_v4l2_subdev(remote->entity);
++	cam->source_pad = remote->index;
++
++	ret = pm_runtime_resume_and_get(cam->dev);
++	if (ret)
++		goto err_pipe;
++
++	cfg.input_format = cam->fmt->in_fmt;
++	cfg.crop_width = cam->pix.width;
++	cfg.crop_height = cam->pix.height;
++
++	mutex_lock(&cam->hw_mutex);
++	mtk_camsv_state_reset(cam);
++	mtk_camsv_hw_dev_config(cam);
++	camsv_cq_state_init(&cam->cq_state);
++	camsv_cq_config_begin(&cam->cq_state);
++	ret = camsv_cq_config_add(&cam->cq_state, 0, 0, cam->cq_hw_id, &cfg,
++				  true, false, false);
++	reinit_completion(&cam->setting_done);
++	if (!ret) {
++		cam->active = true;
++		/* the first job carries the configuration */
++		mtk_camsv_try_apply(cam);
++		bound = mtk_camsv_job_bound(cam);
++		if (!bound)
++			ret = -EIO;
++	}
++	mutex_unlock(&cam->hw_mutex);
++	if (ret)
++		goto err_stop;
++
++	/*
++	 * TODO: the first CQ is expected to execute before the TG
++	 * is enabled (the CQ-done IRQ confirms it); not verified on hardware.
++	 */
++	if (!wait_for_completion_timeout(&cam->setting_done,
++					 msecs_to_jiffies(CAMSV_SETTING_TIMEOUT_MS))) {
++		dev_err(cam->dev, "first CQ was not applied\n");
++		if (mtk_camsv_debug & CAMSV_DBG_DUMP)
++			mtk_camsv_hw_dump(cam, "first CQ timeout");
++		ret = -ETIMEDOUT;
++		goto err_stop;
++	}
++
++	mutex_lock(&cam->hw_mutex);
++	/* diagnostic only: the read-back semantics of the outer set are unproven */
++	mtk_camsv_hw_check_applied(cam, CAMSV_IMG_TAG, cam->pix.width,
++				   cam->last_out_dma);
++	ret = mtk_camsv_hw_stream(cam, true, BIT(CAMSV_IMG_TAG), 1);
++	mutex_unlock(&cam->hw_mutex);
++	if (ret)
++		goto err_stop;
++
++	ret = v4l2_subdev_enable_streams(cam->source, cam->source_pad,
++					 BIT_ULL(0));
++	if (ret)
++		goto err_stop;
++	cam->source_streaming = true;
++
++	if (mtk_camsv_debug & CAMSV_DBG_DUMP) {
++		mtk_camsv_hw_dump(cam, "start");
++		camsv_source_log_status(cam);
++		schedule_delayed_work(&cam->dump_work,
++				      msecs_to_jiffies(CAMSV_DUMP_DELAY_MS));
++	}
++	return 0;
++
++err_stop:
++	camsv_stop(cam, VB2_BUF_STATE_QUEUED);
++	video_device_pipeline_stop(&cam->vdev);
++	return ret;
++err_pipe:
++	video_device_pipeline_stop(&cam->vdev);
++err_return:
++	mutex_lock(&cam->hw_mutex);
++	camsv_return_all(cam, VB2_BUF_STATE_QUEUED);
++	mutex_unlock(&cam->hw_mutex);
++	return ret;
++}
++
++static void camsv_stop_streaming(struct vb2_queue *q)
++{
++	struct mtk_camsv_dev *cam = vb2_get_drv_priv(q);
++
++	camsv_stop(cam, VB2_BUF_STATE_ERROR);
++	video_device_pipeline_stop(&cam->vdev);
++}
++
++static const struct vb2_ops camsv_vb2_ops = {
++	.queue_setup = camsv_queue_setup,
++	.buf_prepare = camsv_buf_prepare,
++	.buf_queue = camsv_buf_queue,
++	.start_streaming = camsv_start_streaming,
++	.stop_streaming = camsv_stop_streaming,
++};
++
++/* ------------------------------------------------------------------ */
++/* ioctls                                                              */
++
++static int camsv_querycap(struct file *file, void *priv,
++			  struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, CAMSV_MDEV_DRIVER_NAME, sizeof(cap->driver));
++	strscpy(cap->card, "MediaTek MT6878 CAMSV", sizeof(cap->card));
++	return 0;
++}
++
++static int camsv_enum_fmt(struct file *file, void *priv,
++			  struct v4l2_fmtdesc *f)
++{
++	unsigned int i, n = 0;
++
++	for (i = 0; i < ARRAY_SIZE(camsv_formats); i++) {
++		if (f->mbus_code && camsv_formats[i].mbus_code != f->mbus_code)
++			continue;
++		if (n++ == f->index) {
++			f->pixelformat = camsv_formats[i].fourcc;
++			return 0;
++		}
++	}
++	return -EINVAL;
++}
++
++static int camsv_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct mtk_camsv_dev *cam = video_drvdata(file);
++
++	f->fmt.pix = cam->pix;
++	return 0;
++}
++
++static int camsv_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	camsv_try_format(&f->fmt.pix);
++	return 0;
++}
++
++static int camsv_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct mtk_camsv_dev *cam = video_drvdata(file);
++
++	if (vb2_is_busy(&cam->queue))
++		return -EBUSY;
++
++	cam->fmt = camsv_try_format(&f->fmt.pix);
++	cam->pix = f->fmt.pix;
++	return 0;
++}
++
++/* VIDIOC_LOG_STATUS: engine and source registers, only while powered */
++static int camsv_log_status(struct file *file, void *priv)
++{
++	struct mtk_camsv_dev *cam = video_drvdata(file);
++
++	mtk_camsv_hw_dump(cam, "log_status");
++	camsv_source_log_status(cam);
++	return 0;
++}
++
++static int camsv_enum_framesizes(struct file *file, void *priv,
++				 struct v4l2_frmsizeenum *fsize)
++{
++	if (fsize->index || !camsv_find_format(fsize->pixel_format))
++		return -EINVAL;
++
++	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
++	fsize->stepwise.min_width = CAMSV_MIN_WIDTH;
++	fsize->stepwise.max_width = CAMSV_MAX_WIDTH;
++	fsize->stepwise.step_width = CAMSV_WIDTH_ALIGN;
++	fsize->stepwise.min_height = CAMSV_MIN_HEIGHT;
++	fsize->stepwise.max_height = CAMSV_MAX_HEIGHT;
++	fsize->stepwise.step_height = CAMSV_HEIGHT_ALIGN;
++	return 0;
++}
++
++static int camsv_subscribe_event(struct v4l2_fh *fh,
++				 const struct v4l2_event_subscription *sub)
++{
++	switch (sub->type) {
++	case V4L2_EVENT_FRAME_SYNC:
++		return v4l2_event_subscribe(fh, sub, 2, NULL);
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct v4l2_ioctl_ops camsv_ioctl_ops = {
++	.vidioc_querycap = camsv_querycap,
++	.vidioc_enum_fmt_vid_cap = camsv_enum_fmt,
++	.vidioc_g_fmt_vid_cap = camsv_g_fmt,
++	.vidioc_s_fmt_vid_cap = camsv_s_fmt,
++	.vidioc_try_fmt_vid_cap = camsv_try_fmt,
++	.vidioc_enum_framesizes = camsv_enum_framesizes,
++	.vidioc_reqbufs = vb2_ioctl_reqbufs,
++	.vidioc_create_bufs = vb2_ioctl_create_bufs,
++	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
++	.vidioc_querybuf = vb2_ioctl_querybuf,
++	.vidioc_qbuf = vb2_ioctl_qbuf,
++	.vidioc_dqbuf = vb2_ioctl_dqbuf,
++	.vidioc_expbuf = vb2_ioctl_expbuf,
++	.vidioc_streamon = vb2_ioctl_streamon,
++	.vidioc_streamoff = vb2_ioctl_streamoff,
++	.vidioc_log_status = camsv_log_status,
++	.vidioc_subscribe_event = camsv_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
++};
++
++static const struct v4l2_file_operations camsv_fops = {
++	.owner = THIS_MODULE,
++	.open = v4l2_fh_open,
++	.release = vb2_fop_release,
++	.poll = vb2_fop_poll,
++	.mmap = vb2_fop_mmap,
++	.unlocked_ioctl = video_ioctl2,
++};
++
++/* ------------------------------------------------------------------ */
++/* Media controller                                                    */
++
++static int camsv_link_validate(struct media_link *link)
++{
++	struct video_device *vdev =
++		media_entity_to_video_device(link->sink->entity);
++	struct mtk_camsv_dev *cam = video_get_drvdata(vdev);
++	struct v4l2_subdev_format sfmt = {
++		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
++		.pad = link->source->index,
++	};
++	struct v4l2_subdev *sd;
++	int ret;
++
++	if (!is_media_entity_v4l2_subdev(link->source->entity))
++		return -EINVAL;
++	sd = media_entity_to_v4l2_subdev(link->source->entity);
++
++	ret = v4l2_subdev_call_state_active(sd, pad, get_fmt, &sfmt);
++	if (ret)
++		return ret;
++
++	if (sfmt.format.width != cam->pix.width ||
++	    sfmt.format.height != cam->pix.height ||
++	    sfmt.format.code != cam->fmt->mbus_code) {
++		dev_dbg(cam->dev, "format mismatch %ux%u 0x%04x vs %ux%u 0x%04x\n",
++			sfmt.format.width, sfmt.format.height, sfmt.format.code,
++			cam->pix.width, cam->pix.height, cam->fmt->mbus_code);
++		return -EPIPE;
++	}
++	return 0;
++}
++
++/* Only endpoints of this device's port 0 map to the sink pad. */
++static int camsv_get_fwnode_pad(struct media_entity *entity,
++				struct fwnode_endpoint *endpoint)
++{
++	struct video_device *vdev = media_entity_to_video_device(entity);
++	struct mtk_camsv_dev *cam = video_get_drvdata(vdev);
++	struct fwnode_handle *parent;
++	bool mine;
++
++	parent = fwnode_graph_get_port_parent(endpoint->local_fwnode);
++	mine = parent == dev_fwnode(cam->dev);
++	fwnode_handle_put(parent);
++
++	return mine && endpoint->port == 0 ? 0 : -ENXIO;
++}
++
++static const struct media_entity_operations camsv_entity_ops = {
++	.link_validate = camsv_link_validate,
++	.get_fwnode_pad = camsv_get_fwnode_pad,
++};
++
++static int camsv_notifier_bound(struct v4l2_async_notifier *notifier,
++				struct v4l2_subdev *sd,
++				struct v4l2_async_connection *asc)
++{
++	struct mtk_camsv_dev *cam =
++		container_of(notifier, struct mtk_camsv_dev, notifier);
++
++	return v4l2_create_fwnode_links_to_pad(sd, &cam->pad,
++					       MEDIA_LNK_FL_ENABLED |
++					       MEDIA_LNK_FL_IMMUTABLE);
++}
++
++static int camsv_notifier_complete(struct v4l2_async_notifier *notifier)
++{
++	struct mtk_camsv_dev *cam =
++		container_of(notifier, struct mtk_camsv_dev, notifier);
++
++	return v4l2_device_register_subdev_nodes(&cam->v4l2_dev);
++}
++
++static const struct v4l2_async_notifier_operations camsv_notifier_ops = {
++	.bound = camsv_notifier_bound,
++	.complete = camsv_notifier_complete,
++};
++
++static int camsv_register_notifier(struct mtk_camsv_dev *cam)
++{
++	struct v4l2_async_connection *asc;
++	struct fwnode_handle *ep;
++	int ret;
++
++	v4l2_async_nf_init(&cam->notifier, &cam->v4l2_dev);
++	cam->notifier.ops = &camsv_notifier_ops;
++
++	/* the source (seninf) is optional until it has a driver */
++	ep = fwnode_graph_get_endpoint_by_id(dev_fwnode(cam->dev), 0, 0,
++					     FWNODE_GRAPH_ENDPOINT_NEXT);
++	if (!ep)
++		return 0;
++
++	asc = v4l2_async_nf_add_fwnode_remote(&cam->notifier, ep,
++					      struct v4l2_async_connection);
++	fwnode_handle_put(ep);
++	if (IS_ERR(asc)) {
++		ret = PTR_ERR(asc);
++		goto err_cleanup;
++	}
++
++	ret = v4l2_async_nf_register(&cam->notifier);
++	if (ret)
++		goto err_cleanup;
++	return 0;
++
++err_cleanup:
++	v4l2_async_nf_cleanup(&cam->notifier);
++	return ret;
++}
++
++int mtk_camsv_video_register(struct mtk_camsv_dev *cam)
++{
++	struct video_device *vdev = &cam->vdev;
++	struct vb2_queue *q = &cam->queue;
++	int ret;
++
++	INIT_DELAYED_WORK(&cam->dump_work, camsv_dump_work);
++
++	cam->pix.pixelformat = camsv_formats[0].fourcc;
++	cam->pix.width = 1920;
++	cam->pix.height = 1080;
++	cam->fmt = camsv_try_format(&cam->pix);
++
++	cam->mdev.dev = cam->dev;
++	strscpy(cam->mdev.model, "MediaTek MT6878 CAMSV", sizeof(cam->mdev.model));
++	strscpy(cam->mdev.driver_name, CAMSV_MDEV_DRIVER_NAME,
++		sizeof(cam->mdev.driver_name));
++	media_device_init(&cam->mdev);
++	cam->v4l2_dev.mdev = &cam->mdev;
++
++	ret = v4l2_device_register(cam->dev, &cam->v4l2_dev);
++	if (ret)
++		goto err_mdev;
++
++	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	q->io_modes = VB2_MMAP | VB2_DMABUF;
++	q->drv_priv = cam;
++	q->buf_struct_size = sizeof(struct mtk_camsv_buffer);
++	q->ops = &camsv_vb2_ops;
++	q->mem_ops = &vb2_dma_contig_memops;
++	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC |
++			     V4L2_BUF_FLAG_TSTAMP_SRC_SOE;
++	q->lock = &cam->vlock;
++	q->dev = cam->dev;
++	q->min_queued_buffers = 1;
++	ret = vb2_queue_init(q);
++	if (ret)
++		goto err_v4l2;
++
++	cam->pad.flags = MEDIA_PAD_FL_SINK | MEDIA_PAD_FL_MUST_CONNECT;
++	vdev->entity.ops = &camsv_entity_ops;
++	ret = media_entity_pads_init(&vdev->entity, 1, &cam->pad);
++	if (ret)
++		goto err_v4l2;
++
++	strscpy(vdev->name, dev_name(cam->dev), sizeof(vdev->name));
++	vdev->fops = &camsv_fops;
++	vdev->ioctl_ops = &camsv_ioctl_ops;
++	vdev->v4l2_dev = &cam->v4l2_dev;
++	vdev->queue = q;
++	vdev->lock = &cam->vlock;
++	vdev->release = video_device_release_empty;
++	vdev->vfl_dir = VFL_DIR_RX;
++	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
++			    V4L2_CAP_IO_MC;
++	video_set_drvdata(vdev, cam);
++
++	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
++	if (ret)
++		goto err_entity;
++
++	ret = camsv_register_notifier(cam);
++	if (ret)
++		goto err_video;
++
++	ret = media_device_register(&cam->mdev);
++	if (ret)
++		goto err_notifier;
++	return 0;
++
++err_notifier:
++	v4l2_async_nf_unregister(&cam->notifier);
++	v4l2_async_nf_cleanup(&cam->notifier);
++err_video:
++	vb2_video_unregister_device(vdev);
++err_entity:
++	media_entity_cleanup(&vdev->entity);
++err_v4l2:
++	v4l2_device_unregister(&cam->v4l2_dev);
++err_mdev:
++	media_device_cleanup(&cam->mdev);
++	return ret;
++}
++
++void mtk_camsv_video_unregister(struct mtk_camsv_dev *cam)
++{
++	cancel_delayed_work_sync(&cam->dump_work);
++	media_device_unregister(&cam->mdev);
++	v4l2_async_nf_unregister(&cam->notifier);
++	v4l2_async_nf_cleanup(&cam->notifier);
++	vb2_video_unregister_device(&cam->vdev);
++	media_entity_cleanup(&cam->vdev.entity);
++	v4l2_device_unregister(&cam->v4l2_dev);
++	media_device_cleanup(&cam->mdev);
++}
+diff --git a/drivers/media/platform/mediatek/camsv/mtk-camsv.h b/drivers/media/platform/mediatek/camsv/mtk-camsv.h
+new file mode 100644
+index 000000000000..9f6244dc1d2f
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camsv/mtk-camsv.h
+@@ -0,0 +1,273 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * MediaTek MT6878 CAMSV capture driver.
++ *
++ * The engine state machine and the IRQ snapshot layout are based on
++ * mtk_cam-engine_fsm.h, mtk_cam-engine.h and mtk_cam-sv.h of the MediaTek
++ * ISP7SP camsys driver (kernel_modules/mtkcam/camsys/isp7sp/cam, GPL-2.0).
++ *
++ * Copyright (c) 2022-2023 MediaTek Inc.
++ * Copyright (c) 2026 serlk
++ */
++
++#ifndef _MTK_CAMSV_H
++#define _MTK_CAMSV_H
++
++#include <linux/atomic.h>
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/interrupt.h>
++#include <linux/kfifo.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/sizes.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++#include <linux/workqueue.h>
++
++#include <media/media-device.h>
++#include <media/v4l2-async.h>
++#include <media/v4l2-dev.h>
++#include <media/v4l2-device.h>
++#include <media/videobuf2-v4l2.h>
++
++#include "mtk-camsv-cq.h"
++#include "mtk-camsv-regs.h"
++
++#define CAMSV_DRV_NAME			"mtk-camsv-mt6878"
++/* media_device_info.driver and v4l2_capability.driver hold 15 characters */
++#define CAMSV_MDEV_DRIVER_NAME		"mtk-camsv"
++
++#define CAMSV_NUM_IRQS			4
++#define CAMSV_NUM_CLKS			8
++#define CAMSV_MAX_HW_ID			5	/* camsv-id 0..5 -> h 3..8 */
++
++/*
++ * The single tag used for a plain RAW image (ISP7SP "normal" tag table).
++ * TODO: tag, group order and pixel mode of the factory single
++ * exposure capture on Titan 2 are not in the specification.
++ */
++#define CAMSV_IMG_TAG			2
++#define CAMSV_IMG_TAG_ORDER		0
++#define CAMSV_PIXEL_MODE		3	/* 8 pixels per clock */
++
++/* CQ memory: one slot per job in flight. */
++#define CAMSV_CQ_SLOTS			4
++#define CAMSV_CQ_SLOT_SIZE		SZ_4K
++
++#define CAMSV_EVENT_FIFO_SIZE		16
++
++/*
++ * Module parameter "debug" (mtk_camsv_debug):
++ * CAMSV_DBG_CQ: the CQ area, every job's list address, length and output
++ *	buffer, a decode of each list and the CQ address registers read
++ *	back after the launch;
++ * CAMSV_DBG_DUMP: a register dump of the engine and of the source
++ *	(log_status) at stream start, one second later, on a first-CQ
++ *	timeout and at stream stop. Status registers are read (whether a
++ *	read clears them is not known) and the frame size monitor selector
++ *	is written; nothing else is changed.
++ */
++#define CAMSV_DBG_CQ			BIT(0)
++#define CAMSV_DBG_DUMP			BIT(1)
++#define CAMSV_DUMP_DELAY_MS		1000
++
++extern unsigned int mtk_camsv_debug;
++
++#define CAMSV_CQ_AREA_SIZE		(CAMSV_CQ_SLOTS * CAMSV_CQ_SLOT_SIZE)
++
++enum mtk_camsv_irq {
++	CAMSV_IRQ_DONE,
++	CAMSV_IRQ_ERR,
++	CAMSV_IRQ_SOF,
++	CAMSV_IRQ_CQ_DONE,
++};
++
++/* Event classes carried by a snapshot (bit mask). */
++#define CAMSV_EV_DONE			BIT(0)	/* group done */
++#define CAMSV_EV_DROP			BIT(1)	/* enqueue loss reported at SOF */
++#define CAMSV_EV_SOF			BIT(2)
++#define CAMSV_EV_ERROR			BIT(3)
++#define CAMSV_EV_SETTING_DONE		BIT(4)	/* last expected CQ done */
++#define CAMSV_EV_INNER			BIT(5)	/* job settings reached inner */
++
++/**
++ * struct mtk_camsv_event - IRQ snapshot passed to the threaded consumer
++ * @ts_boot_ns: ktime_get_boottime_ns() at the IRQ
++ * @ts_mono_ns: ktime_get_ns() at the IRQ (V4L2 timestamps)
++ * @type: CAMSV_EV_* mask
++ * @cookie_outer: outer cookie of the first tag
++ * @cookie_inner: active cookie of the first tag
++ * @sof_tags: tags with a start of frame
++ * @done_tags: tags covered by the done groups
++ * @drop_tags: tags with an enqueue loss
++ * @err_tags: tags with an error
++ * @err_status: raw error status
++ * @groups: active group masks (SOF only)
++ * @first_tag: first tag mask (SOF only)
++ * @last_tag: last tag mask (SOF only)
++ * @fbc_empty: all active tags have an empty FBC (SOF of the last tag)
++ * @frame_count: extended frame counter before this SOF's update
++ */
++struct mtk_camsv_event {
++	u64 ts_boot_ns;
++	u64 ts_mono_ns;
++	u32 type;
++	u32 cookie_outer;
++	u32 cookie_inner;
++	u32 sof_tags;
++	u32 done_tags;
++	u32 drop_tags;
++	u32 err_tags;
++	u32 err_status;
++	u32 groups[CAMSV_NUM_GROUPS];
++	u32 first_tag;
++	u32 last_tag;
++	u32 frame_count;
++	bool fbc_empty;
++};
++
++/* Cookie automaton; both start at -1. */
++struct mtk_camsv_fsm {
++	s32 active_cookie;
++	s32 completed_cookie;
++};
++
++struct mtk_camsv_format {
++	u32 fourcc;
++	u32 mbus_code;
++	u32 out_fmt;		/* protocol code of the memory format */
++	u32 in_fmt;		/* protocol code of the bus format */
++	u8 bpp;			/* bits per pixel in memory */
++};
++
++struct mtk_camsv_buffer {
++	struct vb2_v4l2_buffer vb;
++	struct list_head list;
++	u32 cookie;
++	int slot;
++	bool error;
++	bool started;
++	u64 ts_ns;
++	u32 sequence;
++};
++
++struct mtk_camsv_dev {
++	struct device *dev;
++	unsigned int hw_id;		/* mediatek,camsv-id */
++	u32 cq_hw_id;			/* h = hw_id + 3 */
++	unsigned long engine_mask;	/* bit used in the pending masks */
++
++	void __iomem *base;		/* C: central, outer */
++	void __iomem *base_dma;		/* D: DMA, outer */
++	void __iomem *base_scq;		/* Q: command queue */
++	void __iomem *inner;		/* I: central, active */
++	void __iomem *inner_dma;
++	void __iomem *inner_scq;
++	struct regmap *camsys;		/* T: camsys main reset */
++
++	int irq[CAMSV_NUM_IRQS];
++	atomic_t irq_count[CAMSV_NUM_IRQS];	/* hard IRQ entries */
++	bool irqs_enabled;
++	struct clk_bulk_data clks[CAMSV_NUM_CLKS];
++
++	/*
++	 * Producer side, shared by the four hard IRQ handlers and the code
++	 * that binds a job: @hw_lock. The kfifo has one writer at a time
++	 * (under @hw_lock) and one reader (the consumer under @hw_mutex).
++	 */
++	raw_spinlock_t hw_lock;
++	DECLARE_KFIFO(events, struct mtk_camsv_event, CAMSV_EVENT_FIFO_SIZE);
++	atomic_t fifo_overflow;
++	u32 first_tag;
++	u32 last_tag;
++	u32 active_groups[CAMSV_NUM_GROUPS];
++	u32 tg_cnt;
++	bool ref_bound;
++	u32 expected_cookie;
++	atomic_long_t pending_cq;
++	atomic_long_t pending_inner;
++
++	/* Consumer side and job control: @hw_mutex. */
++	struct mutex hw_mutex;
++	bool active;			/* events are consumed */
++	bool wedged;			/* a stop reset timed out */
++	struct mtk_camsv_fsm fsm;
++	u32 used_tags;
++	u32 dropped_tags;
++	u32 handled_tags;
++	u32 enabled_tags;
++	/*
++	 * Frame number of the stream: counts the starts of frame of the first
++	 * tag from 0 at stream on. Buffer sequence and FRAME_SYNC event.
++	 */
++	u32 sof_seq;
++	unsigned int streaming_count;
++	unsigned int expected_count;
++	struct completion setting_done;
++	struct camsv_cq_state cq_state;
++	struct camsv_cq_state cq_scratch;
++	void *cq_cpu;
++	dma_addr_t cq_dma;
++	struct page *cq_page;		/* set: streaming mapping (cq_low) */
++	unsigned long cq_slots;
++	u32 next_cookie;
++	dma_addr_t last_out_dma;	/* output buffer of the last launch */
++	struct delayed_work dump_work;
++
++	/* Buffer lists: @buf_lock. */
++	spinlock_t buf_lock;
++	struct list_head pending_bufs;
++	struct list_head inflight_bufs;
++	unsigned int num_inflight;
++
++	/* V4L2 / media controller */
++	struct media_device mdev;
++	struct v4l2_device v4l2_dev;
++	struct video_device vdev;
++	struct media_pad pad;
++	struct media_pipeline pipe;
++	struct vb2_queue queue;
++	struct mutex vlock;		/* serializes the video node */
++	struct v4l2_async_notifier notifier;
++	struct v4l2_subdev *source;
++	u32 source_pad;
++	bool source_streaming;
++	struct v4l2_pix_format pix;
++	const struct mtk_camsv_format *fmt;
++};
++
++/* mtk-camsv-hw.c */
++void mtk_camsv_hw_dev_config(struct mtk_camsv_dev *cam);
++int mtk_camsv_hw_top_reset(struct mtk_camsv_dev *cam);
++int mtk_camsv_hw_stop(struct mtk_camsv_dev *cam);
++void mtk_camsv_hw_irqs(struct mtk_camsv_dev *cam, bool on);
++int mtk_camsv_hw_stream(struct mtk_camsv_dev *cam, bool on, u32 tags,
++			unsigned int count);
++void mtk_camsv_hw_apply_cq(struct mtk_camsv_dev *cam, dma_addr_t addr,
++			   u32 size);
++void mtk_camsv_hw_dump(struct mtk_camsv_dev *cam, const char *why);
++void mtk_camsv_hw_dump_cq_regs(struct mtk_camsv_dev *cam);
++bool mtk_camsv_hw_check_applied(struct mtk_camsv_dev *cam, unsigned int tag,
++				u32 width, dma_addr_t out);
++void mtk_camsv_state_reset(struct mtk_camsv_dev *cam);
++int mtk_camsv_bind_job(struct mtk_camsv_dev *cam, u32 cookie);
++void mtk_camsv_unbind_job(struct mtk_camsv_dev *cam);
++bool mtk_camsv_job_bound(struct mtk_camsv_dev *cam);
++irqreturn_t mtk_camsv_irq_done(int irq, void *data);
++irqreturn_t mtk_camsv_irq_err(int irq, void *data);
++irqreturn_t mtk_camsv_irq_sof(int irq, void *data);
++irqreturn_t mtk_camsv_irq_cq_done(int irq, void *data);
++irqreturn_t mtk_camsv_irq_thread(int irq, void *data);
++
++/* mtk-camsv-video.c */
++int mtk_camsv_video_register(struct mtk_camsv_dev *cam);
++void mtk_camsv_video_unregister(struct mtk_camsv_dev *cam);
++void mtk_camsv_try_apply(struct mtk_camsv_dev *cam);
++void mtk_camsv_frame_started(struct mtk_camsv_dev *cam, u32 cookie,
++			     const struct mtk_camsv_event *ev);
++void mtk_camsv_frame_done(struct mtk_camsv_dev *cam, u32 cookie);
++void mtk_camsv_frame_sync(struct mtk_camsv_dev *cam, u32 sequence);
++void mtk_camsv_frame_error(struct mtk_camsv_dev *cam, u32 cookie);
++
++#endif /* _MTK_CAMSV_H */
+-- 
+2.56.0
+

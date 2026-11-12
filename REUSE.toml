@@ -18,3 +18,11 @@ SPDX-License-Identifier = "LGPL-2.1-or-later AND BSD-2-Clause AND CC0-1.0"
 path = "libcamera/APKBUILD.diff"
 SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
 SPDX-License-Identifier = "GPL-2.0-or-later"
+
+# The kernel patch series (git format-patch of titan2-linux): kernel code, GPL-2.0-only as the
+# kernel; files added by a patch carry their own SPDX line (some bindings and device trees are
+# dual licensed GPL-2.0-only OR BSD-2-Clause / OR MIT)
+[[annotations]]
+path = "kernel/patches/*.patch"
+SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
+SPDX-License-Identifier = "GPL-2.0-only"

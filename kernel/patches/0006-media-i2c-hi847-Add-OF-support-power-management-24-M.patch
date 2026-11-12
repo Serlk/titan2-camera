@@ -1,0 +1,1276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:22:53 +0300
+Subject: [PATCH 06/12] media: i2c: hi847: Add OF support, power management, 24
+ MHz MCLK, module EEPROM
+
+Make the driver usable on DT systems such as the Unihertz Titan 2:
+
+- OF match "hynix,hi847";
+- optional reset and powerdown GPIOs, avdd/dovdd/dvdd supplies and a
+  runtime PM power sequence (MCLK, PDN low 1 ms, RST low 1 ms, DOVDD
+  3 ms, AVDD 1 ms, DVDD 1 ms, RST high 2 ms, PDN high 2 ms; power off in
+  reverse without delays); on ACPI the sensor is only touched at probe
+  when it is in D0, as in hi556;
+- orientation and rotation controls from the firmware node;
+- a 24 MHz MCLK configuration with its own mode tables (3264x2448@30
+  and 1920x1080@60), link frequencies 500 and 400 MHz, 24-bit exposure
+  and frame length writes, group hold (0x0208) around exposure, gain and
+  vblank updates, and the limits of that module. Flip controls stay with
+  the 19.2 MHz tables only, as they rewrite output offsets that the 1080p
+  crop uses;
+- the calibration EEPROM of the camera module (same bus, 0x50 by default,
+  answers only while the module is powered) is read once at probe and
+  offered as a read-only nvmem device for user-space calibration
+  (mtk-module-eeprom.h, shared with the IMX766 driver).
+
+The 19.2 MHz behaviour is unchanged apart from the power handling.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/media/i2c/hi847.c             | 787 ++++++++++++++++++++++++--
+ drivers/media/i2c/mtk-module-eeprom.h | 117 ++++
+ 2 files changed, 852 insertions(+), 52 deletions(-)
+ create mode 100644 drivers/media/i2c/mtk-module-eeprom.h
+
+diff --git a/drivers/media/i2c/hi847.c b/drivers/media/i2c/hi847.c
+index def01aa07b2f..d5eefdc4519f 100644
+--- a/drivers/media/i2c/hi847.c
++++ b/drivers/media/i2c/hi847.c
+@@ -4,23 +4,30 @@
+ #include <linux/acpi.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/i2c.h>
++#include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
+ #include <linux/unaligned.h>
+ 
+ #include <media/v4l2-ctrls.h>
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-fwnode.h>
+ 
++#include "mtk-module-eeprom.h"
++
+ #define HI847_REG_VALUE_08BIT		1
+ #define HI847_REG_VALUE_16BIT		2
+ #define HI847_REG_VALUE_24BIT		3
+ 
++#define HI847_LINK_FREQ_500MHZ		500000000ULL
+ #define HI847_LINK_FREQ_400MHZ		400000000ULL
+ #define HI847_LINK_FREQ_200MHZ		200000000ULL
+ #define HI847_SCLK			72000000ULL
+ #define HI847_MCLK			19200000
++#define HI847_MCLK_24MHZ		24000000
+ #define HI847_DATA_LANES		4
+ #define HI847_RGB_DEPTH			10
+ 
+@@ -46,6 +53,16 @@
+ /* horizontal-timings from sensor */
+ #define HI847_REG_LLP			0x0206
+ 
++/* Bits 23:16 of the frame length and of the exposure (24 MHz setup) */
++#define HI847_REG_FLL_HI		0x0211
++#define HI847_FLL_24BIT_MAX		0xffffff
++#define HI847_REG_EXPOSURE_HI		0x020D
++
++/* Group hold (24 MHz setup) */
++#define HI847_REG_GROUP_HOLD		0x0208
++#define HI847_GROUP_HOLD_ON		0x80
++#define HI847_GROUP_HOLD_OFF		0x00
++
+ /* Exposure controls from sensor */
+ #define HI847_REG_EXPOSURE		0x020A
+ #define HI847_EXPOSURE_MIN		4
+@@ -79,11 +96,31 @@
+ #define HI847_REG_FORMAT_X	0x0F04
+ #define HI847_REG_FORMAT_Y	0x0F06
+ 
++/* Pixel array: the whole readable matrix and the area every mode lies in */
++#define HI847_NATIVE_WIDTH	3296
++#define HI847_NATIVE_HEIGHT	2480
++#define HI847_ACTIVE_LEFT	16
++#define HI847_ACTIVE_TOP	16
++#define HI847_ACTIVE_WIDTH	3264
++#define HI847_ACTIVE_HEIGHT	2448
++
++/*
++ * The init table of the 24 MHz (Unihertz Titan 2) setup is
++ * mipi_data_rate_lane_4 with one more write, 0x0202 = 0x0000, inserted before
++ * entry HI847_INIT_24MHZ_EXTRA_POS.
++ */
++#define HI847_INIT_24MHZ_EXTRA_POS	1672
++
+ enum {
+ 	HI847_LINK_FREQ_400MHZ_INDEX,
+ 	HI847_LINK_FREQ_200MHZ_INDEX,
+ };
+ 
++enum {
++	HI847_24MHZ_LINK_FREQ_500MHZ_INDEX,
++	HI847_24MHZ_LINK_FREQ_400MHZ_INDEX,
++};
++
+ struct hi847_reg {
+ 	u16 address;
+ 	u16 val;
+@@ -117,6 +154,9 @@ struct hi847_mode {
+ 	/* Link frequency needed for this resolution */
+ 	u32 link_freq_index;
+ 
++	/* Analogue crop on the pixel array */
++	struct v4l2_rect crop;
++
+ 	/* Sensor register settings for this resolution */
+ 	const struct hi847_reg_list reg_list;
+ };
+@@ -2147,6 +2187,12 @@ static const struct hi847_mode supported_modes[] = {
+ 		.fll_def = HI847_FLL_30FPS,
+ 		.fll_min = HI847_FLL_30FPS_MIN,
+ 		.llp = 0x033C,
++		.crop = {
++			.left = HI847_ACTIVE_LEFT,
++			.top = HI847_ACTIVE_TOP,
++			.width = HI847_ACTIVE_WIDTH,
++			.height = HI847_ACTIVE_HEIGHT,
++		},
+ 		.reg_list = {
+ 			.num_of_regs = ARRAY_SIZE(mode_3264x2448_regs),
+ 			.regs = mode_3264x2448_regs,
+@@ -2159,6 +2205,13 @@ static const struct hi847_mode supported_modes[] = {
+ 		.fll_def = HI847_FLL_60FPS,
+ 		.fll_min = HI847_FLL_60FPS_MIN,
+ 		.llp = 0x033C,
++		/* 2x2 binning of the whole active area */
++		.crop = {
++			.left = HI847_ACTIVE_LEFT,
++			.top = HI847_ACTIVE_TOP,
++			.width = HI847_ACTIVE_WIDTH,
++			.height = HI847_ACTIVE_HEIGHT,
++		},
+ 		.reg_list = {
+ 			.num_of_regs = ARRAY_SIZE(mode_1632x1224_regs),
+ 			.regs = mode_1632x1224_regs,
+@@ -2167,9 +2220,325 @@ static const struct hi847_mode supported_modes[] = {
+ 	}
+ };
+ 
++/*
++ * Mode tables for a 24 MHz MCLK, as used by the Unihertz Titan 2 module
++ * (MediaTek scenarios 0 and 3).
++ */
++static const struct hi847_reg mode_3264x2448_24mhz_regs[] = {
++	{0x0204, 0x0000},
++	{0x0206, 0x0341},
++	{0x020A, 0x0B3D},
++	{0x020E, 0x0B41},
++	{0x0214, 0x0200},
++	{0x0216, 0x0200},
++	{0x0218, 0x0200},
++	{0x021A, 0x0200},
++	{0x0224, 0x002E},
++	{0x022A, 0x0017},
++	{0x022C, 0x0E1F},
++	{0x022E, 0x09C1},
++	{0x0234, 0x1111},
++	{0x0236, 0x1111},
++	{0x0238, 0x1111},
++	{0x023A, 0x1111},
++	{0x0250, 0x0000},
++	{0x0252, 0x0006},
++	{0x0254, 0x0000},
++	{0x0256, 0x0000},
++	{0x0258, 0x0000},
++	{0x025A, 0x0000},
++	{0x025C, 0x0000},
++	{0x025E, 0x0202},
++	{0x0268, 0x00CC},
++	{0x0440, 0x0020},
++	{0x0F00, 0x0000},
++	{0x0F04, 0x0008},
++	{0x0B02, 0x0100},
++	{0x0B04, 0x00DC},
++	{0x0B12, 0x0CC0},
++	{0x0B14, 0x0990},
++	{0x0B20, 0x0100},
++	{0x1100, 0x1100},
++	{0x1102, 0x0008},
++	{0x1108, 0x0202},
++	{0x1118, 0x0000},
++	{0x0A10, 0xB040},
++	{0x0C14, 0x0008},
++	{0x0C18, 0x0CC0},
++	{0x0C1A, 0x0990},
++	{0x0730, 0x0001},
++	{0x0732, 0x0000},
++	{0x0734, 0x0300},
++	{0x0736, 0x005A},
++	{0x0738, 0x0002},
++	{0x073C, 0x0900},
++	{0x0740, 0x0000},
++	{0x0742, 0x0000},
++	{0x0744, 0x0300},
++	{0x0746, 0x007D},
++	{0x0748, 0x0002},
++	{0x074A, 0x0900},
++	{0x074C, 0x0000},
++	{0x074E, 0x0100},
++	{0x0750, 0x0000},
++	{0x1200, 0x0946},
++	{0x1202, 0x1A00},
++	{0x120E, 0x6027},
++	{0x1210, 0x8027},
++	{0x1246, 0x0104},
++	{0x1000, 0x0300},
++	{0x1002, 0xC311},
++	{0x1004, 0x2BAB},
++	{0x1010, 0x0100},
++	{0x1012, 0x015E},
++	{0x1014, 0x0069},
++	{0x1016, 0x0069},
++	{0x101A, 0x0069},
++	{0x1020, 0xC108},
++	{0x1022, 0x0925},
++	{0x1024, 0x050A},
++	{0x1026, 0x0D0D},
++	{0x1028, 0x160A},
++	{0x102A, 0x0E0A},
++	{0x102C, 0x1800},
++	{0x1038, 0x1100},
++	{0x103E, 0x0001},
++	{0x1040, 0x0000},
++	{0x1042, 0x0108},
++	{0x1044, 0x00C8},
++	{0x1046, 0x0004},
++	{0x1048, 0x00C8},
++	{0x1066, 0x0100},
++	{0x1600, 0xE000},
++	{0x1608, 0x0028},
++	{0x160A, 0x0C80},
++	{0x160C, 0x001A},
++	{0x160E, 0x0960},
++	{0x0252, 0x0009},
++};
++
++static const struct hi847_reg mode_1920x1080_24mhz_regs[] = {
++	{0x0204, 0x0000},
++	{0x0206, 0x033C},
++	{0x020A, 0x05A5},
++	{0x020E, 0x05A9},
++	{0x0214, 0x0200},
++	{0x0216, 0x0200},
++	{0x0218, 0x0200},
++	{0x021A, 0x0200},
++	{0x0224, 0x02DA},
++	{0x022A, 0x0017},
++	{0x022C, 0x0E1F},
++	{0x022E, 0x0715},
++	{0x0234, 0x1111},
++	{0x0236, 0x1111},
++	{0x0238, 0x1111},
++	{0x023A, 0x1111},
++	{0x0440, 0x0032},
++	{0x0F00, 0x0000},
++	{0x0F04, 0x02A8},
++	{0x0B04, 0x00DC},
++	{0x0B12, 0x0780},
++	{0x0B14, 0x0438},
++	{0x0B20, 0x0100},
++	{0x1100, 0x1100},
++	{0x1102, 0x0008},
++	{0x1108, 0x0002},
++	{0x1118, 0x04C2},
++	{0x0A10, 0xB040},
++	{0x0C14, 0x02A8},
++	{0x0C18, 0x0780},
++	{0x0C1A, 0x0438},
++	{0x0730, 0x0001},
++	{0x0732, 0x0000},
++	{0x0734, 0x0300},
++	{0x0736, 0x005A},
++	{0x0738, 0x0002},
++	{0x073C, 0x0900},
++	{0x0740, 0x0000},
++	{0x0742, 0x0000},
++	{0x0744, 0x0300},
++	{0x0746, 0x0064},
++	{0x0748, 0x0002},
++	{0x074A, 0x0900},
++	{0x074C, 0x0000},
++	{0x074E, 0x0100},
++	{0x0750, 0x0000},
++	{0x1200, 0x0946},
++	{0x1202, 0x1E00},
++	{0x120E, 0x6027},
++	{0x1210, 0x8027},
++	{0x1000, 0x0300},
++	{0x1002, 0xC311},
++	{0x1004, 0x2BB0},
++	{0x1010, 0x087B},
++	{0x1012, 0x01E4},
++	{0x1014, 0x0020},
++	{0x1016, 0x0020},
++	{0x101A, 0x0020},
++	{0x1020, 0xC107},
++	{0x1022, 0x071A},
++	{0x1024, 0x0307},
++	{0x1026, 0x0B0B},
++	{0x1028, 0x1209},
++	{0x102A, 0x0B05},
++	{0x102C, 0x1400},
++	{0x1038, 0x0000},
++	{0x103E, 0x0001},
++	{0x1042, 0x0008},
++	{0x1044, 0x0120},
++	{0x1046, 0x01B0},
++	{0x1048, 0x0090},
++	{0x1066, 0x089C},
++	{0x1600, 0x0000},
++	{0x1608, 0x0028},
++	{0x160A, 0x0C80},
++	{0x160C, 0x001A},
++	{0x160E, 0x0960},
++};
++
++/*
++ * TODO: link frequencies of the 24 MHz tables are derived, not
++ * specified. Registers 0x0744..0x0748 (125 for 3264x2448, 100 for 1080p,
++ * pre-divider 2) give 24 * 125 / 3 = 1000 and 24 * 100 / 3 = 800 Mbit/s per
++ * lane, i.e. 500 and 400 MHz; the 19.2 MHz table gives 19.2 * 125 / 3 = 800,
++ * matching HI847_LINK_FREQ_400MHZ. The MIPI timing registers 0x1022..0x102c
++ * scale the same way. The factory csi_pixel_rate (400 Mpixel/s for both modes)
++ * only matches the 3264x2448 mode.
++ */
++static const s64 link_freq_menu_items_24mhz[] = {
++	HI847_LINK_FREQ_500MHZ,
++	HI847_LINK_FREQ_400MHZ,
++};
++
++static const struct hi847_mode supported_modes_24mhz[] = {
++	{
++		.width = 3264,
++		.height = 2448,
++		.fll_def = 0x0B41,
++		.fll_min = 0x0B41,
++		.llp = 0x0341,
++		.crop = {
++			.left = HI847_ACTIVE_LEFT,
++			.top = HI847_ACTIVE_TOP,
++			.width = HI847_ACTIVE_WIDTH,
++			.height = HI847_ACTIVE_HEIGHT,
++		},
++		.reg_list = {
++			.num_of_regs = ARRAY_SIZE(mode_3264x2448_24mhz_regs),
++			.regs = mode_3264x2448_24mhz_regs,
++		},
++		.link_freq_index = HI847_24MHZ_LINK_FREQ_500MHZ_INDEX,
++	},
++	{
++		.width = 1920,
++		.height = 1080,
++		.fll_def = 0x05A9,
++		.fll_min = 0x05A9,
++		.llp = 0x033C,
++		/* window x0/y0 (8, 698) plus output offset x1/y1 (680, 2) */
++		.crop = {
++			.left = 688,
++			.top = 700,
++			.width = 1920,
++			.height = 1080,
++		},
++		.reg_list = {
++			.num_of_regs = ARRAY_SIZE(mode_1920x1080_24mhz_regs),
++			.regs = mode_1920x1080_24mhz_regs,
++		},
++		.link_freq_index = HI847_24MHZ_LINK_FREQ_400MHZ_INDEX,
++	}
++};
++
++struct hi847_clk_config {
++	u32 mclk;
++
++	const s64 *link_freqs;
++	unsigned int num_link_freqs;
++
++	const struct hi847_mode *modes;
++	unsigned int num_modes;
++
++	/* Insert 0x0202 = 0x0000 into the init table */
++	bool init_extra_write;
++	/* 24-bit exposure and frame length, group hold around updates */
++	bool wide_timing;
++	/* Flip controls (they rewrite the 0x0F04/0x0F06 output offsets) */
++	bool has_flip;
++	/*
++	 * Clock that counts the line length (llp), 0 if llp is taken as
++	 * pixels. The Titan 2 modes count it at the 72 MHz pclk: 833 / 72 MHz
++	 * x 2881 lines = 33.3 ms, the frame time measured on the phone.
++	 */
++	u32 line_clk;
++
++	u32 exposure_min;
++	u32 exposure_step;
++	u32 exposure_margin;
++	/* 0: maximum exposure */
++	u32 exposure_def;
++	u32 fll_max;
++	u32 again_max;
++	u32 again_def;
++};
++
++static const struct hi847_clk_config hi847_clk_configs[] = {
++	{
++		.mclk = HI847_MCLK,
++		.link_freqs = link_freq_menu_items,
++		.num_link_freqs = ARRAY_SIZE(link_freq_menu_items),
++		.modes = supported_modes,
++		.num_modes = ARRAY_SIZE(supported_modes),
++		.has_flip = true,
++		.exposure_min = HI847_EXPOSURE_MIN,
++		.exposure_step = HI847_EXPOSURE_STEP,
++		.exposure_margin = HI847_EXPOSURE_MAX_MARGIN,
++		.fll_max = HI847_FLL_MAX,
++		.again_max = HI847_ANAL_GAIN_MAX,
++		.again_def = HI847_ANAL_GAIN_MIN,
++	},
++	{
++		/*
++		 * Limits of the Titan 2 setup: exposure from 8 lines in steps
++		 * of 2 with a margin of 22, gain code = gain / 64 - 16 for 1x
++		 * to 15.5x (0..232), 4x and 976 lines by default.
++		 */
++		.mclk = HI847_MCLK_24MHZ,
++		.link_freqs = link_freq_menu_items_24mhz,
++		.num_link_freqs = ARRAY_SIZE(link_freq_menu_items_24mhz),
++		.modes = supported_modes_24mhz,
++		.num_modes = ARRAY_SIZE(supported_modes_24mhz),
++		.init_extra_write = true,
++		.wide_timing = true,
++		.line_clk = 72000000,
++		.exposure_min = 8,
++		.exposure_step = 2,
++		.exposure_margin = 22,
++		.exposure_def = 976,
++		.fll_max = HI847_FLL_24BIT_MAX,
++		.again_max = 232,
++		.again_def = 48,
++	},
++};
++
++static const char * const hi847_supply_names[] = {
++	"dovdd",	/* Digital I/O 1.8 V */
++	"avdd",		/* Analog 2.8 V */
++	"dvdd",		/* Digital core 1.1 V */
++};
++
++#define HI847_NUM_SUPPLIES ARRAY_SIZE(hi847_supply_names)
++
+ struct hi847 {
+ 	struct device *dev;
+ 	struct clk *clk;
++	struct gpio_desc *reset_gpio;
++	struct gpio_desc *powerdown_gpio;
++	struct regulator_bulk_data supplies[HI847_NUM_SUPPLIES];
++
++	/* Tables and limits for the MCLK frequency */
++	const struct hi847_clk_config *cfg;
+ 
+ 	struct v4l2_subdev sd;
+ 	struct media_pad pad;
+@@ -2191,15 +2560,29 @@ struct hi847 {
+ 	struct mutex mutex;
+ };
+ 
+-static u64 to_pixel_rate(u32 f_index)
++static u64 to_pixel_rate(struct hi847 *hi847, u32 f_index)
+ {
+-	u64 pixel_rate = link_freq_menu_items[f_index] * 2 * HI847_DATA_LANES;
++	u64 pixel_rate = hi847->cfg->link_freqs[f_index] * 2 * HI847_DATA_LANES;
+ 
+ 	do_div(pixel_rate, HI847_RGB_DEPTH);
+ 
+ 	return pixel_rate;
+ }
+ 
++/* HBLANK in pixel rate cycles: line time (llp at line_clk) minus width */
++static s64 hi847_hblank(struct hi847 *hi847, const struct hi847_mode *mode)
++{
++	u64 line;
++
++	if (!hi847->cfg->line_clk)
++		return (s64)mode->llp - mode->width;
++
++	line = DIV_ROUND_CLOSEST_ULL((u64)mode->llp *
++				     to_pixel_rate(hi847, mode->link_freq_index),
++				     hi847->cfg->line_clk);
++	return (s64)line - mode->width;
++}
++
+ static int hi847_read_reg(struct hi847 *hi847, u16 reg, u16 len, u32 *val)
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(&hi847->sd);
+@@ -2267,6 +2650,74 @@ static int hi847_write_reg_list(struct hi847 *hi847,
+ 	return 0;
+ }
+ 
++static int hi847_write_init(struct hi847 *hi847,
++			    const struct hi847_reg_list *r_list)
++{
++	struct hi847_reg_list part;
++	int ret;
++
++	if (!hi847->cfg->init_extra_write ||
++	    r_list->num_of_regs < HI847_INIT_24MHZ_EXTRA_POS)
++		return hi847_write_reg_list(hi847, r_list);
++
++	part.regs = r_list->regs;
++	part.num_of_regs = HI847_INIT_24MHZ_EXTRA_POS;
++	ret = hi847_write_reg_list(hi847, &part);
++	if (ret)
++		return ret;
++
++	ret = hi847_write_reg(hi847, HI847_REG_MIRROR_FLIP,
++			      HI847_REG_VALUE_16BIT, 0x0000);
++	if (ret)
++		return ret;
++
++	part.regs = r_list->regs + HI847_INIT_24MHZ_EXTRA_POS;
++	part.num_of_regs = r_list->num_of_regs - HI847_INIT_24MHZ_EXTRA_POS;
++
++	return hi847_write_reg_list(hi847, &part);
++}
++
++static int hi847_group_hold(struct hi847 *hi847, bool hold)
++{
++	if (!hi847->cfg->wide_timing)
++		return 0;
++
++	return hi847_write_reg(hi847, HI847_REG_GROUP_HOLD,
++			       HI847_REG_VALUE_08BIT,
++			       hold ? HI847_GROUP_HOLD_ON :
++				      HI847_GROUP_HOLD_OFF);
++}
++
++static int hi847_write_exposure(struct hi847 *hi847, u32 val)
++{
++	int ret;
++
++	if (hi847->cfg->wide_timing) {
++		ret = hi847_write_reg(hi847, HI847_REG_EXPOSURE_HI,
++				      HI847_REG_VALUE_08BIT, val >> 16);
++		if (ret)
++			return ret;
++	}
++
++	return hi847_write_reg(hi847, HI847_REG_EXPOSURE,
++			       HI847_REG_VALUE_16BIT, val & 0xffff);
++}
++
++static int hi847_write_fll(struct hi847 *hi847, u32 val)
++{
++	int ret;
++
++	if (hi847->cfg->wide_timing) {
++		ret = hi847_write_reg(hi847, HI847_REG_FLL_HI,
++				      HI847_REG_VALUE_08BIT, val >> 16);
++		if (ret)
++			return ret;
++	}
++
++	return hi847_write_reg(hi847, HI847_REG_FLL,
++			       HI847_REG_VALUE_16BIT, val & 0xffff);
++}
++
+ static int hi847_update_digital_gain(struct hi847 *hi847, u32 d_gain)
+ {
+ 	int ret;
+@@ -2419,10 +2870,13 @@ static int hi847_set_ctrl(struct v4l2_ctrl *ctrl)
+ 	if (ctrl->id == V4L2_CID_VBLANK) {
+ 		/* Update max exposure while meeting expected vblanking */
+ 		exposure_max = hi847->cur_mode->height + ctrl->val -
+-			       HI847_EXPOSURE_MAX_MARGIN;
++			       hi847->cfg->exposure_margin;
+ 		__v4l2_ctrl_modify_range(hi847->exposure,
+ 					 hi847->exposure->minimum,
+ 					 exposure_max, hi847->exposure->step,
++					 hi847->cfg->exposure_def ?
++					 min_t(s64, hi847->cfg->exposure_def,
++					       exposure_max) :
+ 					 exposure_max);
+ 	}
+ 
+@@ -2432,8 +2886,12 @@ static int hi847_set_ctrl(struct v4l2_ctrl *ctrl)
+ 
+ 	switch (ctrl->id) {
+ 	case V4L2_CID_ANALOGUE_GAIN:
+-		ret = hi847_write_reg(hi847, HI847_REG_ANALOG_GAIN,
+-				      HI847_REG_VALUE_16BIT, ctrl->val);
++		ret = hi847_group_hold(hi847, true);
++		if (!ret)
++			ret = hi847_write_reg(hi847, HI847_REG_ANALOG_GAIN,
++					      HI847_REG_VALUE_16BIT, ctrl->val);
++		if (!ret)
++			ret = hi847_group_hold(hi847, false);
+ 		break;
+ 
+ 	case V4L2_CID_DIGITAL_GAIN:
+@@ -2441,15 +2899,22 @@ static int hi847_set_ctrl(struct v4l2_ctrl *ctrl)
+ 		break;
+ 
+ 	case V4L2_CID_EXPOSURE:
+-		ret = hi847_write_reg(hi847, HI847_REG_EXPOSURE,
+-				      HI847_REG_VALUE_16BIT, ctrl->val);
++		ret = hi847_group_hold(hi847, true);
++		if (!ret)
++			ret = hi847_write_exposure(hi847, ctrl->val);
++		if (!ret)
++			ret = hi847_group_hold(hi847, false);
+ 		break;
+ 
+ 	case V4L2_CID_VBLANK:
+ 		/* Update FLL that meets expected vertical blanking */
+-		ret = hi847_write_reg(hi847, HI847_REG_FLL,
+-				      HI847_REG_VALUE_16BIT,
+-				      hi847->cur_mode->height + ctrl->val);
++		ret = hi847_group_hold(hi847, true);
++		if (!ret)
++			ret = hi847_write_fll(hi847,
++					      hi847->cur_mode->height +
++					      ctrl->val);
++		if (!ret)
++			ret = hi847_group_hold(hi847, false);
+ 		break;
+ 
+ 	case V4L2_CID_TEST_PATTERN:
+@@ -2480,39 +2945,47 @@ static const struct v4l2_ctrl_ops hi847_ctrl_ops = {
+ 
+ static int hi847_init_controls(struct hi847 *hi847)
+ {
++	const struct hi847_clk_config *cfg = hi847->cfg;
+ 	struct v4l2_ctrl_handler *ctrl_hdlr;
+-	s64 exposure_max, h_blank;
++	s64 exposure_max, exposure_def, h_blank, pixel_rate_max;
++	struct v4l2_fwnode_device_properties props;
++	unsigned int i;
+ 	int ret;
+ 
+ 	ctrl_hdlr = &hi847->ctrl_handler;
+-	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 8);
++	ret = v4l2_ctrl_handler_init(ctrl_hdlr, 10);
+ 	if (ret)
+ 		return ret;
+ 
+ 	ctrl_hdlr->lock = &hi847->mutex;
+ 	hi847->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr, &hi847_ctrl_ops,
+ 						  V4L2_CID_LINK_FREQ,
+-					ARRAY_SIZE(link_freq_menu_items) - 1,
+-					0, link_freq_menu_items);
++						  cfg->num_link_freqs - 1,
++						  hi847->cur_mode->link_freq_index,
++						  cfg->link_freqs);
+ 	if (hi847->link_freq)
+ 		hi847->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+ 
++	pixel_rate_max = 0;
++	for (i = 0; i < cfg->num_link_freqs; i++)
++		pixel_rate_max = max_t(s64, pixel_rate_max,
++				       to_pixel_rate(hi847, i));
++
+ 	hi847->pixel_rate = v4l2_ctrl_new_std
+ 			    (ctrl_hdlr, &hi847_ctrl_ops,
+-			     V4L2_CID_PIXEL_RATE, 0,
+-			     to_pixel_rate(HI847_LINK_FREQ_400MHZ_INDEX),
+-			     1,
+-			     to_pixel_rate(HI847_LINK_FREQ_400MHZ_INDEX));
++			     V4L2_CID_PIXEL_RATE, 0, pixel_rate_max, 1,
++			     to_pixel_rate(hi847,
++					   hi847->cur_mode->link_freq_index));
+ 	hi847->vblank = v4l2_ctrl_new_std(ctrl_hdlr, &hi847_ctrl_ops,
+ 					  V4L2_CID_VBLANK,
+ 					  hi847->cur_mode->fll_min -
+ 					  hi847->cur_mode->height,
+-					  HI847_FLL_MAX -
++					  cfg->fll_max -
+ 					  hi847->cur_mode->height, 1,
+ 					  hi847->cur_mode->fll_def -
+ 					  hi847->cur_mode->height);
+ 
+-	h_blank = hi847->cur_mode->llp - hi847->cur_mode->width;
++	h_blank = hi847_hblank(hi847, hi847->cur_mode);
+ 
+ 	hi847->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &hi847_ctrl_ops,
+ 					  V4L2_CID_HBLANK, h_blank, h_blank, 1,
+@@ -2521,29 +2994,44 @@ static int hi847_init_controls(struct hi847 *hi847)
+ 		hi847->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+ 
+ 	v4l2_ctrl_new_std(ctrl_hdlr, &hi847_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
+-			  HI847_ANAL_GAIN_MIN, HI847_ANAL_GAIN_MAX,
+-			  HI847_ANAL_GAIN_STEP, HI847_ANAL_GAIN_MIN);
++			  HI847_ANAL_GAIN_MIN, cfg->again_max,
++			  HI847_ANAL_GAIN_STEP, cfg->again_def);
+ 	v4l2_ctrl_new_std(ctrl_hdlr, &hi847_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
+ 			  HI847_DGTL_GAIN_MIN, HI847_DGTL_GAIN_MAX,
+ 			  HI847_DGTL_GAIN_STEP, HI847_DGTL_GAIN_DEFAULT);
+-	exposure_max = hi847->cur_mode->fll_def - HI847_EXPOSURE_MAX_MARGIN;
++	exposure_max = hi847->cur_mode->fll_def - cfg->exposure_margin;
++	exposure_def = cfg->exposure_def ?
++		       min_t(s64, cfg->exposure_def, exposure_max) :
++		       exposure_max;
+ 	hi847->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &hi847_ctrl_ops,
+ 					    V4L2_CID_EXPOSURE,
+-					    HI847_EXPOSURE_MIN, exposure_max,
+-					    HI847_EXPOSURE_STEP,
+-					    exposure_max);
++					    cfg->exposure_min, exposure_max,
++					    cfg->exposure_step,
++					    exposure_def);
+ 	v4l2_ctrl_new_std_menu_items(ctrl_hdlr, &hi847_ctrl_ops,
+ 				     V4L2_CID_TEST_PATTERN,
+ 				     ARRAY_SIZE(hi847_test_pattern_menu) - 1,
+ 				     0, 0, hi847_test_pattern_menu);
+-	hi847->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &hi847_ctrl_ops,
+-					 V4L2_CID_HFLIP, 0, 1, 1, 0);
+-	hi847->vflip = v4l2_ctrl_new_std(ctrl_hdlr, &hi847_ctrl_ops,
+-					 V4L2_CID_VFLIP, 0, 1, 1, 0);
++	if (cfg->has_flip) {
++		hi847->hflip = v4l2_ctrl_new_std(ctrl_hdlr, &hi847_ctrl_ops,
++						 V4L2_CID_HFLIP, 0, 1, 1, 0);
++		hi847->vflip = v4l2_ctrl_new_std(ctrl_hdlr, &hi847_ctrl_ops,
++						 V4L2_CID_VFLIP, 0, 1, 1, 0);
++	}
+ 
+ 	if (ctrl_hdlr->error)
+ 		return ctrl_hdlr->error;
+ 
++	/* Orientation and rotation from firmware, when described there */
++	ret = v4l2_fwnode_device_parse(hi847->dev, &props);
++	if (ret)
++		return ret;
++
++	ret = v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &hi847_ctrl_ops,
++					      &props);
++	if (ret)
++		return ret;
++
+ 	hi847->sd.ctrl_handler = ctrl_hdlr;
+ 
+ 	return 0;
+@@ -2564,8 +3052,11 @@ static int hi847_start_streaming(struct hi847 *hi847)
+ 	int link_freq_index, ret;
+ 
+ 	link_freq_index = hi847->cur_mode->link_freq_index;
++	/* The 24 MHz setup has one init table for all its link frequencies */
++	if (hi847->cfg->init_extra_write)
++		link_freq_index = HI847_LINK_FREQ_400MHZ_INDEX;
+ 	reg_list = &link_freq_configs[link_freq_index].reg_list;
+-	ret = hi847_write_reg_list(hi847, reg_list);
++	ret = hi847_write_init(hi847, reg_list);
+ 	if (ret) {
+ 		dev_err(hi847->dev, "failed to set plls");
+ 		return ret;
+@@ -2646,8 +3137,8 @@ static int hi847_set_format(struct v4l2_subdev *sd,
+ 	const struct hi847_mode *mode;
+ 	s32 vblank_def, h_blank;
+ 
+-	mode = v4l2_find_nearest_size(supported_modes,
+-				      ARRAY_SIZE(supported_modes), width,
++	mode = v4l2_find_nearest_size(hi847->cfg->modes,
++				      hi847->cfg->num_modes, width,
+ 				      height, fmt->format.width,
+ 				      fmt->format.height);
+ 
+@@ -2660,17 +3151,18 @@ static int hi847_set_format(struct v4l2_subdev *sd,
+ 		hi847->cur_mode = mode;
+ 		__v4l2_ctrl_s_ctrl(hi847->link_freq, mode->link_freq_index);
+ 		__v4l2_ctrl_s_ctrl_int64(hi847->pixel_rate,
+-					 to_pixel_rate(mode->link_freq_index));
++					 to_pixel_rate(hi847,
++						       mode->link_freq_index));
+ 
+ 		/* Update limits and set FPS to default */
+ 		vblank_def = mode->fll_def - mode->height;
+ 		__v4l2_ctrl_modify_range(hi847->vblank,
+ 					 mode->fll_min - mode->height,
+-					 HI847_FLL_MAX - mode->height, 1,
++					 hi847->cfg->fll_max - mode->height, 1,
+ 					 vblank_def);
+ 		__v4l2_ctrl_s_ctrl(hi847->vblank, vblank_def);
+ 
+-		h_blank = hi847->cur_mode->llp - hi847->cur_mode->width;
++		h_blank = hi847_hblank(hi847, hi847->cur_mode);
+ 
+ 		__v4l2_ctrl_modify_range(hi847->hblank, h_blank, h_blank, 1,
+ 					 h_blank);
+@@ -2715,26 +3207,75 @@ static int hi847_enum_frame_size(struct v4l2_subdev *sd,
+ 				 struct v4l2_subdev_state *sd_state,
+ 				 struct v4l2_subdev_frame_size_enum *fse)
+ {
+-	if (fse->index >= ARRAY_SIZE(supported_modes))
++	const struct hi847_clk_config *cfg = to_hi847(sd)->cfg;
++
++	if (fse->index >= cfg->num_modes)
+ 		return -EINVAL;
+ 
+ 	if (fse->code != MEDIA_BUS_FMT_SGRBG10_1X10)
+ 		return -EINVAL;
+ 
+-	fse->min_width = supported_modes[fse->index].width;
++	fse->min_width = cfg->modes[fse->index].width;
+ 	fse->max_width = fse->min_width;
+-	fse->min_height = supported_modes[fse->index].height;
++	fse->min_height = cfg->modes[fse->index].height;
+ 	fse->max_height = fse->min_height;
+ 
+ 	return 0;
+ }
+ 
++static int hi847_get_selection(struct v4l2_subdev *sd,
++			       struct v4l2_subdev_state *sd_state,
++			       struct v4l2_subdev_selection *sel)
++{
++	struct hi847 *hi847 = to_hi847(sd);
++	const struct v4l2_mbus_framefmt *try_fmt;
++	const struct hi847_mode *mode;
++
++	if (sel->pad)
++		return -EINVAL;
++
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP:
++		mutex_lock(&hi847->mutex);
++		if (sel->which == V4L2_SUBDEV_FORMAT_TRY) {
++			try_fmt = v4l2_subdev_state_get_format(sd_state, 0);
++			mode = v4l2_find_nearest_size(hi847->cfg->modes,
++						      hi847->cfg->num_modes,
++						      width, height,
++						      try_fmt->width,
++						      try_fmt->height);
++		} else {
++			mode = hi847->cur_mode;
++		}
++		sel->r = mode->crop;
++		mutex_unlock(&hi847->mutex);
++		return 0;
++
++	case V4L2_SEL_TGT_NATIVE_SIZE:
++		sel->r.left = 0;
++		sel->r.top = 0;
++		sel->r.width = HI847_NATIVE_WIDTH;
++		sel->r.height = HI847_NATIVE_HEIGHT;
++		return 0;
++
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++		sel->r.left = HI847_ACTIVE_LEFT;
++		sel->r.top = HI847_ACTIVE_TOP;
++		sel->r.width = HI847_ACTIVE_WIDTH;
++		sel->r.height = HI847_ACTIVE_HEIGHT;
++		return 0;
++	}
++
++	return -EINVAL;
++}
++
+ static int hi847_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
+ {
+ 	struct hi847 *hi847 = to_hi847(sd);
+ 
+ 	mutex_lock(&hi847->mutex);
+-	hi847_assign_pad_format(&supported_modes[0],
++	hi847_assign_pad_format(&hi847->cfg->modes[0],
+ 				v4l2_subdev_state_get_format(fh->state, 0));
+ 	mutex_unlock(&hi847->mutex);
+ 
+@@ -2748,6 +3289,7 @@ static const struct v4l2_subdev_video_ops hi847_video_ops = {
+ static const struct v4l2_subdev_pad_ops hi847_pad_ops = {
+ 	.set_fmt = hi847_set_format,
+ 	.get_fmt = hi847_get_format,
++	.get_selection = hi847_get_selection,
+ 	.enum_mbus_code = hi847_enum_mbus_code,
+ 	.enum_frame_size = hi847_enum_frame_size,
+ };
+@@ -2784,7 +3326,8 @@ static int hi847_identify_module(struct hi847 *hi847)
+ 	return 0;
+ }
+ 
+-static int hi847_check_hwcfg(struct device *dev)
++static int hi847_check_hwcfg(struct device *dev,
++			     const struct hi847_clk_config *cfg)
+ {
+ 	struct fwnode_handle *ep;
+ 	struct fwnode_handle *fwnode = dev_fwnode(dev);
+@@ -2819,16 +3362,16 @@ static int hi847_check_hwcfg(struct device *dev)
+ 		goto check_hwcfg_error;
+ 	}
+ 
+-	for (i = 0; i < ARRAY_SIZE(link_freq_menu_items); i++) {
++	for (i = 0; i < cfg->num_link_freqs; i++) {
+ 		for (j = 0; j < bus_cfg.nr_of_link_frequencies; j++) {
+-			if (link_freq_menu_items[i] ==
++			if (cfg->link_freqs[i] ==
+ 				bus_cfg.link_frequencies[j])
+ 				break;
+ 		}
+ 
+ 		if (j == bus_cfg.nr_of_link_frequencies) {
+ 			dev_err(dev, "no link frequency %lld supported",
+-				link_freq_menu_items[i]);
++				cfg->link_freqs[i]);
+ 			ret = -EINVAL;
+ 			goto check_hwcfg_error;
+ 		}
+@@ -2840,6 +3383,82 @@ static int hi847_check_hwcfg(struct device *dev)
+ 	return ret;
+ }
+ 
++/*
++ * Power sequence of the Unihertz Titan 2 module: MCLK, PDN low 1 ms, RST low
++ * 1 ms, DOVDD 3 ms, AVDD 1 ms, DVDD 1 ms, RST high 2 ms, PDN high 2 ms. The
++ * MCLK pad drive strength is a DT pinctrl setting. On ACPI systems the
++ * GPIOs and supplies are usually absent and this only gates the clock.
++ */
++static int hi847_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct hi847 *hi847 = to_hi847(sd);
++	unsigned int i;
++	int ret;
++
++	ret = clk_prepare_enable(hi847->clk);
++	if (ret)
++		return ret;
++
++	if (hi847->powerdown_gpio) {
++		gpiod_set_value_cansleep(hi847->powerdown_gpio, 1);
++		usleep_range(1000, 1100);
++	}
++
++	if (hi847->reset_gpio) {
++		gpiod_set_value_cansleep(hi847->reset_gpio, 1);
++		usleep_range(1000, 1100);
++	}
++
++	for (i = 0; i < HI847_NUM_SUPPLIES; i++) {
++		static const unsigned int delay_us[HI847_NUM_SUPPLIES] = {
++			3000, 1000, 1000,
++		};
++
++		ret = regulator_enable(hi847->supplies[i].consumer);
++		if (ret)
++			goto err_supplies;
++		usleep_range(delay_us[i], delay_us[i] + 100);
++	}
++
++	if (hi847->reset_gpio) {
++		gpiod_set_value_cansleep(hi847->reset_gpio, 0);
++		usleep_range(2000, 2100);
++	}
++
++	if (hi847->powerdown_gpio) {
++		gpiod_set_value_cansleep(hi847->powerdown_gpio, 0);
++		usleep_range(2000, 2100);
++	}
++
++	return 0;
++
++err_supplies:
++	while (i--)
++		regulator_disable(hi847->supplies[i].consumer);
++	gpiod_set_value_cansleep(hi847->reset_gpio, 1);
++	gpiod_set_value_cansleep(hi847->powerdown_gpio, 1);
++	clk_disable_unprepare(hi847->clk);
++
++	return ret;
++}
++
++/* Reverse order of hi847_power_on(), without delays */
++static int hi847_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct hi847 *hi847 = to_hi847(sd);
++	unsigned int i = HI847_NUM_SUPPLIES;
++
++	gpiod_set_value_cansleep(hi847->powerdown_gpio, 1);
++	gpiod_set_value_cansleep(hi847->reset_gpio, 1);
++	while (i--)
++		regulator_disable(hi847->supplies[i].consumer);
++	clk_disable_unprepare(hi847->clk);
++
++	return 0;
++}
++
+ static void hi847_remove(struct i2c_client *client)
+ {
+ 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+@@ -2849,6 +3468,9 @@ static void hi847_remove(struct i2c_client *client)
+ 	media_entity_cleanup(&sd->entity);
+ 	v4l2_ctrl_handler_free(sd->ctrl_handler);
+ 	pm_runtime_disable(hi847->dev);
++	if (!pm_runtime_status_suspended(hi847->dev))
++		hi847_power_off(hi847->dev);
++	pm_runtime_set_suspended(hi847->dev);
+ 	mutex_destroy(&hi847->mutex);
+ }
+ 
+@@ -2856,6 +3478,8 @@ static int hi847_probe(struct i2c_client *client)
+ {
+ 	struct hi847 *hi847;
+ 	unsigned long freq;
++	bool full_power;
++	unsigned int i;
+ 	int ret;
+ 
+ 	hi847 = devm_kzalloc(&client->dev, sizeof(*hi847), GFP_KERNEL);
+@@ -2870,27 +3494,69 @@ static int hi847_probe(struct i2c_client *client)
+ 				     "failed to get clock\n");
+ 
+ 	freq = clk_get_rate(hi847->clk);
+-	if (freq != HI847_MCLK)
++	for (i = 0; i < ARRAY_SIZE(hi847_clk_configs); i++) {
++		if (freq == hi847_clk_configs[i].mclk) {
++			hi847->cfg = &hi847_clk_configs[i];
++			break;
++		}
++	}
++	if (!hi847->cfg)
+ 		return dev_err_probe(hi847->dev, -EINVAL,
+ 				     "external clock %lu is not supported\n",
+ 				     freq);
+ 
+-	ret = hi847_check_hwcfg(hi847->dev);
++	ret = hi847_check_hwcfg(hi847->dev, hi847->cfg);
+ 	if (ret) {
+ 		dev_err(hi847->dev, "failed to get HW configuration: %d",
+ 			ret);
+ 		return ret;
+ 	}
+ 
++	hi847->reset_gpio = devm_gpiod_get_optional(hi847->dev, "reset",
++						    GPIOD_OUT_HIGH);
++	if (IS_ERR(hi847->reset_gpio))
++		return dev_err_probe(hi847->dev, PTR_ERR(hi847->reset_gpio),
++				     "failed to get reset GPIO\n");
++
++	hi847->powerdown_gpio = devm_gpiod_get_optional(hi847->dev,
++							"powerdown",
++							GPIOD_OUT_HIGH);
++	if (IS_ERR(hi847->powerdown_gpio))
++		return dev_err_probe(hi847->dev,
++				     PTR_ERR(hi847->powerdown_gpio),
++				     "failed to get powerdown GPIO\n");
++
++	for (i = 0; i < HI847_NUM_SUPPLIES; i++)
++		hi847->supplies[i].supply = hi847_supply_names[i];
++
++	ret = devm_regulator_bulk_get(hi847->dev, HI847_NUM_SUPPLIES,
++				      hi847->supplies);
++	if (ret)
++		return dev_err_probe(hi847->dev, ret,
++				     "failed to get regulators\n");
++
+ 	v4l2_i2c_subdev_init(&hi847->sd, client, &hi847_subdev_ops);
+-	ret = hi847_identify_module(hi847);
+-	if (ret) {
+-		dev_err(hi847->dev, "failed to find sensor: %d", ret);
+-		return ret;
++
++	full_power = acpi_dev_state_d0(hi847->dev);
++	if (full_power) {
++		/* Ensure non ACPI managed resources are enabled */
++		ret = hi847_power_on(hi847->dev);
++		if (ret)
++			return dev_err_probe(hi847->dev, ret,
++					     "failed to power on sensor\n");
++
++		ret = hi847_identify_module(hi847);
++		if (ret) {
++			dev_err(hi847->dev, "failed to find sensor: %d", ret);
++			goto probe_error_power_off;
++		}
++
++		/* Module calibration, readable only while powered */
++		mtk_module_eeprom_register(hi847->dev, client, "hi847-eeprom");
+ 	}
+ 
+ 	mutex_init(&hi847->mutex);
+-	hi847->cur_mode = &supported_modes[0];
++	hi847->cur_mode = &hi847->cfg->modes[0];
+ 	ret = hi847_init_controls(hi847);
+ 	if (ret) {
+ 		dev_err(hi847->dev, "failed to init controls: %d", ret);
+@@ -2915,7 +3581,9 @@ static int hi847_probe(struct i2c_client *client)
+ 		goto probe_error_media_entity_cleanup;
+ 	}
+ 
+-	pm_runtime_set_active(hi847->dev);
++	/* Set the device's state to active if it's in D0 state. */
++	if (full_power)
++		pm_runtime_set_active(hi847->dev);
+ 	pm_runtime_enable(hi847->dev);
+ 	pm_runtime_idle(hi847->dev);
+ 
+@@ -2928,9 +3596,16 @@ static int hi847_probe(struct i2c_client *client)
+ 	v4l2_ctrl_handler_free(hi847->sd.ctrl_handler);
+ 	mutex_destroy(&hi847->mutex);
+ 
++probe_error_power_off:
++	if (full_power)
++		hi847_power_off(hi847->dev);
++
+ 	return ret;
+ }
+ 
++static DEFINE_RUNTIME_DEV_PM_OPS(hi847_pm_ops, hi847_power_off, hi847_power_on,
++				 NULL);
++
+ #ifdef CONFIG_ACPI
+ static const struct acpi_device_id hi847_acpi_ids[] = {
+ 	{"HYV0847"},
+@@ -2940,10 +3615,18 @@ static const struct acpi_device_id hi847_acpi_ids[] = {
+ MODULE_DEVICE_TABLE(acpi, hi847_acpi_ids);
+ #endif
+ 
++static const struct of_device_id hi847_of_match[] = {
++	{ .compatible = "hynix,hi847" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, hi847_of_match);
++
+ static struct i2c_driver hi847_i2c_driver = {
+ 	.driver = {
+ 		.name = "hi847",
++		.pm = pm_ptr(&hi847_pm_ops),
+ 		.acpi_match_table = ACPI_PTR(hi847_acpi_ids),
++		.of_match_table = hi847_of_match,
+ 	},
+ 	.probe = hi847_probe,
+ 	.remove = hi847_remove,
+diff --git a/drivers/media/i2c/mtk-module-eeprom.h b/drivers/media/i2c/mtk-module-eeprom.h
+new file mode 100644
+index 000000000000..24490a85a42a
+--- /dev/null
++++ b/drivers/media/i2c/mtk-module-eeprom.h
+@@ -0,0 +1,117 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Copy of the calibration EEPROM of a camera module, exposed as nvmem.
++ *
++ * The EEPROM of the MediaTek-style camera modules (Unihertz Titan 2: Hi-847
++ * and IMX766) sits next to the sensor on the same I2C bus, by default at
++ * 0x50, with 16-bit addressing, and answers only while the module is powered.
++ * The sensor driver owns the module power, so it reads the EEPROM once while
++ * it is powered for the chip ID check at probe, and offers the copy as a
++ * read-only nvmem device "<name>" (/sys/bus/nvmem/devices/<name>/nvmem) for
++ * userspace calibration (white balance, lens shading, focus range). The
++ * address can be given in DT as a second reg entry named "eeprom".
++ *
++ * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
++ */
++
++#ifndef __MTK_MODULE_EEPROM_H__
++#define __MTK_MODULE_EEPROM_H__
++
++#include <linux/device.h>
++#include <linux/err.h>
++#include <linux/i2c.h>
++#include <linux/nvmem-provider.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++#define MTK_MODULE_EEPROM_ADDR		0x50
++#define MTK_MODULE_EEPROM_SIZE		0x2000
++#define MTK_MODULE_EEPROM_CHUNK		128
++
++static int mtk_module_eeprom_reg_read(void *priv, unsigned int offset,
++				      void *val, size_t bytes)
++{
++	const u8 *data = priv;
++
++	if (offset >= MTK_MODULE_EEPROM_SIZE ||
++	    bytes > MTK_MODULE_EEPROM_SIZE - offset)
++		return -EINVAL;
++
++	memcpy(val, data + offset, bytes);
++	return 0;
++}
++
++/* Call with the module powered. Failures are not fatal for the sensor. */
++static inline void mtk_module_eeprom_register(struct device *dev,
++					      struct i2c_client *client,
++					      const char *name)
++{
++	struct nvmem_config config = { };
++	struct i2c_client *eeprom;
++	struct nvmem_device *nvmem;
++	unsigned int offset;
++	u8 *data;
++	int ret = 0;
++
++	data = devm_kzalloc(dev, MTK_MODULE_EEPROM_SIZE, GFP_KERNEL);
++	if (!data)
++		return;
++
++	eeprom = i2c_new_ancillary_device(client, "eeprom",
++					  MTK_MODULE_EEPROM_ADDR);
++	if (IS_ERR(eeprom)) {
++		dev_info(dev, "no EEPROM client: %pe\n", eeprom);
++		return;
++	}
++
++	for (offset = 0; offset < MTK_MODULE_EEPROM_SIZE;
++	     offset += MTK_MODULE_EEPROM_CHUNK) {
++		u8 addr[2] = { offset >> 8, offset & 0xff };
++		struct i2c_msg msgs[2] = {
++			{
++				.addr = eeprom->addr,
++				.len = sizeof(addr),
++				.buf = addr,
++			}, {
++				.addr = eeprom->addr,
++				.flags = I2C_M_RD,
++				.len = MTK_MODULE_EEPROM_CHUNK,
++				.buf = data + offset,
++			},
++		};
++
++		ret = i2c_transfer(eeprom->adapter, msgs, ARRAY_SIZE(msgs));
++		if (ret != ARRAY_SIZE(msgs)) {
++			ret = ret < 0 ? ret : -EIO;
++			break;
++		}
++		ret = 0;
++	}
++	i2c_unregister_device(eeprom);
++
++	if (ret) {
++		dev_info(dev, "no module EEPROM at 0x%02x: %d\n",
++			 MTK_MODULE_EEPROM_ADDR, ret);
++		return;
++	}
++
++	config.dev = dev;
++	config.name = name;
++	config.id = NVMEM_DEVID_NONE;
++	config.owner = THIS_MODULE;
++	config.read_only = true;
++	config.word_size = 1;
++	config.stride = 1;
++	config.size = MTK_MODULE_EEPROM_SIZE;
++	config.reg_read = mtk_module_eeprom_reg_read;
++	config.priv = data;
++
++	nvmem = devm_nvmem_register(dev, &config);
++	if (IS_ERR(nvmem))
++		dev_warn(dev, "failed to register %s: %pe\n", name, nvmem);
++	else
++		dev_info(dev, "module EEPROM: %s, %u bytes\n", name,
++			 MTK_MODULE_EEPROM_SIZE);
++}
++
++#endif /* __MTK_MODULE_EEPROM_H__ */
+-- 
+2.56.0
+

@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:22:58 +0300
+Subject: [PATCH 11/12] arm64: dts: mediatek: mt6878: Add disabled seninf and
+ CAMSV nodes
+
+Describe the sensor interface with its register windows, interrupts,
+clocks and graph ports, and CAMSV engines 1, 2 and 5 (camsv-id 0, 1 and
+4) with their register windows, interrupts, clocks and IOMMU ports. The
+power domains are those of the factory device tree: CAM_MAIN and CSI_RX
+for seninf, CAM_MAIN for the CAMSV engines. Their register blocks and the
+camsys_main gates they use are inside CAM_MAIN, so the domain has to be on
+before the first clock or register access; runtime PM guarantees that
+order.
+
+The nodes stay disabled: CAM_MAIN exists only on boards that enable
+cam_vcore_pd with its supply. The PHY calibration cells are left out
+(their efuse offsets are not known).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/boot/dts/mediatek/mt6878.dtsi | 180 +++++++++++++++++++++++
+ 1 file changed, 180 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878.dtsi b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
+index f62bab2a8d94..64c4cd889a28 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
+@@ -1483,6 +1483,78 @@ smi_sub_common_cam1: smi@1a006000 {
+ 			status = "disabled";
+ 		};
+ 
++		/*
++		 * Sensor interface: CSI ports 0..2 on port@0..2, their outputs
++		 * toward CAMSV on port@3..5; the board adds the endpoints.
++		 * Power domains as in the factory device tree: CAM_MAIN (13) and
++		 * CSI_RX (3). CAM_MAIN exists only where the board enables the
++		 * camera vcore domain tree (cam_vcore_pd with its supply), so
++		 * keep this node disabled elsewhere.
++		 * Incomplete on purpose:
++		 * - nvmem-cells "csi0".."csi2": the PHY calibration words are in
++		 *   the efuse, but their offsets in the devinfo copy are not
++		 *   known; the PHYs run with the default termination codes.
++		 *   TODO: offsets of the factory "rg_csi" cells.
++		 * The CSI receiver clocks run from univpll_d4_d2 (312 MHz), the
++		 * first DVFS step of the factory device tree (its clk_top_ap_step0
++		 * is topckgen index 0x73). TODO: the 13th factory clock
++		 * (provider 0x58, index 0x0c) has no name and is left out.
++		 */
++		seninf: seninf@1a00e000 {
++			compatible = "mediatek,mt6878-seninf";
++			reg = <0x1a00e000 0x18000>, <0x11c80000 0x30000>;
++			reg-names = "seninf", "csi-rx";
++			interrupts = <GIC_SPI 152 IRQ_TYPE_LEVEL_HIGH 0>,
++				     <GIC_SPI 149 IRQ_TYPE_LEVEL_HIGH 0>;
++			interrupt-names = "seninf", "tsrec";
++			clocks = <&camsys_main CLK_CAM_MAIN_SENINF>,
++				 <&camsys_main CLK_CAM_MAIN_CAM>,
++				 <&camsys_main CLK_CAM_MAIN_CAMTG>,
++				 <&topckgen CLK_TOP_SENINF_SEL>,
++				 <&topckgen CLK_TOP_SENINF1_SEL>,
++				 <&topckgen CLK_TOP_SENINF2_SEL>;
++			clock-names = "seninf", "cam", "camtg",
++				      "csi0", "csi1", "csi2";
++			assigned-clocks = <&topckgen CLK_TOP_SENINF_SEL>,
++					  <&topckgen CLK_TOP_SENINF1_SEL>,
++					  <&topckgen CLK_TOP_SENINF2_SEL>;
++			assigned-clock-parents = <&topckgen CLK_TOP_UNIVPLL_D4_D2>,
++						 <&topckgen CLK_TOP_UNIVPLL_D4_D2>,
++						 <&topckgen CLK_TOP_UNIVPLL_D4_D2>;
++			power-domains = <&spm MT6878_POWER_DOMAIN_CAM_MAIN>,
++					<&spm MT6878_POWER_DOMAIN_CSI_RX>;
++			status = "disabled";
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				seninf_port0: port@0 {
++					reg = <0>;
++				};
++
++				seninf_port1: port@1 {
++					reg = <1>;
++				};
++
++				seninf_port2: port@2 {
++					reg = <2>;
++				};
++
++				seninf_port3: port@3 {
++					reg = <3>;
++				};
++
++				seninf_port4: port@4 {
++					reg = <4>;
++				};
++
++				seninf_port5: port@5 {
++					reg = <5>;
++				};
++			};
++		};
++
+ 		larb16: smi@1a026000 {
+ 			compatible = "mediatek,mt6878-smi-larb";
+ 			reg = <0x1a026000 0x1000>;
+@@ -1575,6 +1647,114 @@ camsys_yuvb: clock-controller@1a0af000 {
+ 			status = "disabled";
+ 		};
+ 
++		/*
++		 * CAMSV capture engines 1, 2 and 5 (mediatek,camsv-id 0, 1, 4).
++		 * The engines sit in CAM_MAIN (scpsys domain 13, as in the factory
++		 * device tree), which exists only where the board enables the
++		 * camera vcore domain tree (cam_vcore_pd with its supply), so
++		 * keep these nodes disabled elsewhere.
++		 * Each engine reaches memory only through its SMI larb (larb14 /
++		 * larb13 / larb29) and the MM IOMMU: the command queue reader and
++		 * the image write DMA are larb ports, listed in iommus. The driver
++		 * refuses to probe unless the engine is behind the IOMMU, so a
++		 * board enabling an engine also enables its larb, the SMI
++		 * sub-commons above it, smi_common and m4u (see
++		 * mt6878-unihertz-titan2-cameras.dtsi). Without that path
++		 * the first CQ fetch never completes (Titan 2, 2026-11-07).
++		 * The factory device tree describes no iommus on camsv1/2 (their
++		 * ports sit in helper nodes); they are on the engines here, as the
++		 * factory device tree does for camsv5.
++		 */
++		camsv1: camsv@1a100000 {
++			compatible = "mediatek,mt6878-camsv";
++			reg = <0x1a100000 0x1000>, <0x1a110000 0x1000>,
++			      <0x1a120000 0x1000>, <0x1a108000 0x1000>,
++			      <0x1a118000 0x1000>, <0x1a128000 0x1000>;
++			reg-names = "base", "dma", "scq", "inner",
++				    "inner-dma", "inner-scq";
++			interrupts = <GIC_SPI 651 IRQ_TYPE_LEVEL_HIGH 0>,
++				     <GIC_SPI 652 IRQ_TYPE_LEVEL_HIGH 0>,
++				     <GIC_SPI 653 IRQ_TYPE_LEVEL_HIGH 0>,
++				     <GIC_SPI 669 IRQ_TYPE_LEVEL_HIGH 0>;
++			interrupt-names = "done", "err", "sof", "cq-done";
++			clocks = <&camsys_main CLK_CAM_MAIN_CAM>,
++				 <&camsys_main CLK_CAM_MAIN_LARB14>,
++				 <&camsys_main CLK_CAM_MAIN_CAMSV_TOP>,
++				 <&camsys_main CLK_CAM_MAIN_CAM2MM0_GALS>,
++				 <&camsys_main CLK_CAM_MAIN_CAM2MM1_GALS>,
++				 <&camsys_main CLK_CAM_MAIN_CAMSV_A_CON_1>,
++				 <&topckgen CLK_TOP_CAM_SEL>,
++				 <&topckgen CLK_TOP_CAMTM_SEL>;
++			clock-names = "cam", "larb", "camsv-top", "gals0",
++				      "gals1", "camsv", "cam-sel", "camtm-sel";
++			iommus = <&m4u M4U_L14_P0_CAMSV_A_CQI_E1>,
++				 <&m4u M4U_L14_P1_CAMSV_A0_WDMA>;
++			mediatek,camsv-id = <0>;
++			mediatek,camsys = <&camsys_main>;
++			power-domains = <&spm MT6878_POWER_DOMAIN_CAM_MAIN>;
++			status = "disabled";
++		};
++
++		camsv2: camsv@1a101000 {
++			compatible = "mediatek,mt6878-camsv";
++			reg = <0x1a101000 0x1000>, <0x1a111000 0x1000>,
++			      <0x1a121000 0x1000>, <0x1a109000 0x1000>,
++			      <0x1a119000 0x1000>, <0x1a129000 0x1000>;
++			reg-names = "base", "dma", "scq", "inner",
++				    "inner-dma", "inner-scq";
++			interrupts = <GIC_SPI 654 IRQ_TYPE_LEVEL_HIGH 0>,
++				     <GIC_SPI 655 IRQ_TYPE_LEVEL_HIGH 0>,
++				     <GIC_SPI 656 IRQ_TYPE_LEVEL_HIGH 0>,
++				     <GIC_SPI 670 IRQ_TYPE_LEVEL_HIGH 0>;
++			interrupt-names = "done", "err", "sof", "cq-done";
++			clocks = <&camsys_main CLK_CAM_MAIN_CAM>,
++				 <&camsys_main CLK_CAM_MAIN_LARB13>,
++				 <&camsys_main CLK_CAM_MAIN_CAMSV_TOP>,
++				 <&camsys_main CLK_CAM_MAIN_CAM2MM0_GALS>,
++				 <&camsys_main CLK_CAM_MAIN_CAM2MM1_GALS>,
++				 <&camsys_main CLK_CAM_MAIN_CAMSV_B_CON_1>,
++				 <&topckgen CLK_TOP_CAM_SEL>,
++				 <&topckgen CLK_TOP_CAMTM_SEL>;
++			clock-names = "cam", "larb", "camsv-top", "gals0",
++				      "gals1", "camsv", "cam-sel", "camtm-sel";
++			iommus = <&m4u M4U_L13_P0_CAMSV_B_CQI_E1>,
++				 <&m4u M4U_L13_P1_CAMSV_B0_WDMA>;
++			mediatek,camsv-id = <1>;
++			mediatek,camsys = <&camsys_main>;
++			power-domains = <&spm MT6878_POWER_DOMAIN_CAM_MAIN>;
++			status = "disabled";
++		};
++
++		camsv5: camsv@1a104000 {
++			compatible = "mediatek,mt6878-camsv";
++			reg = <0x1a104000 0x1000>, <0x1a114000 0x1000>,
++			      <0x1a124000 0x1000>, <0x1a10c000 0x1000>,
++			      <0x1a11c000 0x1000>, <0x1a12c000 0x1000>;
++			reg-names = "base", "dma", "scq", "inner",
++				    "inner-dma", "inner-scq";
++			interrupts = <GIC_SPI 663 IRQ_TYPE_LEVEL_HIGH 0>,
++				     <GIC_SPI 664 IRQ_TYPE_LEVEL_HIGH 0>,
++				     <GIC_SPI 665 IRQ_TYPE_LEVEL_HIGH 0>,
++				     <GIC_SPI 673 IRQ_TYPE_LEVEL_HIGH 0>;
++			interrupt-names = "done", "err", "sof", "cq-done";
++			clocks = <&camsys_main CLK_CAM_MAIN_CAM>,
++				 <&camsys_main CLK_CAM_MAIN_LARB29>,
++				 <&camsys_main CLK_CAM_MAIN_CAMSV_TOP>,
++				 <&camsys_main CLK_CAM_MAIN_CAM2MM0_GALS>,
++				 <&camsys_main CLK_CAM_MAIN_CAM2MM1_GALS>,
++				 <&camsys_main CLK_CAM_MAIN_CAMSV_E_CON_1>,
++				 <&topckgen CLK_TOP_CAM_SEL>,
++				 <&topckgen CLK_TOP_CAMTM_SEL>;
++			clock-names = "cam", "larb", "camsv-top", "gals0",
++				      "gals1", "camsv", "cam-sel", "camtm-sel";
++			iommus = <&m4u M4U_L29_P2_CAMSV_CQI_E4>,
++				 <&m4u M4U_L29_P6_CAMSV_E4_WDMA>;
++			mediatek,camsv-id = <4>;
++			mediatek,camsys = <&camsys_main>;
++			power-domains = <&spm MT6878_POWER_DOMAIN_CAM_MAIN>;
++			status = "disabled";
++		};
++
+ 		camsys_mraw: clock-controller@1a170000 {
+ 			compatible = "mediatek,mt6878-camsys-mraw", "syscon";
+ 			reg = <0x1a170000 0x1000>;
+-- 
+2.56.0
+

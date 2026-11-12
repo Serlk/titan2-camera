@@ -1,0 +1,1111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 18:22:57 +0300
+Subject: [PATCH 10/12] media: i2c: Add Samsung S5KGD1SP image sensor driver
+
+New driver for the Titan 2 front camera, written from a sensor
+specification: one mode, 3280x2464@30 on 4 D-PHY lanes (432 MHz),
+RAW10.
+
+On stream start the driver checks the chip ID (0x0841), writes the five
+fixed reset writes, waits 24 ms and then the sensor firmware patch (TnP).
+The TnP is not part of the driver and is not distributed: the user has to
+supply it as /lib/firmware/s5kgd1sp_tnp.bin, loaded with
+request_firmware(), a flat array of little-endian u16 { register, value }
+pairs written in order.
+
+Controls: exposure (3.., margin 3), analogue gain (code = gain * 32,
+1x..16x), vblank, hblank, pixel rate, link frequency, test pattern and
+its four colour components (0x0600..0x0608), h/v flip (0x0101, relative
+to the mounting of the module), orientation/rotation. Exposure, gain and
+frame length updates are wrapped in group hold (0x0104).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/media/i2c/Kconfig    |   13 +
+ drivers/media/i2c/Makefile   |    1 +
+ drivers/media/i2c/s5kgd1sp.c | 1036 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 1050 insertions(+)
+ create mode 100644 drivers/media/i2c/s5kgd1sp.c
+
+diff --git a/drivers/media/i2c/Kconfig b/drivers/media/i2c/Kconfig
+index eb26e3477c10..b279c1ce0d42 100644
+--- a/drivers/media/i2c/Kconfig
++++ b/drivers/media/i2c/Kconfig
+@@ -804,6 +804,19 @@ config VIDEO_S5K6A3
+ 	  This is a V4L2 sensor driver for Samsung S5K6A3 raw
+ 	  camera sensor.
+ 
++config VIDEO_S5KGD1SP
++	tristate "Samsung S5KGD1SP sensor support"
++	depends on OF
++	select V4L2_CCI_I2C
++	select FW_LOADER
++	help
++	  This is a V4L2 sensor driver for the Samsung S5KGD1SP 32MP raw
++	  camera sensor. It needs the sensor firmware patch
++	  s5kgd1sp_tnp.bin, which is not part of the kernel.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called s5kgd1sp.
++
+ config VIDEO_S5KJN1
+ 	tristate "Samsung S5KJN1 sensor support"
+ 	select V4L2_CCI_I2C
+diff --git a/drivers/media/i2c/Makefile b/drivers/media/i2c/Makefile
+index e820a3d9a969..c7db837cc643 100644
+--- a/drivers/media/i2c/Makefile
++++ b/drivers/media/i2c/Makefile
+@@ -131,6 +131,7 @@ obj-$(CONFIG_VIDEO_S5C73M3) += s5c73m3/
+ obj-$(CONFIG_VIDEO_S5K3M5) += s5k3m5.o
+ obj-$(CONFIG_VIDEO_S5K5BAF) += s5k5baf.o
+ obj-$(CONFIG_VIDEO_S5K6A3) += s5k6a3.o
++obj-$(CONFIG_VIDEO_S5KGD1SP) += s5kgd1sp.o
+ obj-$(CONFIG_VIDEO_S5KJN1) += s5kjn1.o
+ obj-$(CONFIG_VIDEO_SAA6588) += saa6588.o
+ obj-$(CONFIG_VIDEO_SAA6752HS) += saa6752hs.o
+diff --git a/drivers/media/i2c/s5kgd1sp.c b/drivers/media/i2c/s5kgd1sp.c
+new file mode 100644
+index 000000000000..1cbe9054ca03
+--- /dev/null
++++ b/drivers/media/i2c/s5kgd1sp.c
+@@ -0,0 +1,1036 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Samsung S5KGD1SP image sensor driver
++ *
++ * Copyright (c) 2026 serlk
++ *
++ * Written from the Titan 2 camera sensor specification. The sensor needs a
++ * sensor firmware patch (TnP) on every power-up; it is not part of this
++ * driver and is loaded with request_firmware() from S5KGD1SP_TNP_FW.
++ *
++ * TnP firmware file format: a flat array of little-endian u16 pairs
++ * { register, value }, 4 bytes per entry, no header. The entries are written
++ * in file order as 16-bit register writes, without sorting or removing
++ * duplicates (the 0x6f12 data window auto-increments, and 0x602a moves it).
++ * The file is not distributed with the kernel; the user has to supply it.
++ *
++ * One mode, 3280x2464 at 30 fps over 4-lane D-PHY, RAW10.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/module.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <linux/unaligned.h>
++#include <linux/units.h>
++
++#include <media/v4l2-cci.h>
++#include <media/v4l2-ctrls.h>
++#include <media/v4l2-device.h>
++#include <media/v4l2-fwnode.h>
++
++#define S5KGD1SP_TNP_FW			"s5kgd1sp_tnp.bin"
++/* Sanity limit for the TnP file: the known table has 1215 entries */
++#define S5KGD1SP_TNP_MAX_ENTRIES	4096
++
++#define S5KGD1SP_MCLK_FREQ		(24 * HZ_PER_MHZ)
++#define S5KGD1SP_DATA_LANES		4
++
++#define S5KGD1SP_REG_CHIP_ID		CCI_REG16(0x0000)
++#define S5KGD1SP_CHIP_ID		0x0841
++
++#define S5KGD1SP_REG_FRAME_COUNT	CCI_REG8(0x0005)
++
++#define S5KGD1SP_REG_MODE_SELECT	CCI_REG8(0x0100)
++#define S5KGD1SP_MODE_STANDBY		0x00
++#define S5KGD1SP_MODE_STREAMING		0x01
++
++#define S5KGD1SP_REG_ORIENTATION	CCI_REG8(0x0101)
++#define S5KGD1SP_HFLIP			BIT(0)
++#define S5KGD1SP_VFLIP			BIT(1)
++
++#define S5KGD1SP_REG_GROUP_HOLD		CCI_REG8(0x0104)
++
++#define S5KGD1SP_REG_EXPOSURE		CCI_REG16(0x0202)
++#define S5KGD1SP_EXPOSURE_MIN		3
++#define S5KGD1SP_EXPOSURE_STEP		1
++#define S5KGD1SP_EXPOSURE_MARGIN	3
++#define S5KGD1SP_EXPOSURE_DEFAULT	976
++
++/* code = gain * 32, i.e. 1/32 steps: 1x = 0x20 .. 16x = 0x200 */
++#define S5KGD1SP_REG_ANALOG_GAIN	CCI_REG16(0x0204)
++#define S5KGD1SP_AGAIN_MIN		0x0020
++#define S5KGD1SP_AGAIN_MAX		0x0200
++#define S5KGD1SP_AGAIN_STEP		1
++#define S5KGD1SP_AGAIN_DEFAULT		0x0080	/* 4x */
++
++#define S5KGD1SP_REG_FRAME_LENGTH	CCI_REG16(0x0340)
++#define S5KGD1SP_FLL_MAX		0xffff
++
++#define S5KGD1SP_REG_TEST_PATTERN	CCI_REG16(0x0600)
++#define S5KGD1SP_REG_TP_RED		CCI_REG16(0x0602)
++#define S5KGD1SP_REG_TP_GREENR		CCI_REG16(0x0604)
++#define S5KGD1SP_REG_TP_BLUE		CCI_REG16(0x0606)
++#define S5KGD1SP_REG_TP_GREENB		CCI_REG16(0x0608)
++#define S5KGD1SP_TP_COLOUR_MAX		0x3ff
++
++#define S5KGD1SP_REG_PAGE		CCI_REG16(0x6028)
++#define S5KGD1SP_REG_SW_RESET		CCI_REG16(0x6010)
++
++/*
++ * 345.6 Mpixel/s RAW10 on 4 lanes: 864 Mbit/s per lane. The mode table PLL
++ * (24 MHz / 4 (0x030e) * 288 (0x0310) / 2 (0x0312)) gives the same 864.
++ * csi_pixel_rate is taken as pixel/s.
++ */
++#define S5KGD1SP_LINK_FREQ_432MHZ	(432 * HZ_PER_MHZ)
++
++#define S5KGD1SP_NATIVE_WIDTH		6560
++#define S5KGD1SP_NATIVE_HEIGHT		4928
++
++static const s64 s5kgd1sp_link_freq_menu[] = {
++	S5KGD1SP_LINK_FREQ_432MHZ,
++};
++
++static const char * const s5kgd1sp_test_pattern_menu[] = {
++	"Disabled",
++	"Solid Colour",
++	"Colour Bars",
++};
++
++/*
++ * Indexed by the register mirror bits (vflip << 1) | hflip. The factory
++ * configuration (both bits set) delivers a Gb first pixel; the other entries
++ * are derived from it. TODO: only the factory (1, 1) setting is
++ * confirmed.
++ *
++ * The module is mounted with both mirror bits set (factory setting), and the DT
++ * rotation is given for that orientation. The HFLIP/VFLIP controls are
++ * relative to it: 0/0 is the factory orientation, so that userspace resetting
++ * the flips (libcamera does for an identity transform) keeps the confirmed
++ * Bayer order and the mounting rotation.
++ */
++#define S5KGD1SP_MOUNT_FLIPS		(S5KGD1SP_HFLIP | S5KGD1SP_VFLIP)
++
++static const u32 s5kgd1sp_mbus_codes[] = {
++	MEDIA_BUS_FMT_SGRBG10_1X10,
++	MEDIA_BUS_FMT_SRGGB10_1X10,
++	MEDIA_BUS_FMT_SBGGR10_1X10,
++	MEDIA_BUS_FMT_SGBRG10_1X10,
++};
++
++static const char * const s5kgd1sp_supply_names[] = {
++	"dovdd",	/* Digital I/O 1.8 V */
++	"avdd",		/* Analog 2.8 V */
++	"dvdd",		/* Digital core 1.1 V */
++};
++
++enum s5kgd1sp_supply {
++	S5KGD1SP_SUPPLY_DOVDD,
++	S5KGD1SP_SUPPLY_AVDD,
++	S5KGD1SP_SUPPLY_DVDD,
++	S5KGD1SP_NUM_SUPPLIES,
++};
++
++/*
++ * Mode register table of the Titan 2 configuration (all factory modes share
++ * it). These are plain sensor settings, kept in the driver.
++ * TODO: the table has 104 steps (0..103); 105 were expected.
++ */
++static const struct cci_reg_sequence s5kgd1sp_mode_3280x2464_regs[] = {
++	{ CCI_REG16(0x6028), 0x4000 },
++	{ CCI_REG16(0x6214), 0xf9f0 },
++	{ CCI_REG16(0x6218), 0xe150 },
++	{ CCI_REG16(0x6242), 0x0e00 },
++	{ CCI_REG16(0x6028), 0x2000 },
++	{ CCI_REG16(0x602a), 0x12f2 },
++	{ CCI_REG16(0x6f12), 0x0d10 },
++	{ CCI_REG16(0x6f12), 0x0a18 },
++	{ CCI_REG16(0x6f12), 0x19b0 },
++	{ CCI_REG16(0x6f12), 0x1350 },
++	{ CCI_REG16(0x602a), 0x1eb6 },
++	{ CCI_REG16(0x6f12), 0x0206 },
++	{ CCI_REG16(0x602a), 0x3770 },
++	{ CCI_REG16(0x6f12), 0x0100 },
++	{ CCI_REG16(0x602a), 0x1eb8 },
++	{ CCI_REG16(0x6f12), 0x0301 },
++	{ CCI_REG16(0x602a), 0x131e },
++	{ CCI_REG16(0x6f12), 0x0100 },
++	{ CCI_REG16(0x602a), 0x3dea },
++	{ CCI_REG16(0x6f12), 0x0081 },
++	{ CCI_REG16(0x602a), 0x11a6 },
++	{ CCI_REG16(0x6f12), 0x0000 },
++	{ CCI_REG16(0x6f12), 0x0004 },
++	{ CCI_REG16(0x602a), 0x11ae },
++	{ CCI_REG16(0x6f12), 0x0003 },
++	{ CCI_REG16(0x602a), 0x13fc },
++	{ CCI_REG16(0x6f12), 0x0044 },
++	{ CCI_REG16(0x6f12), 0x0064 },
++	{ CCI_REG16(0x6f12), 0x0044 },
++	{ CCI_REG16(0x602a), 0x3302 },
++	{ CCI_REG16(0x6f12), 0x0100 },
++	{ CCI_REG16(0x6f12), 0x0100 },
++	{ CCI_REG16(0x6f12), 0x0001 },
++	{ CCI_REG16(0x602a), 0x27d2 },
++	{ CCI_REG16(0x6f12), 0x0203 },
++	{ CCI_REG16(0x602a), 0x1ec8 },
++	{ CCI_REG16(0x6f12), 0x0503 },
++	{ CCI_REG16(0x6f12), 0x0504 },
++	{ CCI_REG16(0x602a), 0x1ed2 },
++	{ CCI_REG16(0x6f12), 0x080f },
++	{ CCI_REG16(0x602a), 0x1ed6 },
++	{ CCI_REG16(0x6f12), 0x0307 },
++	{ CCI_REG16(0x602a), 0x123c },
++	{ CCI_REG16(0x6f12), 0x0009 },
++	{ CCI_REG16(0x602a), 0x21be },
++	{ CCI_REG16(0x6f12), 0x04d2 },
++	{ CCI_REG16(0x6f12), 0x41a6 },
++	{ CCI_REG16(0x602a), 0x145c },
++	{ CCI_REG16(0x6f12), 0x0035 },
++	{ CCI_REG16(0x6f12), 0x0049 },
++	{ CCI_REG16(0x6f12), 0x0035 },
++	{ CCI_REG16(0x602a), 0x140e },
++	{ CCI_REG16(0x6f12), 0x0000 },
++	{ CCI_REG16(0x6f12), 0x0001 },
++	{ CCI_REG16(0x6f12), 0x0000 },
++	{ CCI_REG16(0x6028), 0x4000 },
++	{ CCI_REG16(0xf466), 0x0e0d },
++	{ CCI_REG16(0x0344), 0x0008 },
++	{ CCI_REG16(0x0346), 0x0000 },
++	{ CCI_REG16(0x0348), 0x19a7 },
++	{ CCI_REG16(0x034a), 0x134e },
++	{ CCI_REG16(0x034c), 0x0cd0 },
++	{ CCI_REG16(0x034e), 0x09a0 },
++	{ CCI_REG16(0x0350), 0x0000 },
++	{ CCI_REG16(0x0352), 0x0004 },
++	{ CCI_REG16(0x0900), 0x0112 },
++	{ CCI_REG16(0x0380), 0x0001 },
++	{ CCI_REG16(0x0382), 0x0001 },
++	{ CCI_REG16(0x0384), 0x0002 },
++	{ CCI_REG16(0x0386), 0x0002 },
++	{ CCI_REG16(0x0400), 0x2010 },
++	{ CCI_REG16(0x0404), 0x1000 },
++	{ CCI_REG16(0x0402), 0x1010 },
++	{ CCI_REG16(0x0114), 0x0300 },
++	{ CCI_REG16(0x0116), 0x3000 },
++	{ CCI_REG16(0x0110), 0x1002 },
++	{ CCI_REG16(0x011c), 0x0100 },
++	{ CCI_REG16(0x0136), 0x1800 },
++	{ CCI_REG16(0x0300), 0x0002 },
++	{ CCI_REG16(0x0302), 0x0003 },
++	{ CCI_REG16(0x0304), 0x0004 },
++	{ CCI_REG16(0x0306), 0x011e },
++	{ CCI_REG16(0x0308), 0x0008 },
++	{ CCI_REG16(0x030a), 0x0002 },
++	{ CCI_REG16(0x030c), 0x0000 },
++	{ CCI_REG16(0x030e), 0x0004 },
++	{ CCI_REG16(0x0310), 0x0120 },
++	{ CCI_REG16(0x0312), 0x0002 },
++	{ CCI_REG16(0x0340), 0x0a40 },
++	{ CCI_REG16(0x0342), 0x38c0 },
++	{ CCI_REG16(0x0202), 0x0100 },
++	{ CCI_REG16(0x0200), 0x0100 },
++	{ CCI_REG16(0x022c), 0x0100 },
++	{ CCI_REG16(0x0226), 0x0100 },
++	{ CCI_REG16(0x021e), 0x0000 },
++	{ CCI_REG16(0x6028), 0x2000 },
++	{ CCI_REG16(0x602a), 0x3020 },
++	{ CCI_REG16(0x6f12), 0x0000 },
++	{ CCI_REG16(0x6028), 0x4000 },
++	{ CCI_REG16(0x0b00), 0x0080 },
++	{ CCI_REG16(0x0b08), 0x0000 },
++	{ CCI_REG16(0x0d00), 0x0000 },
++	{ CCI_REG16(0x0d02), 0x0000 },
++	{ CCI_REG16(0x0d04), 0x0000 },
++};
++
++struct s5kgd1sp_mode {
++	u32 width;
++	u32 height;
++	u64 pixel_rate;
++	u32 line_length;
++	u32 frame_length;
++	const struct cci_reg_sequence *regs;
++	unsigned int num_regs;
++};
++
++static const struct s5kgd1sp_mode s5kgd1sp_mode = {
++	.width = 3280,
++	.height = 2464,
++	.pixel_rate = 1144000000,
++	.line_length = 14528,
++	.frame_length = 2624,
++	.regs = s5kgd1sp_mode_3280x2464_regs,
++	.num_regs = ARRAY_SIZE(s5kgd1sp_mode_3280x2464_regs),
++};
++
++struct s5kgd1sp {
++	struct device *dev;
++	struct regmap *regmap;
++	struct clk *mclk;
++	struct gpio_desc *reset_gpio;
++	struct regulator_bulk_data supplies[S5KGD1SP_NUM_SUPPLIES];
++	const struct firmware *tnp;
++
++	struct v4l2_subdev sd;
++	struct media_pad pad;
++
++	struct v4l2_ctrl_handler ctrl_handler;
++	struct v4l2_ctrl *exposure;
++	struct v4l2_ctrl *hflip;
++	struct v4l2_ctrl *vflip;
++	struct v4l2_ctrl *test_pattern;
++	/* Set once a non-zero test pattern has been written */
++	bool tp_active;
++};
++
++static inline struct s5kgd1sp *to_s5kgd1sp(struct v4l2_subdev *sd)
++{
++	return container_of(sd, struct s5kgd1sp, sd);
++}
++
++static u32 s5kgd1sp_get_format_code(struct s5kgd1sp *s5k)
++{
++	unsigned int i;
++
++	i = (s5k->vflip->val ? S5KGD1SP_VFLIP : 0) |
++	    (s5k->hflip->val ? S5KGD1SP_HFLIP : 0);
++
++	return s5kgd1sp_mbus_codes[i ^ S5KGD1SP_MOUNT_FLIPS];
++}
++
++static void s5kgd1sp_group_hold(struct s5kgd1sp *s5k, bool hold, int *err)
++{
++	cci_write(s5k->regmap, S5KGD1SP_REG_GROUP_HOLD, hold ? 1 : 0, err);
++}
++
++static int s5kgd1sp_set_test_pattern(struct s5kgd1sp *s5k, u32 pattern)
++{
++	int ret = 0;
++
++	/* As the s5k3p9sp GPL driver: 0 is written only to end a pattern */
++	if (pattern) {
++		ret = cci_write(s5k->regmap, S5KGD1SP_REG_TEST_PATTERN, pattern,
++				NULL);
++		if (!ret)
++			s5k->tp_active = true;
++	} else if (s5k->tp_active) {
++		ret = cci_write(s5k->regmap, S5KGD1SP_REG_TEST_PATTERN, 0, NULL);
++		if (!ret)
++			s5k->tp_active = false;
++	}
++
++	return ret;
++}
++
++static int s5kgd1sp_set_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct s5kgd1sp *s5k = container_of(ctrl->handler, struct s5kgd1sp,
++					    ctrl_handler);
++	const struct s5kgd1sp_mode *mode = &s5kgd1sp_mode;
++	s64 exposure_max;
++	int ret = 0;
++
++	if (ctrl->id == V4L2_CID_VBLANK) {
++		exposure_max = mode->height + ctrl->val -
++			       S5KGD1SP_EXPOSURE_MARGIN;
++		__v4l2_ctrl_modify_range(s5k->exposure, s5k->exposure->minimum,
++					 exposure_max, s5k->exposure->step,
++					 min_t(s64, S5KGD1SP_EXPOSURE_DEFAULT,
++					       exposure_max));
++	}
++
++	if (!pm_runtime_get_if_active(s5k->dev))
++		return 0;
++
++	switch (ctrl->id) {
++	case V4L2_CID_EXPOSURE:
++		s5kgd1sp_group_hold(s5k, true, &ret);
++		cci_write(s5k->regmap, S5KGD1SP_REG_EXPOSURE, ctrl->val, &ret);
++		s5kgd1sp_group_hold(s5k, false, &ret);
++		break;
++	case V4L2_CID_ANALOGUE_GAIN:
++		s5kgd1sp_group_hold(s5k, true, &ret);
++		cci_write(s5k->regmap, S5KGD1SP_REG_ANALOG_GAIN, ctrl->val,
++			  &ret);
++		s5kgd1sp_group_hold(s5k, false, &ret);
++		break;
++	case V4L2_CID_VBLANK:
++		s5kgd1sp_group_hold(s5k, true, &ret);
++		cci_write(s5k->regmap, S5KGD1SP_REG_FRAME_LENGTH,
++			  mode->height + ctrl->val, &ret);
++		s5kgd1sp_group_hold(s5k, false, &ret);
++		break;
++	case V4L2_CID_HFLIP:
++	case V4L2_CID_VFLIP:
++		ret = cci_update_bits(s5k->regmap, S5KGD1SP_REG_ORIENTATION,
++				      S5KGD1SP_HFLIP | S5KGD1SP_VFLIP,
++				      ((s5k->hflip->val ? S5KGD1SP_HFLIP : 0) |
++				       (s5k->vflip->val ? S5KGD1SP_VFLIP : 0)) ^
++				      S5KGD1SP_MOUNT_FLIPS,
++				      NULL);
++		break;
++	case V4L2_CID_TEST_PATTERN:
++		ret = s5kgd1sp_set_test_pattern(s5k, ctrl->val);
++		break;
++	case V4L2_CID_TEST_PATTERN_RED:
++		ret = cci_write(s5k->regmap, S5KGD1SP_REG_TP_RED, ctrl->val,
++				NULL);
++		break;
++	case V4L2_CID_TEST_PATTERN_GREENR:
++		ret = cci_write(s5k->regmap, S5KGD1SP_REG_TP_GREENR, ctrl->val,
++				NULL);
++		break;
++	case V4L2_CID_TEST_PATTERN_BLUE:
++		ret = cci_write(s5k->regmap, S5KGD1SP_REG_TP_BLUE, ctrl->val,
++				NULL);
++		break;
++	case V4L2_CID_TEST_PATTERN_GREENB:
++		ret = cci_write(s5k->regmap, S5KGD1SP_REG_TP_GREENB, ctrl->val,
++				NULL);
++		break;
++	case V4L2_CID_LINK_FREQ:
++	case V4L2_CID_PIXEL_RATE:
++	case V4L2_CID_HBLANK:
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	pm_runtime_put(s5k->dev);
++
++	return ret;
++}
++
++static const struct v4l2_ctrl_ops s5kgd1sp_ctrl_ops = {
++	.s_ctrl = s5kgd1sp_set_ctrl,
++};
++
++static int s5kgd1sp_init_controls(struct s5kgd1sp *s5k)
++{
++	static const u32 tp_ids[] = {
++		V4L2_CID_TEST_PATTERN_RED,
++		V4L2_CID_TEST_PATTERN_GREENR,
++		V4L2_CID_TEST_PATTERN_BLUE,
++		V4L2_CID_TEST_PATTERN_GREENB,
++	};
++	struct v4l2_ctrl_handler *hdl = &s5k->ctrl_handler;
++	const struct s5kgd1sp_mode *mode = &s5kgd1sp_mode;
++	struct v4l2_fwnode_device_properties props;
++	struct v4l2_ctrl *ctrl;
++	s64 hblank, vblank;
++	unsigned int i;
++	int ret;
++
++	v4l2_ctrl_handler_init(hdl, 15);
++
++	ctrl = v4l2_ctrl_new_int_menu(hdl, &s5kgd1sp_ctrl_ops,
++				      V4L2_CID_LINK_FREQ,
++				      ARRAY_SIZE(s5kgd1sp_link_freq_menu) - 1,
++				      0, s5kgd1sp_link_freq_menu);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	v4l2_ctrl_new_std(hdl, &s5kgd1sp_ctrl_ops, V4L2_CID_PIXEL_RATE,
++			  mode->pixel_rate, mode->pixel_rate, 1,
++			  mode->pixel_rate);
++
++	hblank = mode->line_length - mode->width;
++	ctrl = v4l2_ctrl_new_std(hdl, &s5kgd1sp_ctrl_ops, V4L2_CID_HBLANK,
++				 hblank, hblank, 1, hblank);
++	if (ctrl)
++		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
++
++	vblank = mode->frame_length - mode->height;
++	v4l2_ctrl_new_std(hdl, &s5kgd1sp_ctrl_ops, V4L2_CID_VBLANK, vblank,
++			  S5KGD1SP_FLL_MAX - mode->height, 1, vblank);
++
++	s5k->exposure = v4l2_ctrl_new_std(hdl, &s5kgd1sp_ctrl_ops,
++					  V4L2_CID_EXPOSURE,
++					  S5KGD1SP_EXPOSURE_MIN,
++					  mode->frame_length -
++					  S5KGD1SP_EXPOSURE_MARGIN,
++					  S5KGD1SP_EXPOSURE_STEP,
++					  S5KGD1SP_EXPOSURE_DEFAULT);
++
++	v4l2_ctrl_new_std(hdl, &s5kgd1sp_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
++			  S5KGD1SP_AGAIN_MIN, S5KGD1SP_AGAIN_MAX,
++			  S5KGD1SP_AGAIN_STEP, S5KGD1SP_AGAIN_DEFAULT);
++
++	s5k->test_pattern =
++		v4l2_ctrl_new_std_menu_items(hdl, &s5kgd1sp_ctrl_ops,
++					     V4L2_CID_TEST_PATTERN,
++					     ARRAY_SIZE(s5kgd1sp_test_pattern_menu) - 1,
++					     0, 0, s5kgd1sp_test_pattern_menu);
++
++	for (i = 0; i < ARRAY_SIZE(tp_ids); i++)
++		v4l2_ctrl_new_std(hdl, &s5kgd1sp_ctrl_ops, tp_ids[i], 0,
++				  S5KGD1SP_TP_COLOUR_MAX, 1, 0);
++
++	/* 0/0: the module setting as mounted (H mirror + V flip in the register) */
++	s5k->hflip = v4l2_ctrl_new_std(hdl, &s5kgd1sp_ctrl_ops,
++				       V4L2_CID_HFLIP, 0, 1, 1, 0);
++	if (s5k->hflip)
++		s5k->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
++
++	s5k->vflip = v4l2_ctrl_new_std(hdl, &s5kgd1sp_ctrl_ops,
++				       V4L2_CID_VFLIP, 0, 1, 1, 0);
++	if (s5k->vflip)
++		s5k->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
++
++	if (hdl->error) {
++		ret = hdl->error;
++		goto error;
++	}
++
++	ret = v4l2_fwnode_device_parse(s5k->dev, &props);
++	if (ret)
++		goto error;
++
++	ret = v4l2_ctrl_new_fwnode_properties(hdl, &s5kgd1sp_ctrl_ops, &props);
++	if (ret)
++		goto error;
++
++	s5k->sd.ctrl_handler = hdl;
++
++	return 0;
++
++error:
++	v4l2_ctrl_handler_free(hdl);
++
++	return ret;
++}
++
++static int s5kgd1sp_load_tnp(struct s5kgd1sp *s5k)
++{
++	size_t n;
++	int ret;
++
++	if (s5k->tnp)
++		return 0;
++
++	ret = request_firmware(&s5k->tnp, S5KGD1SP_TNP_FW, s5k->dev);
++	if (ret) {
++		dev_err(s5k->dev, "failed to load %s: %d\n", S5KGD1SP_TNP_FW,
++			ret);
++		return ret;
++	}
++
++	n = s5k->tnp->size / 4;
++	if (!n || s5k->tnp->size % 4 || n > S5KGD1SP_TNP_MAX_ENTRIES) {
++		dev_err(s5k->dev, "%s: invalid size %zu\n", S5KGD1SP_TNP_FW,
++			s5k->tnp->size);
++		release_firmware(s5k->tnp);
++		s5k->tnp = NULL;
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int s5kgd1sp_write_tnp(struct s5kgd1sp *s5k)
++{
++	const u8 *data = s5k->tnp->data;
++	size_t i, n = s5k->tnp->size / 4;
++	int ret = 0;
++
++	for (i = 0; i < n && !ret; i++)
++		cci_write(s5k->regmap,
++			  CCI_REG16(get_unaligned_le16(data + 4 * i)),
++			  get_unaligned_le16(data + 4 * i + 2), &ret);
++
++	return ret;
++}
++
++/*
++ * Open sequence of the specification: the chip ID has been checked at probe
++ * and is checked again here, then five fixed writes, at least 24 ms, the TnP
++ * table. No calibration data is written.
++ */
++static int s5kgd1sp_sensor_init(struct s5kgd1sp *s5k)
++{
++	u64 val;
++	int ret;
++
++	ret = cci_read(s5k->regmap, S5KGD1SP_REG_CHIP_ID, &val, NULL);
++	if (ret)
++		return ret;
++	if (val != S5KGD1SP_CHIP_ID)
++		return -ENODEV;
++
++	cci_write(s5k->regmap, CCI_REG16(0x0100), 0x0000, &ret);
++	cci_write(s5k->regmap, S5KGD1SP_REG_PAGE, 0x4000, &ret);
++	cci_write(s5k->regmap, CCI_REG16(0x0000), 0x0010, &ret);
++	cci_write(s5k->regmap, CCI_REG16(0x0000), S5KGD1SP_CHIP_ID, &ret);
++	cci_write(s5k->regmap, S5KGD1SP_REG_SW_RESET, 0x0001, &ret);
++	if (ret)
++		return ret;
++
++	usleep_range(24000, 25000);
++
++	return s5kgd1sp_write_tnp(s5k);
++}
++
++static int s5kgd1sp_enable_streams(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *state, u32 pad,
++				   u64 streams_mask)
++{
++	struct s5kgd1sp *s5k = to_s5kgd1sp(sd);
++	const struct s5kgd1sp_mode *mode = &s5kgd1sp_mode;
++	int ret;
++
++	ret = s5kgd1sp_load_tnp(s5k);
++	if (ret)
++		return ret;
++
++	ret = pm_runtime_resume_and_get(s5k->dev);
++	if (ret)
++		return ret;
++
++	ret = s5kgd1sp_sensor_init(s5k);
++	if (ret)
++		goto error;
++
++	/* A fresh init leaves the test pattern generator off */
++	s5k->tp_active = false;
++
++	ret = cci_multi_reg_write(s5k->regmap, mode->regs, mode->num_regs,
++				  NULL);
++	if (ret)
++		goto error;
++
++	/*
++	 * The factory camera stack defers stagger-AE and max-fps requests while streaming until
++	 * the first SOF. A sensor driver sees no SOF here; all controls are
++	 * applied before stream on, and later updates go out immediately.
++	 * TODO: does a VBLANK/EXPOSURE write before the first frame
++	 * break the S5KGD1SP, or is that lock only a HAL concern?
++	 */
++	ret = __v4l2_ctrl_handler_setup(s5k->sd.ctrl_handler);
++	if (ret)
++		goto error;
++
++	ret = cci_write(s5k->regmap, S5KGD1SP_REG_MODE_SELECT,
++			S5KGD1SP_MODE_STREAMING, NULL);
++	if (ret)
++		goto error;
++
++	__v4l2_ctrl_grab(s5k->vflip, true);
++	__v4l2_ctrl_grab(s5k->hflip, true);
++
++	return 0;
++
++error:
++	dev_err(s5k->dev, "failed to start streaming: %d\n", ret);
++	pm_runtime_put_autosuspend(s5k->dev);
++
++	return ret;
++}
++
++static int s5kgd1sp_disable_streams(struct v4l2_subdev *sd,
++				    struct v4l2_subdev_state *state, u32 pad,
++				    u64 streams_mask)
++{
++	struct s5kgd1sp *s5k = to_s5kgd1sp(sd);
++	int ret;
++
++	ret = cci_write(s5k->regmap, S5KGD1SP_REG_MODE_SELECT,
++			S5KGD1SP_MODE_STANDBY, NULL);
++	if (ret)
++		dev_err(s5k->dev, "failed to stop streaming: %d\n", ret);
++
++	__v4l2_ctrl_grab(s5k->vflip, false);
++	__v4l2_ctrl_grab(s5k->hflip, false);
++
++	pm_runtime_put_autosuspend(s5k->dev);
++
++	return ret;
++}
++
++static void s5kgd1sp_update_pad_format(struct s5kgd1sp *s5k,
++				       struct v4l2_mbus_framefmt *fmt)
++{
++	fmt->code = s5kgd1sp_get_format_code(s5k);
++	fmt->width = s5kgd1sp_mode.width;
++	fmt->height = s5kgd1sp_mode.height;
++	fmt->field = V4L2_FIELD_NONE;
++	fmt->colorspace = V4L2_COLORSPACE_RAW;
++	fmt->ycbcr_enc = V4L2_YCBCR_ENC_601;
++	fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++	fmt->xfer_func = V4L2_XFER_FUNC_NONE;
++}
++
++static int s5kgd1sp_set_pad_format(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *state,
++				   struct v4l2_subdev_format *fmt)
++{
++	struct s5kgd1sp *s5k = to_s5kgd1sp(sd);
++
++	s5kgd1sp_update_pad_format(s5k, &fmt->format);
++	*v4l2_subdev_state_get_format(state, 0) = fmt->format;
++
++	return 0;
++}
++
++static int s5kgd1sp_enum_mbus_code(struct v4l2_subdev *sd,
++				   struct v4l2_subdev_state *state,
++				   struct v4l2_subdev_mbus_code_enum *code)
++{
++	if (code->index > 0)
++		return -EINVAL;
++
++	code->code = s5kgd1sp_get_format_code(to_s5kgd1sp(sd));
++
++	return 0;
++}
++
++static int s5kgd1sp_enum_frame_size(struct v4l2_subdev *sd,
++				    struct v4l2_subdev_state *state,
++				    struct v4l2_subdev_frame_size_enum *fse)
++{
++	if (fse->index > 0)
++		return -EINVAL;
++
++	if (fse->code != s5kgd1sp_get_format_code(to_s5kgd1sp(sd)))
++		return -EINVAL;
++
++	fse->min_width = s5kgd1sp_mode.width;
++	fse->max_width = fse->min_width;
++	fse->min_height = s5kgd1sp_mode.height;
++	fse->max_height = fse->min_height;
++
++	return 0;
++}
++
++static int s5kgd1sp_get_selection(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_state *state,
++				  struct v4l2_subdev_selection *sel)
++{
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_NATIVE_SIZE:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++		/* The mode reads the whole array with 2x2 binning */
++		sel->r.left = 0;
++		sel->r.top = 0;
++		sel->r.width = S5KGD1SP_NATIVE_WIDTH;
++		sel->r.height = S5KGD1SP_NATIVE_HEIGHT;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int s5kgd1sp_init_state(struct v4l2_subdev *sd,
++			       struct v4l2_subdev_state *state)
++{
++	struct v4l2_subdev_format fmt = {
++		.which = V4L2_SUBDEV_FORMAT_TRY,
++		.pad = 0,
++	};
++
++	return s5kgd1sp_set_pad_format(sd, state, &fmt);
++}
++
++static const struct v4l2_subdev_video_ops s5kgd1sp_video_ops = {
++	.s_stream = v4l2_subdev_s_stream_helper,
++};
++
++static const struct v4l2_subdev_pad_ops s5kgd1sp_pad_ops = {
++	.set_fmt = s5kgd1sp_set_pad_format,
++	.get_fmt = v4l2_subdev_get_fmt,
++	.get_selection = s5kgd1sp_get_selection,
++	.enum_mbus_code = s5kgd1sp_enum_mbus_code,
++	.enum_frame_size = s5kgd1sp_enum_frame_size,
++	.enable_streams = s5kgd1sp_enable_streams,
++	.disable_streams = s5kgd1sp_disable_streams,
++};
++
++static const struct v4l2_subdev_ops s5kgd1sp_subdev_ops = {
++	.video = &s5kgd1sp_video_ops,
++	.pad = &s5kgd1sp_pad_ops,
++};
++
++static const struct v4l2_subdev_internal_ops s5kgd1sp_internal_ops = {
++	.init_state = s5kgd1sp_init_state,
++};
++
++static const struct media_entity_operations s5kgd1sp_entity_ops = {
++	.link_validate = v4l2_subdev_link_validate,
++};
++
++/*
++ * Titan 2 power sequence: MCLK, RST low, DOVDD 1 ms, AVDD 1 ms, DVDD 1 ms,
++ * RST high 1 ms, then the MCLK drive strength step (a DT pinctrl setting)
++ * with its 1 ms delay.
++ */
++static int s5kgd1sp_power_on(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct s5kgd1sp *s5k = to_s5kgd1sp(sd);
++	unsigned int i;
++	int ret;
++
++	ret = clk_prepare_enable(s5k->mclk);
++	if (ret)
++		return ret;
++
++	gpiod_set_value_cansleep(s5k->reset_gpio, 1);
++
++	for (i = 0; i < S5KGD1SP_NUM_SUPPLIES; i++) {
++		ret = regulator_enable(s5k->supplies[i].consumer);
++		if (ret)
++			goto err_supplies;
++		usleep_range(1000, 1100);
++	}
++
++	gpiod_set_value_cansleep(s5k->reset_gpio, 0);
++	usleep_range(1000, 1100);
++
++	/* MCLK drive strength step (pinctrl) */
++	usleep_range(1000, 1100);
++
++	return 0;
++
++err_supplies:
++	while (i--)
++		regulator_disable(s5k->supplies[i].consumer);
++	clk_disable_unprepare(s5k->mclk);
++
++	return ret;
++}
++
++/* Reverse order of s5kgd1sp_power_on(), without delays */
++static int s5kgd1sp_power_off(struct device *dev)
++{
++	struct v4l2_subdev *sd = dev_get_drvdata(dev);
++	struct s5kgd1sp *s5k = to_s5kgd1sp(sd);
++	unsigned int i = S5KGD1SP_NUM_SUPPLIES;
++
++	gpiod_set_value_cansleep(s5k->reset_gpio, 1);
++	while (i--)
++		regulator_disable(s5k->supplies[i].consumer);
++	clk_disable_unprepare(s5k->mclk);
++
++	return 0;
++}
++
++static int s5kgd1sp_identify(struct s5kgd1sp *s5k)
++{
++	unsigned int retry;
++	u64 val = 0;
++	int ret;
++
++	for (retry = 0; retry < 2; retry++) {
++		ret = cci_read(s5k->regmap, S5KGD1SP_REG_CHIP_ID, &val, NULL);
++		if (!ret && val == S5KGD1SP_CHIP_ID)
++			return 0;
++	}
++
++	if (ret)
++		return dev_err_probe(s5k->dev, ret, "failed to read chip id\n");
++
++	return dev_err_probe(s5k->dev, -ENODEV, "chip id mismatch: %x != %llx\n",
++			     S5KGD1SP_CHIP_ID, val);
++}
++
++static int s5kgd1sp_check_hwcfg(struct s5kgd1sp *s5k)
++{
++	struct fwnode_handle *fwnode = dev_fwnode(s5k->dev), *ep;
++	struct v4l2_fwnode_endpoint bus_cfg = {
++		.bus_type = V4L2_MBUS_CSI2_DPHY,
++	};
++	unsigned long freq_bitmap;
++	int ret;
++
++	if (!fwnode)
++		return -ENODEV;
++
++	ep = fwnode_graph_get_next_endpoint(fwnode, NULL);
++	if (!ep)
++		return -EINVAL;
++
++	ret = v4l2_fwnode_endpoint_alloc_parse(ep, &bus_cfg);
++	fwnode_handle_put(ep);
++	if (ret)
++		return ret;
++
++	if (bus_cfg.bus.mipi_csi2.num_data_lanes != S5KGD1SP_DATA_LANES) {
++		dev_err(s5k->dev, "unsupported number of data lanes: %u\n",
++			bus_cfg.bus.mipi_csi2.num_data_lanes);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	ret = v4l2_link_freq_to_bitmap(s5k->dev, bus_cfg.link_frequencies,
++				       bus_cfg.nr_of_link_frequencies,
++				       s5kgd1sp_link_freq_menu,
++				       ARRAY_SIZE(s5kgd1sp_link_freq_menu),
++				       &freq_bitmap);
++
++out:
++	v4l2_fwnode_endpoint_free(&bus_cfg);
++
++	return ret;
++}
++
++static int s5kgd1sp_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct s5kgd1sp *s5k;
++	unsigned long freq;
++	unsigned int i;
++	int ret;
++
++	s5k = devm_kzalloc(dev, sizeof(*s5k), GFP_KERNEL);
++	if (!s5k)
++		return -ENOMEM;
++
++	s5k->dev = dev;
++	v4l2_i2c_subdev_init(&s5k->sd, client, &s5kgd1sp_subdev_ops);
++
++	ret = s5kgd1sp_check_hwcfg(s5k);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "failed to check HW configuration\n");
++
++	s5k->regmap = devm_cci_regmap_init_i2c(client, 16);
++	if (IS_ERR(s5k->regmap))
++		return dev_err_probe(dev, PTR_ERR(s5k->regmap),
++				     "failed to init CCI\n");
++
++	s5k->mclk = devm_v4l2_sensor_clk_get(dev, NULL);
++	if (IS_ERR(s5k->mclk))
++		return dev_err_probe(dev, PTR_ERR(s5k->mclk),
++				     "failed to get MCLK\n");
++
++	freq = clk_get_rate(s5k->mclk);
++	if (freq != S5KGD1SP_MCLK_FREQ)
++		return dev_err_probe(dev, -EINVAL,
++				     "MCLK frequency %lu is not supported\n",
++				     freq);
++
++	for (i = 0; i < S5KGD1SP_NUM_SUPPLIES; i++)
++		s5k->supplies[i].supply = s5kgd1sp_supply_names[i];
++
++	ret = devm_regulator_bulk_get(dev, S5KGD1SP_NUM_SUPPLIES,
++				      s5k->supplies);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get regulators\n");
++
++	s5k->reset_gpio = devm_gpiod_get_optional(dev, "reset",
++						  GPIOD_OUT_HIGH);
++	if (IS_ERR(s5k->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(s5k->reset_gpio),
++				     "failed to get reset GPIO\n");
++
++	ret = s5kgd1sp_power_on(dev);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to power on\n");
++
++	ret = s5kgd1sp_identify(s5k);
++	if (ret)
++		goto err_power_off;
++
++	ret = s5kgd1sp_init_controls(s5k);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to init controls\n");
++		goto err_power_off;
++	}
++
++	s5k->sd.state_lock = s5k->ctrl_handler.lock;
++	s5k->sd.internal_ops = &s5kgd1sp_internal_ops;
++	s5k->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
++	s5k->sd.entity.ops = &s5kgd1sp_entity_ops;
++	s5k->sd.entity.function = MEDIA_ENT_F_CAM_SENSOR;
++	s5k->pad.flags = MEDIA_PAD_FL_SOURCE;
++
++	ret = media_entity_pads_init(&s5k->sd.entity, 1, &s5k->pad);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to init entity pads\n");
++		goto err_ctrl_free;
++	}
++
++	ret = v4l2_subdev_init_finalize(&s5k->sd);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to init subdev\n");
++		goto err_entity_cleanup;
++	}
++
++	pm_runtime_set_active(dev);
++	pm_runtime_enable(dev);
++
++	ret = v4l2_async_register_subdev_sensor(&s5k->sd);
++	if (ret) {
++		dev_err_probe(dev, ret, "failed to register subdev\n");
++		goto err_subdev_cleanup;
++	}
++
++	pm_runtime_set_autosuspend_delay(dev, 1000);
++	pm_runtime_use_autosuspend(dev);
++	pm_runtime_idle(dev);
++
++	return 0;
++
++err_subdev_cleanup:
++	v4l2_subdev_cleanup(&s5k->sd);
++	pm_runtime_disable(dev);
++	pm_runtime_set_suspended(dev);
++err_entity_cleanup:
++	media_entity_cleanup(&s5k->sd.entity);
++err_ctrl_free:
++	v4l2_ctrl_handler_free(&s5k->ctrl_handler);
++err_power_off:
++	s5kgd1sp_power_off(dev);
++
++	return ret;
++}
++
++static void s5kgd1sp_remove(struct i2c_client *client)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(client);
++	struct s5kgd1sp *s5k = to_s5kgd1sp(sd);
++
++	v4l2_async_unregister_subdev(sd);
++	v4l2_subdev_cleanup(sd);
++	media_entity_cleanup(&sd->entity);
++	v4l2_ctrl_handler_free(&s5k->ctrl_handler);
++
++	pm_runtime_disable(s5k->dev);
++	if (!pm_runtime_status_suspended(s5k->dev)) {
++		s5kgd1sp_power_off(s5k->dev);
++		pm_runtime_set_suspended(s5k->dev);
++	}
++
++	release_firmware(s5k->tnp);
++}
++
++static DEFINE_RUNTIME_DEV_PM_OPS(s5kgd1sp_pm_ops, s5kgd1sp_power_off,
++				 s5kgd1sp_power_on, NULL);
++
++static const struct of_device_id s5kgd1sp_of_match[] = {
++	{ .compatible = "samsung,s5kgd1sp" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, s5kgd1sp_of_match);
++
++static struct i2c_driver s5kgd1sp_i2c_driver = {
++	.driver = {
++		.name = "s5kgd1sp",
++		.pm = pm_ptr(&s5kgd1sp_pm_ops),
++		.of_match_table = s5kgd1sp_of_match,
++	},
++	.probe = s5kgd1sp_probe,
++	.remove = s5kgd1sp_remove,
++};
++module_i2c_driver(s5kgd1sp_i2c_driver);
++
++MODULE_FIRMWARE(S5KGD1SP_TNP_FW);
++MODULE_AUTHOR("serlk");
++MODULE_DESCRIPTION("Samsung S5KGD1SP image sensor driver");
++MODULE_LICENSE("GPL");
+-- 
+2.56.0
+
