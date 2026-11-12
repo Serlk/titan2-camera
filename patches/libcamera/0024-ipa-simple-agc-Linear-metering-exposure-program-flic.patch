@@ -1,0 +1,298 @@
+From b0dea094da78cbf663ab8bbda4460992c1ffa030 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:02:10 +0300
+Subject: [PATCH 24/26] ipa: simple: agc: Linear metering, exposure program,
+ flicker steps
+
+Add, from the tuning file:
+
+- target_linear and weights: meter the weighted mean of the 5x5 zones
+  above the black level as a fraction of the range (e.g. 0.18 for middle
+  grey) instead of the mean sample value of the histogram, with centre
+  weights; a 10 % dead band;
+- program: exposure time / total gain points; below the first point only
+  the exposure time changes, between points both rise log-linearly, past
+  the last one only the gain. The exposure time stays within the frame
+  length of the mode;
+- flicker_period_us: exposure times of at least one period are rounded
+  down to whole periods (10 ms for 50 Hz mains) and the gain makes up.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/ipa/simple/algorithms/agc.cpp | 171 ++++++++++++++++++++++++------
+ src/ipa/simple/algorithms/agc.h   |  20 +++-
+ 2 files changed, 160 insertions(+), 31 deletions(-)
+
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index 9f43781..1ded03d 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -8,6 +8,8 @@
+ #include "agc.h"
+ 
+ #include <algorithm>
++#include <array>
++#include <vector>
+ #include <cmath>
+ #include <stdint.h>
+ 
+@@ -59,11 +61,87 @@ int Agc::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
+ 			     1.5, 4.5);
+ 	highlightLimit_ = std::clamp(tuningData["highlights"].get<double>().value_or(1.0),
+ 				     0.0, 1.0);
++
++	/*
++	 * target_linear: weighted mean luminance above the black level as a
++	 * fraction of the range (e.g. 0.18), with weights: 25 metering weights
++	 * of a 5x5 grid, row major (default: uniform). Replaces the MSV target.
++	 */
++	targetLinear_ = std::clamp(tuningData["target_linear"].get<double>().value_or(0.0),
++				   0.0, 0.9);
++	weights_.fill(1.0);
++	if (auto w = tuningData["weights"].get<std::vector<double>>()) {
++		if (w->size() != weights_.size()) {
++			LOG(IPASoftExposure, Error) << "weights needs 25 values";
++			return -EINVAL;
++		}
++		std::copy(w->begin(), w->end(), weights_.begin());
++	}
++
++	/*
++	 * program: [[exposure_us, total_gain], ...]: below the first point
++	 * only the exposure time changes (at gain 1), between points both rise
++	 * (log-linearly), past the last one only the gain. flicker_period_us:
++	 * exposure times of at least one period are rounded down to whole
++	 * periods (10000 for 50 Hz mains, 8333 for 60 Hz), the gain makes up.
++	 */
++	program_.clear();
++	for (const ValueNode &p : tuningData["program"].asList()) {
++		auto t = p[0].get<double>();
++		auto g = p[1].get<double>();
++		if (!t || !g || *t <= 0.0 || *g < 1.0 ||
++		    (!program_.empty() && (*t < program_.back().first ||
++					   *t * *g <= program_.back().first * program_.back().second))) {
++			LOG(IPASoftExposure, Error) << "Invalid exposure program";
++			return -EINVAL;
++		}
++		program_.emplace_back(*t * 1e-6, *g);
++	}
++	flickerPeriod_ = std::max(tuningData["flicker_period_us"].get<double>().value_or(0.0), 0.0) * 1e-6;
++
+ 	return 0;
+ }
+ 
++/* Exposure time (lines) and analogue gain for a total exposure (s x gain) */
++void Agc::distribute(IPAContext &context, double total,
++		     int32_t &exposure, double &gain) const
++{
++	const auto &agc = context.configuration.agc;
++	const double line = agc.lineDuration.get<std::ratio<1>>();
++	const double tMax = agc.exposureMax * line;
++	const double tMin = agc.exposureMin * line;
++
++	double t = total;
++	if (!program_.empty() && total > program_.front().first * program_.front().second) {
++		t = program_.back().first;
++		for (size_t i = 1; i < program_.size(); i++) {
++			const double e0 = program_[i - 1].first * program_[i - 1].second;
++			const double e1 = program_[i].first * program_[i].second;
++			if (total > e1)
++				continue;
++			const double f = std::log(total / e0) / std::log(e1 / e0);
++			t = program_[i - 1].first *
++			    std::pow(program_[i].first / program_[i - 1].first, f);
++			break;
++		}
++	}
++
++	t = std::clamp(t, tMin, tMax);
++	if (flickerPeriod_ > 0.0 && t >= flickerPeriod_ && total / t < agc.againMax)
++		t = std::max(std::floor(t / flickerPeriod_) * flickerPeriod_, tMin);
++
++	double g = total / t;
++	if (g < agc.againMin) {
++		g = agc.againMin;
++		t = std::clamp(total / g, tMin, tMax);
++	}
++
++	exposure = std::clamp<int32_t>(std::lround(t / line), agc.exposureMin, agc.exposureMax);
++	gain = std::clamp(g, agc.againMin, agc.againMax);
++}
++
+ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext,
+-			 double exposureMSV, double highlights)
++			 double exposureMSV, double linearMean, double highlights)
+ {
+ 	/*
+ 	 * Largest change of the total exposure (exposure time x gain) in one
+@@ -81,16 +159,22 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext,
+ 	/* Too many clipped highlights: darken, whatever the mean says */
+ 	const bool clipping = highlights > highlightLimit_;
+ 
+-	if (clipping ||
+-	    exposureMSV < target_ - kExposureSatisfactory ||
+-	    exposureMSV > target_ + kExposureSatisfactory) {
++	/* Linear metering when tuned, else the mean sample value */
++	const bool linear = targetLinear_ > 0.0 && linearMean >= 0.0;
++	const bool off = linear
++		? std::abs(linearMean / targetLinear_ - 1.0) > 0.1
++		: (exposureMSV < target_ - kExposureSatisfactory ||
++		   exposureMSV > target_ + kExposureSatisfactory);
++
++	if (clipping || off) {
+ 		/*
+ 		 * The MSV is the mean bin index (1 .. kExposureBinsCount) of
+ 		 * the histogram above the black level, about linear in the
+ 		 * mean brightness: bin i covers (i - 1) .. i fifths of it.
+ 		 */
+-		double factor = (target_ - 0.5) /
+-				std::max(exposureMSV - 0.5, 0.25);
++		double factor = linear
++			? targetLinear_ / std::max(linearMean, 0.002)
++			: (target_ - 0.5) / std::max(exposureMSV - 0.5, 0.25);
+ 		factor = std::clamp(factor, kMaxStepDown, kMaxStepUp);
+ 		if (clipping)
+ 			factor = std::min(factor, 0.8);
+@@ -98,29 +182,38 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext,
+ 		double target = std::max(exposure, 1) * again * factor;
+ 		double gainLow = std::max(agc.again10, agc.againMin);
+ 
+-		/* Exposure time first, at the lowest useful gain, then gain. */
+-		int32_t nextExposure = std::clamp<int32_t>(std::lround(target / gainLow),
+-							   agc.exposureMin, agc.exposureMax);
+-		double nextGain = std::clamp(target / nextExposure,
+-					     agc.againMin, agc.againMax);
+-
+-		/* Always move by at least one step in the wanted direction. */
+-		if (factor > 1.0 && nextExposure <= exposure &&
+-		    nextGain - again < agc.againMinStep) {
+-			if (exposure < agc.exposureMax)
+-				nextExposure = exposure + 1;
+-			else
+-				nextGain = again + agc.againMinStep;
+-		} else if (factor < 1.0 && nextExposure >= exposure &&
+-			   again - nextGain < agc.againMinStep) {
+-			if (again > gainLow)
+-				nextGain = again - agc.againMinStep;
+-			else
+-				nextExposure = exposure - 1;
++		if (!program_.empty() || flickerPeriod_ > 0.0) {
++			const double line = agc.lineDuration.get<std::ratio<1>>();
++			int32_t e;
++			double g;
++			distribute(context, target * line, e, g);
++			exposure = e;
++			again = g;
++		} else {
++			/* Exposure time first, at the lowest useful gain, then gain. */
++			int32_t nextExposure = std::clamp<int32_t>(std::lround(target / gainLow),
++								   agc.exposureMin, agc.exposureMax);
++			double nextGain = std::clamp(target / nextExposure,
++						     agc.againMin, agc.againMax);
++
++			/* Always move by at least one step in the wanted direction. */
++			if (factor > 1.0 && nextExposure <= exposure &&
++			    nextGain - again < agc.againMinStep) {
++				if (exposure < agc.exposureMax)
++					nextExposure = exposure + 1;
++				else
++					nextGain = again + agc.againMinStep;
++			} else if (factor < 1.0 && nextExposure >= exposure &&
++				   again - nextGain < agc.againMinStep) {
++				if (again > gainLow)
++					nextGain = again - agc.againMinStep;
++				else
++					nextExposure = exposure - 1;
++			}
++
++			exposure = nextExposure;
++			again = nextGain;
+ 		}
+-
+-		exposure = nextExposure;
+-		again = nextGain;
+ 	}
+ 
+ 	exposure = std::clamp(exposure, context.configuration.agc.exposureMin,
+@@ -132,7 +225,8 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext,
+ 	context.activeState.agc.again = again;
+ 
+ 	LOG(IPASoftExposure, Debug)
+-		<< "exposureMSV " << exposureMSV
++		<< "exposureMSV " << exposureMSV << " linear " << linearMean
++		<< " highlights " << highlights
+ 		<< " exp " << exposure << " again " << again;
+ }
+ 
+@@ -211,7 +305,24 @@ void Agc::process(IPAContext &context,
+ 	}
+ 	double highlights = total ? static_cast<double>(top) / total : 0.0;
+ 
+-	updateExposure(context, frameContext, exposureMSV, highlights);
++	/* Weighted mean of the metering zones above the black level, 0 .. 1 */
++	double linearMean = -1.0;
++	{
++		const double black = context.activeState.blc.level;
++		double weighted = 0.0, weightSum = 0.0;
++		for (unsigned int z = 0; z < stats->zoneSum.size(); z++) {
++			if (!stats->zoneCount[z])
++				continue;
++			const double mean = static_cast<double>(stats->zoneSum[z]) /
++					    stats->zoneCount[z];
++			weighted += weights_[z] * std::max(mean - black, 0.0);
++			weightSum += weights_[z];
++		}
++		if (weightSum > 0.0)
++			linearMean = weighted / weightSum / std::max(255.0 - black, 1.0);
++	}
++
++	updateExposure(context, frameContext, exposureMSV, linearMean, highlights);
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Agc, "Agc")
+diff --git a/src/ipa/simple/algorithms/agc.h b/src/ipa/simple/algorithms/agc.h
+index ad1a9ce..a49ae55 100644
+--- a/src/ipa/simple/algorithms/agc.h
++++ b/src/ipa/simple/algorithms/agc.h
+@@ -7,6 +7,10 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <utility>
++#include <vector>
++
+ #include "algorithm.h"
+ 
+ namespace libcamera {
+@@ -28,12 +32,26 @@ public:
+ 
+ private:
+ 	void updateExposure(IPAContext &context, IPAFrameContext &frameContext,
+-			    double exposureMSV, double highlights);
++			    double exposureMSV, double linearMean, double highlights);
++	void distribute(IPAContext &context, double total,
++			int32_t &exposure, double &gain) const;
+ 
+ 	/* Target mean sample value (1 .. kExposureBinsCount) */
+ 	double target_;
+ 	/* Fraction of the samples allowed in the top histogram bins */
+ 	double highlightLimit_;
++
++	/*
++	 * Linear metering: weighted mean of the 5x5 zones above the black
++	 * level, as a fraction of the range; 0 = use the MSV target
++	 */
++	double targetLinear_ = 0.0;
++	std::array<double, 25> weights_ = {};
++
++	/* Exposure program: (exposure time in s, total gain) points */
++	std::vector<std::pair<double, double>> program_;
++	/* Flicker period in s (0 = no flicker avoidance) */
++	double flickerPeriod_ = 0.0;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+-- 
+2.56.0
+

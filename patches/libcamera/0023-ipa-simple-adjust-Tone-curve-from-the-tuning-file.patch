@@ -1,0 +1,124 @@
+From 0a0d4b5ecdedffc2fb451fee082c445e0616e60d Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:02:10 +0300
+Subject: [PATCH 23/26] ipa: simple: adjust: Tone curve from the tuning file
+
+Read a tone curve (nodes of input and output, with their full scales)
+from the tuning file, resample it to the debayer table and use it instead
+of the gamma power law until the application sets the Gamma control.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/ipa/simple/algorithms/adjust.cpp | 41 ++++++++++++++++++++++++++++
+ src/ipa/simple/algorithms/adjust.h   |  7 +++++
+ 2 files changed, 48 insertions(+)
+
+diff --git a/src/ipa/simple/algorithms/adjust.cpp b/src/ipa/simple/algorithms/adjust.cpp
+index b2fa8ac..e4e1c96 100644
+--- a/src/ipa/simple/algorithms/adjust.cpp
++++ b/src/ipa/simple/algorithms/adjust.cpp
+@@ -9,6 +9,8 @@
+ #include "adjust.h"
+ 
+ #include <algorithm>
++#include <cmath>
++#include <vector>
+ 
+ #include <libcamera/base/log.h>
+ #include <libcamera/base/utils.h>
+@@ -36,6 +38,37 @@ int Adjust::init(IPAContext &context, const ValueNode &tuningData)
+ 	if (auto s = tuningData["saturation"].get<float>())
+ 		saturation_ = std::clamp(*s, 0.0f, 2.0f);
+ 
++	/*
++	 * tone_curve: { input: [...], output: [...], input_max, output_max }:
++	 * nodes in increasing input order, the input normalised by input_max
++	 * (default 4095) and the output by output_max (default 1023), linear
++	 * between the nodes. Applied after the CCM to R, G and B, it replaces
++	 * the gamma power law until a Gamma control is set.
++	 */
++	const ValueNode &tc = tuningData["tone_curve"];
++	if (tc.isDictionary()) {
++		auto in = tc["input"].get<std::vector<double>>();
++		auto out = tc["output"].get<std::vector<double>>();
++		const double inMax = tc["input_max"].get<double>().value_or(4095.0);
++		const double outMax = tc["output_max"].get<double>().value_or(1023.0);
++		if (!in || !out || in->size() != out->size() || in->size() < 2 ||
++		    inMax <= 0.0 || outMax <= 0.0) {
++			LOG(IPASoftAdjust, Error) << "Invalid tone curve";
++			return -EINVAL;
++		}
++		for (unsigned int i = 0; i < toneTable_.size(); i++) {
++			const double x = inMax * i / (toneTable_.size() - 1);
++			size_t k = 1;
++			while (k < in->size() - 1 && (*in)[k] < x)
++				k++;
++			const double x0 = (*in)[k - 1], x1 = (*in)[k];
++			const double f = x1 > x0 ? std::clamp((x - x0) / (x1 - x0), 0.0, 1.0) : 1.0;
++			const double y = (*out)[k - 1] + f * ((*out)[k] - (*out)[k - 1]);
++			toneTable_[i] = std::clamp(std::lround(y / outMax * 255.0), 0L, 255L);
++		}
++		toneCurve_ = true;
++	}
++
+ 	context.ctrlMap[&controls::Gamma] =
+ 		ControlInfo(0.1f, 10.0f, kDefaultGamma);
+ 	context.ctrlMap[&controls::Contrast] =
+@@ -50,6 +83,7 @@ int Adjust::configure(IPAContext &context,
+ 		      [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+ 	context.activeState.knobs.gamma = gamma_;
++	gammaRequested_ = false;
+ 	context.activeState.knobs.contrast = contrast_;
+ 	context.activeState.knobs.saturation = saturation_;
+ 
+@@ -64,6 +98,7 @@ void Adjust::queueRequest(typename Module::Context &context,
+ 	const auto &gamma = controls.get(controls::Gamma);
+ 	if (gamma.has_value()) {
+ 		context.activeState.knobs.gamma = gamma.value();
++		gammaRequested_ = true;
+ 		LOG(IPASoftAdjust, Debug) << "Setting gamma to " << gamma.value();
+ 	}
+ 
+@@ -117,6 +152,12 @@ void Adjust::prepare(IPAContext &context,
+ 	}
+ 
+ 	params->gamma = 1.0 / context.activeState.knobs.gamma;
++
++	params->toneCurveEnabled = toneCurve_ && !gammaRequested_;
++	if (params->toneCurveEnabled) {
++		params->toneCurve = toneTable_;
++		params->toneCurveSequence = toneSequence_ + 1;
++	}
+ 	const float contrast = context.activeState.knobs.contrast.value_or(kDefaultContrast);
+ 	params->contrastExp = tan(std::clamp(contrast * M_PI_4, 0.0, M_PI_2 - 0.00001));
+ }
+diff --git a/src/ipa/simple/algorithms/adjust.h b/src/ipa/simple/algorithms/adjust.h
+index d50bffb..926f805 100644
+--- a/src/ipa/simple/algorithms/adjust.h
++++ b/src/ipa/simple/algorithms/adjust.h
+@@ -7,7 +7,9 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <optional>
++#include <stdint.h>
+ 
+ #include "libcamera/internal/matrix.h"
+ 
+@@ -48,6 +50,11 @@ private:
+ 
+ 	/* Defaults from the tuning file (gamma, contrast, saturation) */
+ 	float gamma_ = kDefaultGamma;
++	/* Tone curve from the tuning file, used until a Gamma control */
++	bool toneCurve_ = false;
++	bool gammaRequested_ = false;
++	std::array<uint8_t, 256> toneTable_ = {};
++	uint32_t toneSequence_ = 0;
+ 	std::optional<float> contrast_;
+ 	std::optional<float> saturation_;
+ };
+-- 
+2.56.0
+

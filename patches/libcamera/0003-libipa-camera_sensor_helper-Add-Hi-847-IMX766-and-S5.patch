@@ -1,0 +1,87 @@
+From 32eede863a73ffb9069b463e16343b87d74c69e6 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:02:52 +0300
+Subject: [PATCH 03/26] libipa: camera_sensor_helper: Add Hi-847, IMX766 and
+ S5KGD1SP
+
+Add helpers for the three sensors of the Unihertz Titan 2. The gain
+models follow the V4L2_CID_ANALOGUE_GAIN codes of the kernel drivers:
+
+  hi847     gain = code / 16 + 1         (code 0 .. 232, 1x .. 15.5x)
+  imx766    gain = 16384 / (16384 - code) (code 0 .. 16128, 1x .. 64x)
+  s5kgd1sp  gain = code / 32             (code 0x20 .. 0x200, 1x .. 16x)
+
+All three have a black level pedestal of 64 at 10 bits.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/ipa/libipa/camera_sensor_helper.cpp | 39 +++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index e3e3e53..9798b54 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -520,6 +520,19 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("gc08a3", CameraSensorHelperGc08a3)
+ 
++class CameraSensorHelperHi847 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperHi847()
++	{
++		/* Pedestal 64 at 10 bits. */
++		blackLevel_ = 4096;
++		/* 1x .. 15.5x in 1/16 steps, code 0 = 1x. */
++		gain_ = AnalogueGainLinear{ 1, 16, 0, 16 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("hi847", CameraSensorHelperHi847)
++
+ class CameraSensorHelperHm1246 : public CameraSensorHelper
+ {
+ public:
+@@ -653,6 +666,19 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("imx708", CameraSensorHelperImx708)
+ 
++class CameraSensorHelperImx766 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperImx766()
++	{
++		/* Pedestal 64 at 10 bits. */
++		blackLevel_ = 4096;
++		/* gain = 16384 / (16384 - code), 1x .. 64x. */
++		gain_ = AnalogueGainLinear{ 0, 16384, -1, 16384 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("imx766", CameraSensorHelperImx766)
++
+ class CameraSensorHelperOv2685 : public CameraSensorHelper
+ {
+ public:
+@@ -789,6 +815,19 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov13858", CameraSensorHelperOv13858)
+ 
++class CameraSensorHelperS5kgd1sp : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperS5kgd1sp()
++	{
++		/* Pedestal 64 at 10 bits. */
++		blackLevel_ = 4096;
++		/* gain = code / 32, 1x (0x20) .. 16x (0x200). */
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 32 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("s5kgd1sp", CameraSensorHelperS5kgd1sp)
++
+ class CameraSensorHelperVd55g1 : public CameraSensorHelper
+ {
+ public:
+-- 
+2.56.0
+

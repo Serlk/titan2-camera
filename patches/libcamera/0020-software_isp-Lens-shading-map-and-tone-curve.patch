@@ -1,0 +1,362 @@
+From 10408cb3354cf5717d66f3d3bdbce5f7804bcbd0 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:02:10 +0300
+Subject: [PATCH 20/26] software_isp: Lens shading map and tone curve
+
+Add two tables to DebayerParams:
+
+- a lens shading gain map, 17 x 17 nodes over the input frame, per node
+  R, G and B gains coded as log2(gain) / 3 in 8 bits (1.0 .. 8.0). The
+  GPU debayer uploads it as a texture when it changes and multiplies the
+  colour after the black level subtraction, bilinearly between the nodes
+  (the detail stage high-pass is scaled alike). The CPU debayer has no
+  spatial correction and ignores it;
+
+- a tone curve, 256 output values for uniformly spaced linear inputs,
+  replacing the gamma power law: a texture lookup on the GPU, the gamma
+  table on the CPU. The contrast curve still applies before it.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ .../internal/software_isp/debayer_params.h    | 22 ++++++++
+ src/libcamera/shaders/bayer_1x_packed.frag    | 37 ++++++++++++-
+ src/libcamera/shaders/bayer_unpacked.frag     | 37 ++++++++++++-
+ src/libcamera/software_isp/debayer_cpu.cpp    | 19 ++++++-
+ src/libcamera/software_isp/debayer_egl.cpp    | 55 +++++++++++++++++++
+ src/libcamera/software_isp/debayer_egl.h      | 12 ++++
+ 6 files changed, 175 insertions(+), 7 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index 8925f3c..7f36e00 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -10,6 +10,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <stdint.h>
+ 
+ #include "libcamera/internal/matrix.h"
+@@ -28,6 +29,27 @@ struct DebayerParams {
+ 	float sharpen = 0.0;
+ 	float denoise = 0.0;
+ 	float noiseThreshold = 0.0;
++
++	/*
++	 * Lens shading correction (GPU debayer only): kLscGrid x kLscGrid
++	 * nodes over the input frame, RGBA8 per node with R, G, B =
++	 * log2(gain) / 3 * 255 (gain 1 .. 8), bilinearly interpolated.
++	 * lscSequence changes whenever the table does.
++	 */
++	static constexpr unsigned int kLscGrid = 17;
++	bool lscEnabled = false;
++	uint32_t lscSequence = 0;
++	std::array<uint8_t, kLscGrid * kLscGrid * 4> lscTable = {};
++
++	/*
++	 * Tone curve replacing the gamma power law: output 0 .. 255 for
++	 * kToneCurveSize uniformly spaced linear inputs 0 .. 1, interpolated
++	 * linearly. toneCurveSequence changes whenever the curve does.
++	 */
++	static constexpr unsigned int kToneCurveSize = 256;
++	bool toneCurveEnabled = false;
++	uint32_t toneCurveSequence = 0;
++	std::array<uint8_t, kToneCurveSize> toneCurve = {};
+ 	RGB<float> gains = RGB<float>({ 1.0, 1.0, 1.0 });
+ };
+ 
+diff --git a/src/libcamera/shaders/bayer_1x_packed.frag b/src/libcamera/shaders/bayer_1x_packed.frag
+index 9f4bec3..dfe864a 100644
+--- a/src/libcamera/shaders/bayer_1x_packed.frag
++++ b/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -79,6 +79,36 @@ uniform float contrastExp;
+  */
+ uniform vec3 detail;
+ 
++/*
++ * Lens shading (Titan 2): 17x17 RGBA8 gain map over the input frame,
++ * channel = log2(gain) / 3, bilinear. Tone curve: 256x1 R8 table of the
++ * output for uniformly spaced linear inputs, replacing the gamma power law.
++ */
++uniform sampler2D lsc_tex;
++uniform float lsc_on;
++uniform sampler2D tone_tex;
++uniform float tone_on;
++
++vec3 lsc_gain(vec2 uv)
++{
++	if (lsc_on < 0.5)
++		return vec3(1.0);
++	vec2 t = (clamp(uv, 0.0, 1.0) * 16.0 + 0.5) / 17.0;
++	return exp2(texture2D(lsc_tex, t).rgb * 3.0);
++}
++
++float tone(float v)
++{
++	return texture2D(tone_tex, vec2((clamp(v, 0.0, 1.0) * 255.0 + 0.5) / 256.0, 0.5)).r;
++}
++
++vec3 apply_tone(vec3 rgb, float g)
++{
++	if (tone_on > 0.5)
++		return vec3(tone(rgb.r), tone(rgb.g), tone(rgb.b));
++	return pow(rgb, vec3(g));
++}
++
+ vec3 apply_detail(vec3 rgb, float hp)
+ {
+ 	float w = mix(-detail.y, detail.x,
+@@ -243,6 +273,9 @@ void main(void)
+ 
+ 	rgb = rgb - blacklevel;
+ 
++	vec3 lscg = lsc_gain((center_pixel + 0.5) / tex_size);
++	rgb *= lscg;
++
+ 	/* Same-colour neighbours at distance 2, for the detail stage */
+ 	{
+ 		float xl = floor(BPP * (center_pixel.x - 2.0) + 0.02) * tex_step.x;
+@@ -250,7 +283,7 @@ void main(void)
+ 		float same = fetch(xl, center_bytes.y) + fetch(xr, center_bytes.y) +
+ 			     fetch(center_bytes.x, center_bytes.y - 2.0 * tex_step.y) +
+ 			     fetch(center_bytes.x, center_bytes.y + 2.0 * tex_step.y);
+-		rgb = apply_detail(rgb, C - same * 0.25);
++		rgb = apply_detail(rgb, (C - same * 0.25) * lscg.g);
+ 	}
+ 
+ 	/*
+@@ -307,7 +340,7 @@ void main(void)
+ 	rgb.b = apply_contrast(rgb.b);
+ 
+ 	/* Apply gamma after colour correction */
+-	rgb = pow(rgb, vec3(gamma));
++	rgb = apply_tone(rgb, gamma);
+ 
+ #if defined (SWAP_BLUE)
+ 	gl_FragColor = vec4(rgb.bgr, 1.0);
+diff --git a/src/libcamera/shaders/bayer_unpacked.frag b/src/libcamera/shaders/bayer_unpacked.frag
+index ed3ac40..849f0fa 100644
+--- a/src/libcamera/shaders/bayer_unpacked.frag
++++ b/src/libcamera/shaders/bayer_unpacked.frag
+@@ -38,6 +38,36 @@ uniform float           contrastExp;
+  */
+ uniform vec3 detail;
+ 
++/*
++ * Lens shading (Titan 2): 17x17 RGBA8 gain map over the input frame,
++ * channel = log2(gain) / 3, bilinear. Tone curve: 256x1 R8 table of the
++ * output for uniformly spaced linear inputs, replacing the gamma power law.
++ */
++uniform sampler2D lsc_tex;
++uniform float lsc_on;
++uniform sampler2D tone_tex;
++uniform float tone_on;
++
++vec3 lsc_gain(vec2 uv)
++{
++    if (lsc_on < 0.5)
++        return vec3(1.0);
++    vec2 t = (clamp(uv, 0.0, 1.0) * 16.0 + 0.5) / 17.0;
++    return exp2(texture2D(lsc_tex, t).rgb * 3.0);
++}
++
++float tone(float v)
++{
++    return texture2D(tone_tex, vec2((clamp(v, 0.0, 1.0) * 255.0 + 0.5) / 256.0, 0.5)).r;
++}
++
++vec3 apply_tone(vec3 rgb, float g)
++{
++    if (tone_on > 0.5)
++        return vec3(tone(rgb.r), tone(rgb.g), tone(rgb.b));
++    return pow(rgb, vec3(g));
++}
++
+ vec3 apply_detail(vec3 rgb, float hp)
+ {
+     float w = mix(-detail.y, detail.x,
+@@ -146,8 +176,11 @@ void main(void) {
+ 
+     rgb = rgb - blacklevel;
+ 
++    vec3 lscg = lsc_gain(center.xy);
++    rgb *= lscg;
++
+     /* value[0] = (0,-2) + (0,2), value[2] = (-2,0) + (2,0): same colour as C */
+-    rgb = apply_detail(rgb, C - (value[0] + value[2]) * 0.25);
++    rgb = apply_detail(rgb, (C - (value[0] + value[2]) * 0.25) * lscg.g);
+ 
+     /*
+      *   CCM is a 3x3 in the format
+@@ -202,7 +235,7 @@ void main(void) {
+     rgb.b = apply_contrast(rgb.b);
+ 
+     /* Apply gamma after colour correction */
+-    rgb = pow(rgb, vec3(gamma));
++    rgb = apply_tone(rgb, gamma);
+ 
+ #if defined (SWAP_BLUE)
+     gl_FragColor = vec4(rgb.bgr, 1.0);
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index c3f8488..3ccae17 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -898,8 +898,19 @@ void DebayerCpu::updateGammaTable(const DebayerParams &params)
+ 			normalized = 0.5 * std::pow(normalized / 0.5, contrastExp);
+ 		else
+ 			normalized = 1.0 - 0.5 * std::pow((1.0 - normalized) / 0.5, contrastExp);
+-		gammaTable_[i] = UINT8_MAX *
+-				 std::pow(normalized, gamma);
++		if (params.toneCurveEnabled) {
++			/* Tone curve table: uniformly spaced linear inputs */
++			const float pos = std::clamp(normalized, 0.0f, 1.0f) *
++					  (DebayerParams::kToneCurveSize - 1);
++			const unsigned int i0 = std::min(static_cast<unsigned int>(pos),
++							 DebayerParams::kToneCurveSize - 2);
++			const float f = pos - i0;
++			gammaTable_[i] = params.toneCurve[i0] * (1.0f - f) +
++					 params.toneCurve[i0 + 1] * f;
++		} else {
++			gammaTable_[i] = UINT8_MAX *
++					 std::pow(normalized, gamma);
++		}
+ 	}
+ 	/*
+ 	 * Due to CCM operations, the table lookup may reach indices below the black
+@@ -916,7 +927,9 @@ void DebayerCpu::updateLookupTables(const DebayerParams &params)
+ 	const bool gammaUpdateNeeded =
+ 		params.gamma != params_.gamma ||
+ 		params.blackLevel != params_.blackLevel ||
+-		params.contrastExp != params_.contrastExp;
++		params.contrastExp != params_.contrastExp ||
++		params.toneCurveEnabled != params_.toneCurveEnabled ||
++		params.toneCurveSequence != params_.toneCurveSequence;
+ 	if (gammaUpdateNeeded)
+ 		updateGammaTable(params);
+ 
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 2e36d31..4c67187 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -104,6 +104,10 @@ int DebayerEGL::getShaderVariableLocations(void)
+ 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
+ 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
+ 	detailUniformDataIn_ = glGetUniformLocation(programId_, "detail");
++	lscTexUniform_ = glGetUniformLocation(programId_, "lsc_tex");
++	lscOnUniform_ = glGetUniformLocation(programId_, "lsc_on");
++	toneTexUniform_ = glGetUniformLocation(programId_, "tone_tex");
++	toneOnUniform_ = glGetUniformLocation(programId_, "tone_on");
+ 
+ 	textureUniformStep_ = glGetUniformLocation(programId_, "tex_step");
+ 	textureUniformSize_ = glGetUniformLocation(programId_, "tex_size");
+@@ -495,11 +499,52 @@ void DebayerEGL::setShaderVariableValues(const DebayerParams &params)
+ 	/* Detail stage: sharpening, denoise, noise threshold */
+ 	glUniform3f(detailUniformDataIn_, params.sharpen, params.denoise,
+ 		    params.noiseThreshold);
++
++	/* Lens shading and tone curve tables (texture units 2 and 3) */
++	updateTables(params);
++	glUniform1i(lscTexUniform_, eglImageLsc_->texture_unit_uniform_id_);
++	glUniform1f(lscOnUniform_, params.lscEnabled && lscUploaded_ ? 1.0f : 0.0f);
++	glUniform1i(toneTexUniform_, eglImageTone_->texture_unit_uniform_id_);
++	glUniform1f(toneOnUniform_, params.toneCurveEnabled && toneUploaded_ ? 1.0f : 0.0f);
+ 	LOG(Debayer, Debug) << " contrastExpUniformDataIn_ " << contrastExpUniformDataIn_ << " data " << params.contrastExp;
+ 
+ 	return;
+ }
+ 
++void DebayerEGL::updateTables(const DebayerParams &params)
++{
++	if (params.lscEnabled &&
++	    (!lscUploaded_ || params.lscSequence != lscSequence_)) {
++		egl_.createTexture2D(*eglImageLsc_, GL_RGBA, DebayerParams::kLscGrid,
++				     DebayerParams::kLscGrid,
++				     const_cast<uint8_t *>(params.lscTable.data()));
++		/* The gain map is interpolated between the nodes */
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++		lscSequence_ = params.lscSequence;
++		lscUploaded_ = true;
++	} else {
++		glActiveTexture(eglImageLsc_->texture_unit_);
++		glBindTexture(GL_TEXTURE_2D, eglImageLsc_->texture_);
++	}
++
++	if (params.toneCurveEnabled &&
++	    (!toneUploaded_ || params.toneCurveSequence != toneSequence_)) {
++		egl_.createTexture2D(*eglImageTone_, GL_LUMINANCE,
++				     DebayerParams::kToneCurveSize, 1,
++				     const_cast<uint8_t *>(params.toneCurve.data()));
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++		toneSequence_ = params.toneCurveSequence;
++		toneUploaded_ = true;
++	} else {
++		glActiveTexture(eglImageTone_->texture_unit_);
++		glBindTexture(GL_TEXTURE_2D, eglImageTone_->texture_);
++	}
++
++	glActiveTexture(GL_TEXTURE0);
++}
++
+ int DebayerEGL::debayerGPU(MappedFrameBuffer &in, int out_fd, const DebayerParams &params)
+ {
+ 	/* eGL context switch */
+@@ -588,6 +633,14 @@ int DebayerEGL::start()
+ 	/* Texture we will render to */
+ 	eglImageBayerOut_ = std::make_unique<eGLImage>(outputSize_.width, outputSize_.height, outputConfig_.stride, GL_TEXTURE1, 1);
+ 
++	/* Lens shading gain map and tone curve */
++	eglImageLsc_ = std::make_unique<eGLImage>(DebayerParams::kLscGrid, DebayerParams::kLscGrid,
++						  DebayerParams::kLscGrid * 4, GL_TEXTURE2, 2);
++	eglImageTone_ = std::make_unique<eGLImage>(DebayerParams::kToneCurveSize, 1,
++						   DebayerParams::kToneCurveSize, GL_TEXTURE3, 3);
++	lscUploaded_ = false;
++	toneUploaded_ = false;
++
+ 	if (initBayerShaders(inputPixelFormat_, outputPixelFormat_))
+ 		return -EINVAL;
+ 
+@@ -598,6 +651,8 @@ void DebayerEGL::stop()
+ {
+ 	eglImageBayerOut_.reset();
+ 	eglImageBayerIn_.reset();
++	eglImageLsc_.reset();
++	eglImageTone_.reset();
+ 
+ 	if (programId_)
+ 		glDeleteProgram(programId_);
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index b887cee..78b6a8e 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -76,6 +76,14 @@ private:
+ 	/* Pointer to object representing input texture */
+ 	std::unique_ptr<eGLImage> eglImageBayerIn_;
+ 	std::unique_ptr<eGLImage> eglImageBayerOut_;
++	/* Lens shading gain map and tone curve, uploaded when they change */
++	std::unique_ptr<eGLImage> eglImageLsc_;
++	std::unique_ptr<eGLImage> eglImageTone_;
++	uint32_t lscSequence_ = 0;
++	uint32_t toneSequence_ = 0;
++	bool lscUploaded_ = false;
++	bool toneUploaded_ = false;
++	void updateTables(const DebayerParams &params);
+ 
+ 	/* Shader parameters */
+ 	float firstRed_x_;
+@@ -102,6 +110,10 @@ private:
+ 	/* Contrast */
+ 	GLint contrastExpUniformDataIn_;
+ 	GLint detailUniformDataIn_;
++	GLint lscTexUniform_;
++	GLint lscOnUniform_;
++	GLint toneTexUniform_;
++	GLint toneOnUniform_;
+ 
+ 	Rectangle window_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+-- 
+2.56.0
+

@@ -1,0 +1,226 @@
+From 5af6d0cd5c97f99e3f2fc52a0ab591a449bd4e4f Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:02:10 +0300
+Subject: [PATCH 19/26] software_isp: swstats: Metering zones
+
+Add a 5x5 grid of metering zones to the statistics: sums of the 8-bit
+luminance (with the black level) and numbers of the sampled pixels per
+zone, for centre-weighted exposure metering.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ .../internal/software_isp/swisp_stats.h       | 18 +++++++++
+ .../internal/software_isp/swstats_cpu.h       | 16 ++++++++
+ src/libcamera/software_isp/swstats_cpu.cpp    | 38 ++++++++++++++++++-
+ 3 files changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index b0ece26..815e613 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -58,6 +58,24 @@ struct SwIspStats {
+ 	 *        processed lies in the focus window
+ 	 */
+ 	bool afLine;
++	/**
++	 * \brief Number of metering zones per side (kZones x kZones grid)
++	 */
++	static constexpr unsigned int kZones = 5;
++	/**
++	 * \brief Sums of the 8-bit luminance (with the black level) of the
++	 *        sampled pixels per metering zone, row major
++	 */
++	std::array<uint64_t, kZones * kZones> zoneSum;
++	/**
++	 * \brief Numbers of the sampled pixels per metering zone
++	 */
++	std::array<uint32_t, kZones * kZones> zoneCount;
++	/**
++	 * \brief Internal to the statistics gathering: metering zone row of
++	 *        the line being processed
++	 */
++	unsigned int zoneRow;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/include/libcamera/internal/software_isp/swstats_cpu.h b/include/libcamera/internal/software_isp/swstats_cpu.h
+index 6bd6eef..2b31820 100644
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -11,6 +11,8 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
++#include <array>
+ #include <stdint.h>
+ #include <vector>
+ 
+@@ -21,6 +23,7 @@
+ #include "libcamera/internal/bayer_format.h"
+ #include "libcamera/internal/framebuffer.h"
+ #include "libcamera/internal/shared_mem_object.h"
++
+ #include "libcamera/internal/software_isp/swisp_stats.h"
+ 
+ #include "benchmark.h"
+@@ -68,6 +71,7 @@ public:
+ 			return;
+ 
+ 		stats_[statsBufferIndex].afLine = isAfLine(y);
++		stats_[statsBufferIndex].zoneRow = zoneRow(y);
+ 		(this->*stats0_)(src, stats_[statsBufferIndex]);
+ 	}
+ 
+@@ -81,6 +85,7 @@ public:
+ 			return;
+ 
+ 		stats_[statsBufferIndex].afLine = isAfLine(y);
++		stats_[statsBufferIndex].zoneRow = zoneRow(y);
+ 		(this->*stats2_)(src, stats_[statsBufferIndex]);
+ 	}
+ 
+@@ -92,6 +97,11 @@ private:
+ 
+ 	int setupStandardBayerOrder(BayerFormat::Order order);
+ 	bool isAfLine(unsigned int y) const { return y >= afY0_ && y < afY1_; }
++	unsigned int zoneRow(unsigned int y) const
++	{
++		unsigned int r = y > zoneY0_ ? (y - zoneY0_) * SwIspStats::kZones / zoneHeight_ : 0;
++		return std::min(r, SwIspStats::kZones - 1);
++	}
+ 	/* Bayer 8 bpp unpacked */
+ 	void statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats);
+ 	/* Bayer 10 bpp unpacked */
+@@ -125,6 +135,12 @@ private:
+ 	unsigned int afX0Bytes_ = 0, afX1Bytes_ = 0;
+ 	unsigned int afY0_ = 0, afY1_ = 0;
+ 
++	/* Metering zones: ends in pixels / packed bytes from the window start */
++	std::array<unsigned int, SwIspStats::kZones> zoneEndX_ = {};
++	std::array<unsigned int, SwIspStats::kZones> zoneEndXBytes_ = {};
++	unsigned int zoneY0_ = 0;
++	unsigned int zoneHeight_ = 1;
++
+ 	std::vector<SwIspStats> stats_;
+ 	SharedMemObject<SwIspStats> sharedStats_;
+ 	Benchmark bench_;
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index ae80ac0..a3e26b6 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -182,7 +182,20 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 	uint64_t sumB = 0;                \
+ 	uint64_t afSharp = 0;             \
+ 	uint64_t afSum = 0;               \
+-	int afPrev = -1;
++	int afPrev = -1;                  \
++	unsigned int zone = 0;            \
++	uint64_t *zoneSum = &stats.zoneSum[stats.zoneRow * SwIspStats::kZones]; \
++	uint32_t *zoneCount = &stats.zoneCount[stats.zoneRow * SwIspStats::kZones];
++
++/*
++ * Metering zones: x (loop units) against the zone ends of the line, yVal
++ * (luminance * 256 * div) brought to 8 bits.
++ */
++#define SWSTATS_ACCUMULATE_ZONE(x, zoneEnd, div)               \
++	while (zone < SwIspStats::kZones - 1 && (x) >= (zoneEnd)[zone]) \
++		zone++;                                            \
++	zoneSum[zone] += yVal / (256 * (div));                     \
++	zoneCount[zone]++;
+ 
+ /*
+  * Focus measure over the centre of the window: x (loop units) inside
+@@ -239,6 +252,7 @@ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
+ 
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
+ 		SWSTATS_ACCUMULATE_AF(x, afX0_, afX1_)
++		SWSTATS_ACCUMULATE_ZONE(x, zoneEndX_, 1)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -266,6 +280,7 @@ void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats)
+ 		/* divide Y by 4 for 10 -> 8 bpp value */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(4)
+ 		SWSTATS_ACCUMULATE_AF(x, afX0_, afX1_)
++		SWSTATS_ACCUMULATE_ZONE(x, zoneEndX_, 4)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -293,6 +308,7 @@ void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats)
+ 		/* divide Y by 16 for 12 -> 8 bpp value */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(16)
+ 		SWSTATS_ACCUMULATE_AF(x, afX0_, afX1_)
++		SWSTATS_ACCUMULATE_ZONE(x, zoneEndX_, 16)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -320,6 +336,7 @@ void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 		/* Data is already 8 bits, divide by 1 */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
+ 		SWSTATS_ACCUMULATE_AF(x, afX0Bytes_, afX1Bytes_)
++		SWSTATS_ACCUMULATE_ZONE(x, zoneEndXBytes_, 1)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -347,6 +364,7 @@ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 		/* Data is already 8 bits, divide by 1 */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
+ 		SWSTATS_ACCUMULATE_AF(x, afX0Bytes_, afX1Bytes_)
++		SWSTATS_ACCUMULATE_ZONE(x, zoneEndXBytes_, 1)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -372,6 +390,9 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 		s.afSharpness = 0;
+ 		s.afSum = 0;
+ 		s.afLine = false;
++		s.zoneSum.fill(0);
++		s.zoneCount.fill(0);
++		s.zoneRow = 0;
+ 	}
+ }
+ 
+@@ -391,10 +412,16 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 		sharedStats_->yHistogram.fill(0);
+ 		sharedStats_->afSharpness = 0;
+ 		sharedStats_->afSum = 0;
++		sharedStats_->zoneSum.fill(0);
++		sharedStats_->zoneCount.fill(0);
+ 		for (const auto &s : stats_) {
+ 			sharedStats_->sum_ += s.sum_;
+ 			sharedStats_->afSharpness += s.afSharpness;
+ 			sharedStats_->afSum += s.afSum;
++			for (unsigned int z = 0; z < s.zoneSum.size(); z++) {
++				sharedStats_->zoneSum[z] += s.zoneSum[z];
++				sharedStats_->zoneCount[z] += s.zoneCount[z];
++			}
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
+ 		}
+@@ -549,6 +576,14 @@ void SwStatsCpu::setWindow(const Rectangle &window)
+ 	afX1Bytes_ = afX1_ * 5 / 4;
+ 	afY0_ = window_.y + window_.height / 3;
+ 	afY1_ = window_.y + window_.height * 2 / 3;
++
++	/* Metering zones: kZones x kZones over the window */
++	for (unsigned int z = 0; z < SwIspStats::kZones; z++) {
++		zoneEndX_[z] = window_.width * (z + 1) / SwIspStats::kZones;
++		zoneEndXBytes_[z] = zoneEndX_[z] * 5 / 4;
++	}
++	zoneY0_ = window_.y;
++	zoneHeight_ = std::max(window_.height, 1u);
+ }
+ 
+ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+@@ -569,6 +604,7 @@ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+ 		linePointers[1] = src;
+ 		linePointers[2] = src + stride_;
+ 		stats_[0].afLine = isAfLine(window_.y + y);
++		stats_[0].zoneRow = zoneRow(window_.y + y);
+ 		(this->*stats0_)(linePointers, stats_[0]);
+ 		src += stride_ * 2;
+ 	}
+-- 
+2.56.0
+

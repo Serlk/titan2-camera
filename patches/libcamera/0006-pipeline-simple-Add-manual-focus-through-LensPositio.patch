@@ -1,0 +1,203 @@
+From e2f5c8dbe036a65a12d2cf6210fa3323a4139c43 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:56:53 +0300
+Subject: [PATCH 06/26] pipeline: simple: Add manual focus through LensPosition
+
+The simple pipeline handler opens the focus lens of the sensor (ancillary
+link) but offers no way to move it, so the lens stays wherever the driver
+left it, typically at the far end.
+
+When the sensor has a focus lens with V4L2_CID_FOCUS_ABSOLUTE, expose the
+LensPosition control (dioptres) and map it linearly to the lens position:
+position = infinity + dioptres * steps_per_dioptre. The simple pipeline
+has no lens tuning, so the map comes from the configuration file, per
+sensor model, with a common fallback:
+
+  configuration:
+    pipelines:
+      simple:
+        lens:
+          hi847:
+            infinity: 100          # lens steps at 0 dioptres
+            steps_per_dioptre: 90
+            default: 1.0           # dioptres, applied at start
+
+LensPosition can be set at start and in any request, and is reported in
+the request metadata. There is no autofocus algorithm.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/libcamera/pipeline/simple/simple.cpp | 103 ++++++++++++++++++++++-
+ 1 file changed, 101 insertions(+), 2 deletions(-)
+
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index d6ec5ce..50b7d98 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <iterator>
+ #include <list>
+ #include <map>
+@@ -33,6 +34,7 @@
+ #include <libcamera/stream.h>
+ 
+ #include "libcamera/internal/camera.h"
++#include "libcamera/internal/camera_lens.h"
+ #include "libcamera/internal/camera_manager.h"
+ #include "libcamera/internal/camera_sensor.h"
+ #include "libcamera/internal/camera_sensor_properties.h"
+@@ -345,6 +347,17 @@ public:
+ 	V4L2VideoDevice *video_;
+ 	V4L2Device *frameStartEmitter_;
+ 
++	/* Manual focus: LensPosition (dioptres) mapped linearly to the VCM */
++	CameraLens *lens_ = nullptr;
++	double lensInfinity_ = 0.0;
++	double lensStepsPerDioptre_ = 1.0;
++	int32_t lensMin_ = 0;
++	int32_t lensMax_ = 0;
++	float lensDefault_ = 0.0f;
++	float lensPosition_ = 0.0f;
++	void initLens();
++	void setLensPosition(float dioptres);
++
+ 	std::vector<Configuration> configs_;
+ 	std::map<PixelFormat, std::vector<const Configuration *>> formats_;
+ 
+@@ -690,9 +703,79 @@ int SimpleCameraData::init()
+ 		frameStartEmitter_ = video_;
+ 	}
+ 
++	initLens();
++
+ 	return 0;
+ }
+ 
++/*
++ * Expose manual focus when the sensor has a focus lens: the LensPosition
++ * control in dioptres, mapped linearly to the lens driver's
++ * V4L2_CID_FOCUS_ABSOLUTE. The map comes from the configuration file
++ * (pipelines.simple.lens.<sensor model>, else pipelines.simple.lens:
++ * infinity, steps_per_dioptre, default) as the simple pipeline has no
++ * lens tuning. There is no autofocus.
++ */
++void SimpleCameraData::initLens()
++{
++	CameraLens *lens = sensor_->focusLens();
++	if (!lens)
++		return;
++
++	const ControlInfoMap &lensControls = lens->controls();
++	auto it = lensControls.find(V4L2_CID_FOCUS_ABSOLUTE);
++	if (it == lensControls.end())
++		return;
++
++	lensMin_ = it->second.min().get<int32_t>();
++	lensMax_ = it->second.max().get<int32_t>();
++
++	const GlobalConfiguration &configuration =
++		pipe()->cameraManager()->_d()->configuration();
++	/* Per sensor model (lens.<model>), else the common entry (lens). */
++	const ValueNode &lensCfg =
++		configuration.configuration()["pipelines"]["simple"]["lens"];
++	const ValueNode &cfg = lensCfg.contains(sensor_->model())
++				       ? lensCfg[sensor_->model()]
++				       : lensCfg;
++	lensInfinity_ = cfg["infinity"].get<double>().value_or(lensMin_);
++	lensStepsPerDioptre_ =
++		cfg["steps_per_dioptre"].get<double>().value_or(100.0);
++	if (lensStepsPerDioptre_ <= 0.0) {
++		LOG(SimplePipeline, Error)
++			<< "Invalid lens steps_per_dioptre, manual focus disabled";
++		return;
++	}
++
++	float maxDioptres = std::max(0.0, (lensMax_ - lensInfinity_) /
++					       lensStepsPerDioptre_);
++	lensDefault_ = std::clamp<float>(cfg["default"].get<double>().value_or(1.0),
++					 0.0f, maxDioptres);
++
++	ControlInfoMap::Map ctrls(controlInfo_.begin(), controlInfo_.end());
++	ctrls[&controls::LensPosition] = ControlInfo(0.0f, maxDioptres,
++						     lensDefault_);
++	controlInfo_ = ControlInfoMap(std::move(ctrls), controls::controls);
++
++	lens_ = lens;
++	lensPosition_ = lensDefault_;
++
++	LOG(SimplePipeline, Debug)
++		<< "Manual focus on lens '" << lens->model() << "': 0 .. "
++		<< maxDioptres << " dioptres, infinity at " << lensInfinity_
++		<< ", " << lensStepsPerDioptre_ << " steps per dioptre";
++}
++
++void SimpleCameraData::setLensPosition(float dioptres)
++{
++	int32_t steps = std::lround(lensInfinity_ +
++				    dioptres * lensStepsPerDioptre_);
++	steps = std::clamp(steps, lensMin_, lensMax_);
++
++	if (lens_->setFocusPosition(steps) == 0)
++		lensPosition_ = (steps - lensInfinity_) / lensStepsPerDioptre_;
++}
++
+ /*
+  * Generate a list of supported pipeline configurations for a sensor media bus
+  * code and size.
+@@ -951,9 +1034,13 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 		}
+ 	}
+ 
+-	if (request)
++	if (request) {
+ 		request->_d()->metadata().set(controls::SensorTimestamp,
+ 					      buffer->metadata().timestamp);
++		if (lens_)
++			request->_d()->metadata().set(controls::LensPosition,
++						      lensPosition_);
++	}
+ 
+ 	/*
+ 	 * Queue the captured and the request buffer to the converter or Software
+@@ -1627,7 +1714,7 @@ int SimplePipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
+ 		return data->video_->exportBuffers(count, buffers);
+ }
+ 
+-int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlList *controls)
++int SimplePipelineHandler::start(Camera *camera, const ControlList *controls)
+ {
+ 	SimpleCameraData *data = cameraData(camera);
+ 	V4L2VideoDevice *video = data->video_;
+@@ -1664,6 +1751,12 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
+ 
+ 	video->bufferReady.connect(data, &SimpleCameraData::imageBufferReady);
+ 
++	if (data->lens_) {
++		auto pos = controls ? controls->get(controls::LensPosition)
++				    : std::nullopt;
++		data->setLensPosition(pos.value_or(data->lensDefault_));
++	}
++
+ 	data->delayedCtrls_->reset();
+ 	if (frameStartEmitter) {
+ 		ret = frameStartEmitter->setFrameStartEnabled(true);
+@@ -1739,6 +1832,12 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
+ 	SimpleCameraData *data = cameraData(camera);
+ 	int ret;
+ 
++	if (data->lens_) {
++		const auto pos = request->controls().get(controls::LensPosition);
++		if (pos)
++			data->setLensPosition(*pos);
++	}
++
+ 	std::map<const Stream *, FrameBuffer *> buffers;
+ 	bool metadataRequired = false;
+ 
+-- 
+2.56.0
+

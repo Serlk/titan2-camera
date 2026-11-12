@@ -1,0 +1,97 @@
+From 0f476ced2eeac8012324baf1fe2ad905fa448b74 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:02:10 +0300
+Subject: [PATCH 18/26] ipa: simple: Sensor mode at configure, sensor model in
+ the context
+
+The soft IPA receives the IPACameraSensorInfo once, at init, for the
+default sensor format, and keeps it for every configuration: the line
+duration (ExposureTime, exposure programs) and the analogue crop are
+those of the default mode whatever mode is configured.
+
+Add the sensor info to IPAConfigInfo, fill it from the configured sensor
+in the simple pipeline handler, and use it at configure. Keep the sensor
+model name in the IPA context for algorithms that look up per-sensor data
+(the module calibration EEPROM).
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ include/libcamera/ipa/soft.mojom         | 2 ++
+ src/ipa/simple/ipa_context.h             | 3 +++
+ src/ipa/simple/soft_simple.cpp           | 4 ++++
+ src/libcamera/pipeline/simple/simple.cpp | 3 +++
+ 4 files changed, 12 insertions(+)
+
+diff --git a/include/libcamera/ipa/soft.mojom b/include/libcamera/ipa/soft.mojom
+index 1b926fb..fd535d0 100644
+--- a/include/libcamera/ipa/soft.mojom
++++ b/include/libcamera/ipa/soft.mojom
+@@ -10,6 +10,8 @@ import "include/libcamera/ipa/core.mojom";
+ 
+ struct IPAConfigInfo {
+ 	libcamera.ControlInfoMap sensorControls;
++	/* Sensor mode of this configuration (crop, line length, pixel rate) */
++	libcamera.IPACameraSensorInfo sensorInfo;
+ };
+ 
+ interface IPASoftInterface {
+diff --git a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+index f8fd06a..686c7c5 100644
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -9,6 +9,7 @@
+ 
+ #include <array>
+ #include <optional>
++#include <string>
+ #include <stdint.h>
+ 
+ #include <libcamera/controls.h>
+@@ -94,6 +95,8 @@ struct IPAContext {
+ 	}
+ 
+ 	IPACameraSensorInfo sensorInfo;
++	/* Sensor model name, e.g. for its calibration EEPROM */
++	std::string sensorModel;
+ 	IPASessionConfiguration configuration;
+ 	IPAActiveState activeState;
+ 	FCQueue<IPAFrameContext> frameContexts;
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index f276868..3e27b06 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -107,6 +107,7 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 	}
+ 
+ 	context_.sensorInfo = sensorInfo;
++	context_.sensorModel = settings.sensorModel;
+ 
+ 	/* Load the tuning data file */
+ 	File file(settings.configurationFile);
+@@ -202,6 +203,9 @@ int IPASoftSimple::init(const IPASettings &settings,
+ int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
+ {
+ 	sensorInfoMap_ = configInfo.sensorControls;
++	/* The sensor mode of this configuration, when the pipeline gives it */
++	if (!configInfo.sensorInfo.outputSize.isNull())
++		context_.sensorInfo = configInfo.sensorInfo;
+ 
+ 	const ControlInfo &exposureInfo = sensorInfoMap_.find(V4L2_CID_EXPOSURE)->second;
+ 	const ControlInfo &gainInfo = sensorInfoMap_.find(V4L2_CID_ANALOGUE_GAIN)->second;
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 50ebe21..f8c7242 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1798,6 +1798,9 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
+ 	} else {
+ 		ipa::soft::IPAConfigInfo configInfo;
+ 		configInfo.sensorControls = data->sensor_->controls();
++		/* The configured sensor mode (the IPA got the default at init) */
++		if (data->sensor_->sensorInfo(&configInfo.sensorInfo) < 0)
++			configInfo.sensorInfo = {};
+ 		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo);
+ 	}
+ }
+-- 
+2.56.0
+

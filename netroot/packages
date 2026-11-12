@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Packages added to the rootfs by titan2-tools scripts/netroot-serve.sh CAMERA=1
+# (whitespace separated; '#' starts a comment).
+libcamera libcamera-ipa libcamera-tools libcamera-gstreamer libcamera-v4l2 qcam
+pipewire pipewire-libs wireplumber pipewire-pulse gst-plugin-pipewire
+xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk niri-portalsconf
+snapshot qt6-qtwayland
+gstreamer-tools gst-plugins-base gst-plugins-good gst-plugins-bad
+dbus dbus-x11 xdg-user-dirs py3-gst

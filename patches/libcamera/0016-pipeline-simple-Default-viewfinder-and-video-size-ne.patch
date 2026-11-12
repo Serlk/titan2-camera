@@ -1,0 +1,95 @@
+From 160f4c22f6e5a6f8bb9b20ba08bd2050f50245a5 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:42:50 +0300
+Subject: [PATCH 16/26] pipeline: simple: Default viewfinder and video size
+ near 1920x1080
+
+generateConfiguration() proposes the largest output size for every role.
+With the software ISP every pixel is processed: a full-resolution
+viewfinder is slow, and requesting 1920x1080 from a sensor with a
+1920x1080 mode still selects the next larger mode when the CPU debayer
+border makes the output of the 1920x1080 mode slightly narrower
+(1912x1080).
+
+For the Viewfinder and VideoRecording roles, propose the size of the
+pipeline configuration with the smallest sensor capture that produces at
+least 90 % of 1920x1080 (or of the largest output, if smaller). Still
+capture and raw keep the largest size.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/libcamera/pipeline/simple/simple.cpp | 52 ++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 0c27b5a..50ebe21 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1636,12 +1636,64 @@ SimplePipelineHandler::generateConfiguration(Camera *camera, Span<const StreamRo
+ 	 *
+ 	 * \todo Implement a better way to pick the default format
+ 	 */
++	/*
++	 * Viewfinder and video default to about 1920x1080 rather than to the
++	 * largest output: the software ISP processes every pixel, and the
++	 * sensor often has a smaller mode for it. Pick the size from the
++	 * pipeline configuration with the smallest sensor capture that still
++	 * produces at least 90 % of the area, so that a 1920x1080 sensor mode
++	 * is used even when the debayering border makes its output slightly
++	 * narrower (1912x1080 with the CPU debayer).
++	 */
++	auto defaultVideoSize = [&](const PixelFormat &format) -> std::optional<Size> {
++		Size largest;
++		for (const SimpleCameraData::Configuration &c : data->configs_) {
++			if (std::find(c.outputFormats.begin(), c.outputFormats.end(),
++				      format) != c.outputFormats.end())
++				largest.expandTo(c.outputSizes.max);
++		}
++		const Size target = Size(1920, 1080).boundedTo(largest);
++		if (target.isNull())
++			return std::nullopt;
++
++		const SimpleCameraData::Configuration *best = nullptr;
++		Size bestSize;
++		for (const SimpleCameraData::Configuration &c : data->configs_) {
++			if (std::find(c.outputFormats.begin(), c.outputFormats.end(),
++				      format) == c.outputFormats.end())
++				continue;
++
++			Size size = c.outputSizes.max.boundedTo(target);
++			size = size.alignedDownTo(std::max(c.outputSizes.hStep, 1u),
++						  std::max(c.outputSizes.vStep, 1u));
++			if (!c.outputSizes.contains(size) ||
++			    10 * static_cast<uint64_t>(size.width) * size.height <
++				    9 * static_cast<uint64_t>(target.width) * target.height)
++				continue;
++
++			if (!best || c.captureSize < best->captureSize) {
++				best = &c;
++				bestSize = size;
++			}
++		}
++
++		if (!best)
++			return std::nullopt;
++		return bestSize;
++	};
++
+ 	for (StreamRole role : roles) {
+ 		const auto &formats = (role == StreamRole::Raw ? rawFormats : processedFormats);
+ 		StreamConfiguration cfg{ StreamFormats{ formats } };
+ 		cfg.pixelFormat = formats.begin()->first;
+ 		cfg.size = formats.begin()->second[0].max;
+ 
++		if (role == StreamRole::Viewfinder || role == StreamRole::VideoRecording) {
++			auto size = defaultVideoSize(cfg.pixelFormat);
++			if (size)
++				cfg.size = *size;
++		}
++
+ 		config->addConfiguration(cfg);
+ 	}
+ 
+-- 
+2.56.0
+

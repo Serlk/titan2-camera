@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: CC0-1.0
+# libcamera configuration for the Unihertz Titan 2 -> /etc/libcamera/configuration.yaml
+# (installed by titan2-tools scripts/netroot-serve.sh CAMERA=1; ~/.config/libcamera/configuration.yaml
+# wins if present: the first file found is used).
+%YAML 1.1
+---
+version: 1
+configuration:
+  pipelines:
+    simple:
+      # Manual focus (patches/libcamera/0006), per sensor model:
+      #   VCM steps = infinity + dioptres * steps_per_dioptre; `default` (dioptres) at camera start.
+      # The module calibration EEPROM (/sys/bus/nvmem/devices/<model>-eeprom/nvmem: the
+      # lens codes at infinity/macro and the target distances) replaces infinity/steps_per_dioptre
+      # and sets the autofocus range (patch 0025); the values below are the fallback without it,
+      # or the map itself with `override: true`. `eeprom: none|<path>` selects another source.
+      lens:
+        # Hi-847 + DW9714 (0..1023): sharpest at 400 for ~0.3 m (3.3 dioptres, focus sweep).
+        # infinity NOT measured (placeholder 100): calibrate with scripts/camera-raw-test.sh focus.
+        hi847:
+          infinity: 100
+          steps_per_dioptre: 90
+          default: 1.0
+        # IMX766 + DW9800K (dw9719 driver, 0..1023): no sweep yet, same placeholder map.
+        # Autofocus (Af in the tuning file, AfModeContinuous by default) moves the lens over
+        # 0 .. (1023 - infinity) / steps_per_dioptre dioptres; `default` is the start position
+        # and LensPosition applies in AfModeManual only.
+        imx766:
+          infinity: 100
+          steps_per_dioptre: 90
+          default: 1.0
+        # S5KGD1SP (front): fixed focus, no lens.
+  software_isp:
+    # cpu: verified on the phone (1080p, 30 fps). gpu (EGL on panthor): denoise/sharpening
+    # stage, lens shading, full-size output from each sensor mode; not yet the default.
+    # LIBCAMERA_SOFTISP_MODE=gpu|cpu overrides this for one run.
+    mode: cpu
+    # CPU debayer threads (default 2); the Dimensity 7300 has 4 big cores
+    threads: 3
+...

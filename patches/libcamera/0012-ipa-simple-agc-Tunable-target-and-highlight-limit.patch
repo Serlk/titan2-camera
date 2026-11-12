@@ -1,0 +1,131 @@
+From 68406bd4fcc757ba4a6696e95d68c7ba7fabc4c6 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:42:29 +0300
+Subject: [PATCH 12/26] ipa: simple: agc: Tunable target and highlight limit
+
+The AGC aims at a mean sample value of 2.5 (the middle of the five bins
+above the black level), about 40 % of the range in linear light: bright
+after the gamma curve, and a bright part of the scene (a monitor) clips.
+
+Read the target from the tuning file (target, 1.5 .. 4.5, default 2.5),
+and add a highlight limit (highlights: fraction of the samples allowed in
+the top 1/16 of the histogram, default 1.0 = off) above which the
+exposure goes down whatever the mean is.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/ipa/simple/algorithms/agc.cpp | 46 +++++++++++++++++++++++++++----
+ src/ipa/simple/algorithms/agc.h   | 10 ++++++-
+ 2 files changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index 1ab32a4..9f43781 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -40,10 +40,30 @@ static constexpr float kExposureOptimal = kExposureBinsCount / 2.0;
+ static constexpr float kExposureSatisfactory = 0.2;
+ 
+ Agc::Agc()
++	: target_(kExposureOptimal), highlightLimit_(1.0)
+ {
+ }
+ 
+-void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
++/*
++ * Tuning (all optional):
++ *   target: mean sample value to reach, 1 .. 5 (default 2.5, the middle of
++ *           the histogram above the black level: bright, ~0.4 of the range
++ *           in linear light)
++ *   highlights: fraction of the samples allowed in the top 1/16 of the
++ *           histogram before the exposure is reduced regardless of the mean
++ *           (default 1.0: no limit)
++ */
++int Agc::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	target_ = std::clamp(tuningData["target"].get<double>().value_or(kExposureOptimal),
++			     1.5, 4.5);
++	highlightLimit_ = std::clamp(tuningData["highlights"].get<double>().value_or(1.0),
++				     0.0, 1.0);
++	return 0;
++}
++
++void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext,
++			 double exposureMSV, double highlights)
+ {
+ 	/*
+ 	 * Largest change of the total exposure (exposure time x gain) in one
+@@ -58,16 +78,22 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
+ 
+-	if (exposureMSV < kExposureOptimal - kExposureSatisfactory ||
+-	    exposureMSV > kExposureOptimal + kExposureSatisfactory) {
++	/* Too many clipped highlights: darken, whatever the mean says */
++	const bool clipping = highlights > highlightLimit_;
++
++	if (clipping ||
++	    exposureMSV < target_ - kExposureSatisfactory ||
++	    exposureMSV > target_ + kExposureSatisfactory) {
+ 		/*
+ 		 * The MSV is the mean bin index (1 .. kExposureBinsCount) of
+ 		 * the histogram above the black level, about linear in the
+ 		 * mean brightness: bin i covers (i - 1) .. i fifths of it.
+ 		 */
+-		double factor = (kExposureOptimal - 0.5) /
++		double factor = (target_ - 0.5) /
+ 				std::max(exposureMSV - 0.5, 0.25);
+ 		factor = std::clamp(factor, kMaxStepDown, kMaxStepUp);
++		if (clipping)
++			factor = std::min(factor, 0.8);
+ 
+ 		double target = std::max(exposure, 1) * again * factor;
+ 		double gainLow = std::max(agc.again10, agc.againMin);
+@@ -175,7 +201,17 @@ void Agc::process(IPAContext &context,
+ 	}
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
+-	updateExposure(context, frameContext, exposureMSV);
++
++	/* Samples in the top 1/16 of the histogram (near clipping) */
++	uint64_t total = 0, top = 0;
++	for (unsigned int i = 0; i < SwIspStats::kYHistogramSize; i++) {
++		total += histogram[i];
++		if (i >= SwIspStats::kYHistogramSize - SwIspStats::kYHistogramSize / 16)
++			top += histogram[i];
++	}
++	double highlights = total ? static_cast<double>(top) / total : 0.0;
++
++	updateExposure(context, frameContext, exposureMSV, highlights);
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Agc, "Agc")
+diff --git a/src/ipa/simple/algorithms/agc.h b/src/ipa/simple/algorithms/agc.h
+index 112d9f5..ad1a9ce 100644
+--- a/src/ipa/simple/algorithms/agc.h
++++ b/src/ipa/simple/algorithms/agc.h
+@@ -19,13 +19,21 @@ public:
+ 	Agc();
+ 	~Agc() = default;
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++
+ 	void process(IPAContext &context, const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+ 		     ControlList &metadata) override;
+ 
+ private:
+-	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++	void updateExposure(IPAContext &context, IPAFrameContext &frameContext,
++			    double exposureMSV, double highlights);
++
++	/* Target mean sample value (1 .. kExposureBinsCount) */
++	double target_;
++	/* Fraction of the samples allowed in the top histogram bins */
++	double highlightLimit_;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+-- 
+2.56.0
+

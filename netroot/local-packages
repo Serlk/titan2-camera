@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Packages that must come from LOCAL_REPO (scripts/build-libcamera.sh) and are upgraded over
+# Alpine's versions (apk add --upgrade): Alpine's libcamera comes in as a dependency of
+# pipewire-libs and is replaced by ours (same ABI 0.7).
+libcamera libcamera-ipa libcamera-tools libcamera-gstreamer libcamera-v4l2 qcam

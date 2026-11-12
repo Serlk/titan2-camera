@@ -1,0 +1,37 @@
+From 09557cd7a7800bc795291c3a79f45822709b8c3c Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:01:39 +0300
+Subject: [PATCH 01/26] pipeline: simple: Support the MediaTek MT6878 CAMSV
+
+The MT6878 (Dimensity 7300) CAMSV engine is a raw capture DMA behind the
+SENINF CSI-2 receiver. With the mainline CAMSV driver (mtk-camsv-mt6878),
+every CAMSV instance is a media device, driver name "mtk-camsv" (the
+media_device_info driver field holds 15 characters), with one chain
+
+  sensor -> mtk-seninf-mt6878 (subdev) -> CAMSV (video node)
+
+and the video node delivers raw Bayer frames (CSI-2 packed RAW10 among
+others). There is no ISP on this path, so enable the software ISP.
+
+Used on the Unihertz Titan 2 (Hi-847, IMX766, S5KGD1SP sensors).
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/libcamera/pipeline/simple/simple.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index c6fe12d..0566423 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -261,6 +261,7 @@ static const SimplePipelineInfo supportedDevices[] = {
+ 	{ "intel-ipu6", {}, true },
+ 	{ "intel-ipu7", {}, true },
+ 	{ "j721e-csi2rx", {}, true },
++	{ "mtk-camsv", {}, true },
+ 	{ "mtk-seninf", { { "mtk-mdp", 3 } }, false },
+ 	{ "mxc-isi", {}, false },
+ 	{ "qcom-camss", {}, true },
+-- 
+2.56.0
+

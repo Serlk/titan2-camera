@@ -1,0 +1,358 @@
+From 752ffca625a94a234202e09e5292cad95f669ea9 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:42:29 +0300
+Subject: [PATCH 13/26] software_isp: GPU detail stage, full-size GPU output
+
+Add a light denoise and sharpening stage to the GPU debayer shaders: a
+same-colour high-pass of the raw sample (centre minus the mean of its
+four neighbours at distance 2) is removed below a noise threshold
+(coring) and amplified above twice the threshold (unsharp mask), equally
+on R, G and B. The strengths and the threshold come in DebayerParams; the
+CPU debayer ignores them.
+
+A new simple IPA algorithm, Detail, sets them from piecewise linear
+curves over the analogue gain in the tuning file (sharpen, denoise,
+threshold), so that noisy high-gain frames are smoothed more and
+sharpened less.
+
+The GPU debayer samples with GL_CLAMP_TO_EDGE and scales its input, so
+its output needs no border: allow output sizes up to the input size. A
+1920x1080 stream then comes from a 1920x1080 sensor mode rather than from
+the next larger one.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ .../internal/software_isp/debayer_params.h    |   4 +
+ src/ipa/simple/algorithms/detail.cpp          | 105 ++++++++++++++++++
+ src/ipa/simple/algorithms/detail.h            |  44 ++++++++
+ src/ipa/simple/algorithms/meson.build         |   1 +
+ src/libcamera/shaders/bayer_1x_packed.frag    |  26 +++++
+ src/libcamera/shaders/bayer_unpacked.frag     |  19 ++++
+ src/libcamera/software_isp/debayer_egl.cpp    |  14 ++-
+ src/libcamera/software_isp/debayer_egl.h      |   1 +
+ 8 files changed, 212 insertions(+), 2 deletions(-)
+ create mode 100644 src/ipa/simple/algorithms/detail.cpp
+ create mode 100644 src/ipa/simple/algorithms/detail.h
+
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index 6772b43..8925f3c 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -24,6 +24,10 @@ struct DebayerParams {
+ 	RGB<float> blackLevel = RGB<float>({ 0.0, 0.0, 0.0 });
+ 	float gamma = 1.0;
+ 	float contrastExp = 1.0;
++	/* Detail stage (GPU debayer only): sharpening, denoise, noise threshold */
++	float sharpen = 0.0;
++	float denoise = 0.0;
++	float noiseThreshold = 0.0;
+ 	RGB<float> gains = RGB<float>({ 1.0, 1.0, 1.0 });
+ };
+ 
+diff --git a/src/ipa/simple/algorithms/detail.cpp b/src/ipa/simple/algorithms/detail.cpp
+new file mode 100644
+index 0000000..35a82e0
+--- /dev/null
++++ b/src/ipa/simple/algorithms/detail.cpp
+@@ -0,0 +1,105 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, serlk <22211586+Serlk@users.noreply.github.com>
++ *
++ * Detail: denoise and sharpening strengths for the GPU debayer
++ */
++
++#include "detail.h"
++
++#include <algorithm>
++
++#include <libcamera/base/log.h>
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++LOG_DEFINE_CATEGORY(IPASoftDetail)
++
++/*
++ * Tuning: piecewise linear curves over the analogue gain, as lists of
++ * [gain, value] pairs in increasing gain order (a single number is a
++ * constant):
++ *
++ *   - Detail:
++ *       sharpen:   [ [1.0, 0.6], [16.0, 0.2] ]   # unsharp mask strength
++ *       denoise:   [ [1.0, 0.2], [16.0, 0.8] ]   # coring strength, 0 .. 1
++ *       threshold: [ [1.0, 0.004], [16.0, 0.02] ] # noise level, raw 0 .. 1
++ *
++ * The CPU debayer has no detail stage and ignores these values.
++ */
++int Detail::readCurve(const ValueNode &node, Curve &curve, double def)
++{
++	curve.clear();
++
++	if (node.isValue()) {
++		curve.emplace_back(1.0, node.get<double>().value_or(def));
++		return 0;
++	}
++
++	if (node.isList()) {
++		for (const ValueNode &point : node.asList()) {
++			auto gain = point[0].get<double>();
++			auto value = point[1].get<double>();
++			if (!gain || !value)
++				return -EINVAL;
++			if (!curve.empty() && *gain <= curve.back().first)
++				return -EINVAL;
++			curve.emplace_back(*gain, *value);
++		}
++	}
++
++	if (curve.empty())
++		curve.emplace_back(1.0, def);
++
++	return 0;
++}
++
++double Detail::eval(const Curve &curve, double gain)
++{
++	if (gain <= curve.front().first)
++		return curve.front().second;
++	if (gain >= curve.back().first)
++		return curve.back().second;
++
++	for (size_t i = 1; i < curve.size(); i++) {
++		if (gain > curve[i].first)
++			continue;
++		const auto &[g0, v0] = curve[i - 1];
++		const auto &[g1, v1] = curve[i];
++		return v0 + (v1 - v0) * (gain - g0) / (g1 - g0);
++	}
++
++	return curve.back().second;
++}
++
++int Detail::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	if (readCurve(tuningData["sharpen"], sharpen_, 0.0) ||
++	    readCurve(tuningData["denoise"], denoise_, 0.0) ||
++	    readCurve(tuningData["threshold"], threshold_, 0.01)) {
++		LOG(IPASoftDetail, Error) << "Invalid Detail tuning curves";
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++void Detail::prepare(IPAContext &context,
++		     [[maybe_unused]] const uint32_t frame,
++		     [[maybe_unused]] IPAFrameContext &frameContext,
++		     DebayerParams *params)
++{
++	const double gain = context.activeState.agc.again;
++
++	params->sharpen = std::clamp(eval(sharpen_, gain), 0.0, 4.0);
++	params->denoise = std::clamp(eval(denoise_, gain), 0.0, 1.0);
++	params->noiseThreshold = std::clamp(eval(threshold_, gain), 0.0, 1.0);
++}
++
++REGISTER_IPA_ALGORITHM(Detail, "Detail")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/detail.h b/src/ipa/simple/algorithms/detail.h
+new file mode 100644
+index 0000000..f5c2ace
+--- /dev/null
++++ b/src/ipa/simple/algorithms/detail.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, serlk <22211586+Serlk@users.noreply.github.com>
++ *
++ * Detail: denoise and sharpening strengths for the GPU debayer
++ */
++
++#pragma once
++
++#include <utility>
++#include <vector>
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class Detail : public Algorithm
++{
++public:
++	Detail() = default;
++	~Detail() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	void prepare(IPAContext &context,
++		     const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++
++private:
++	using Curve = std::vector<std::pair<double, double>>;
++
++	static int readCurve(const ValueNode &node, Curve &curve, double def);
++	static double eval(const Curve &curve, double gain);
++
++	Curve sharpen_;
++	Curve denoise_;
++	Curve threshold_;
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/meson.build b/src/ipa/simple/algorithms/meson.build
+index 73c6372..19123ef 100644
+--- a/src/ipa/simple/algorithms/meson.build
++++ b/src/ipa/simple/algorithms/meson.build
+@@ -6,4 +6,5 @@ soft_simple_ipa_algorithms = files([
+     'agc.cpp',
+     'blc.cpp',
+     'ccm.cpp',
++    'detail.cpp',
+ ])
+diff --git a/src/libcamera/shaders/bayer_1x_packed.frag b/src/libcamera/shaders/bayer_1x_packed.frag
+index 23747f7..9f4bec3 100644
+--- a/src/libcamera/shaders/bayer_1x_packed.frag
++++ b/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -70,6 +70,22 @@ uniform vec3 blacklevel;
+ uniform float gamma;
+ uniform float contrastExp;
+ 
++/*
++ * Detail stage (Titan 2): x = sharpening, y = denoise, z = noise threshold.
++ * hp is a same-colour high-pass of the raw sample (centre minus the mean of
++ * its four neighbours at distance 2). Small differences are taken as noise
++ * and removed (coring, strength y), larger ones as edges and boosted
++ * (unsharp mask, strength x). Added equally to R, G and B: luminance only.
++ */
++uniform vec3 detail;
++
++vec3 apply_detail(vec3 rgb, float hp)
++{
++	float w = mix(-detail.y, detail.x,
++				  smoothstep(detail.z, 2.0 * detail.z, abs(hp)));
++	return rgb + vec3(w * hp);
++}
++
+ float apply_contrast(float value)
+ {
+ 	// Apply simple S-curve
+@@ -227,6 +243,16 @@ void main(void)
+ 
+ 	rgb = rgb - blacklevel;
+ 
++	/* Same-colour neighbours at distance 2, for the detail stage */
++	{
++		float xl = floor(BPP * (center_pixel.x - 2.0) + 0.02) * tex_step.x;
++		float xr = floor(BPP * (center_pixel.x + 2.0) + 0.02) * tex_step.x;
++		float same = fetch(xl, center_bytes.y) + fetch(xr, center_bytes.y) +
++			     fetch(center_bytes.x, center_bytes.y - 2.0 * tex_step.y) +
++			     fetch(center_bytes.x, center_bytes.y + 2.0 * tex_step.y);
++		rgb = apply_detail(rgb, C - same * 0.25);
++	}
++
+ 	/*
+ 	 *   CCM is a 3x3 in the format
+ 	 *
+diff --git a/src/libcamera/shaders/bayer_unpacked.frag b/src/libcamera/shaders/bayer_unpacked.frag
+index 1b85196..ed3ac40 100644
+--- a/src/libcamera/shaders/bayer_unpacked.frag
++++ b/src/libcamera/shaders/bayer_unpacked.frag
+@@ -29,6 +29,22 @@ uniform vec3            blacklevel;
+ uniform float           gamma;
+ uniform float           contrastExp;
+ 
++/*
++ * Detail stage (Titan 2): x = sharpening, y = denoise, z = noise threshold.
++ * hp is a same-colour high-pass of the raw sample (centre minus the mean of
++ * its four neighbours at distance 2). Small differences are taken as noise
++ * and removed (coring, strength y), larger ones as edges and boosted
++ * (unsharp mask, strength x). Added equally to R, G and B: luminance only.
++ */
++uniform vec3 detail;
++
++vec3 apply_detail(vec3 rgb, float hp)
++{
++    float w = mix(-detail.y, detail.x,
++                  smoothstep(detail.z, 2.0 * detail.z, abs(hp)));
++    return rgb + vec3(w * hp);
++}
++
+ float apply_contrast(float value)
+ {
+     // Apply simple S-curve
+@@ -130,6 +146,9 @@ void main(void) {
+ 
+     rgb = rgb - blacklevel;
+ 
++    /* value[0] = (0,-2) + (0,2), value[2] = (-2,0) + (2,0): same colour as C */
++    rgb = apply_detail(rgb, C - (value[0] + value[2]) * 0.25);
++
+     /*
+      *   CCM is a 3x3 in the format
+      *
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 8f0c229..2e36d31 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -103,6 +103,7 @@ int DebayerEGL::getShaderVariableLocations(void)
+ 	blackLevelUniformDataIn_ = glGetUniformLocation(programId_, "blacklevel");
+ 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
+ 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
++	detailUniformDataIn_ = glGetUniformLocation(programId_, "detail");
+ 
+ 	textureUniformStep_ = glGetUniformLocation(programId_, "tex_step");
+ 	textureUniformSize_ = glGetUniformLocation(programId_, "tex_size");
+@@ -490,6 +491,10 @@ void DebayerEGL::setShaderVariableValues(const DebayerParams &params)
+ 	 * Contrast
+ 	 */
+ 	glUniform1f(contrastExpUniformDataIn_, params.contrastExp);
++
++	/* Detail stage: sharpening, denoise, noise threshold */
++	glUniform3f(detailUniformDataIn_, params.sharpen, params.denoise,
++		    params.noiseThreshold);
+ 	LOG(Debayer, Debug) << " contrastExpUniformDataIn_ " << contrastExpUniformDataIn_ << " data " << params.contrastExp;
+ 
+ 	return;
+@@ -621,9 +626,14 @@ SizeRange DebayerEGL::sizes(PixelFormat inputFormat, const Size &inputSize)
+ 		return {};
+ 	}
+ 
++	/*
++	 * The GPU samples with GL_CLAMP_TO_EDGE and needs no border: the
++	 * output can be as large as the input (a 1920x1080 stream from a
++	 * 1920x1080 sensor mode instead of the next larger mode).
++	 */
+ 	return SizeRange(Size(patternSize.width, patternSize.height),
+-			 Size((inputSize.width - 2 * patternSize.width) & ~(patternSize.width - 1),
+-			      (inputSize.height - 2 * borderHeight) & ~(patternSize.height - 1)),
++			 Size(inputSize.width & ~(patternSize.width - 1),
++			      inputSize.height & ~(patternSize.height - 1)),
+ 			 patternSize.width, patternSize.height);
+ }
+ 
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index fcd281f..b887cee 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -101,6 +101,7 @@ private:
+ 
+ 	/* Contrast */
+ 	GLint contrastExpUniformDataIn_;
++	GLint detailUniformDataIn_;
+ 
+ 	Rectangle window_;
+ 	std::unique_ptr<SwStatsCpu> stats_;
+-- 
+2.56.0
+

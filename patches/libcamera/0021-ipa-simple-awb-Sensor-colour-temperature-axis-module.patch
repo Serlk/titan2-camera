@@ -1,0 +1,399 @@
+From 846396875d722a2f9a9b6c6a0cbfed61936b4c3a Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:02:10 +0300
+Subject: [PATCH 21/26] ipa: simple: awb: Sensor colour temperature axis,
+ module calibration
+
+The colour temperature that selects the CCM is estimated with the
+generic estimateCCT(), which assumes sRGB primaries for the raw sensor
+colours. Add a sensor-specific axis from the tuning file: x =
+256 * (log2(gainR / gainB) - ref) mapped to a colour temperature by a
+table, linearly in mireds.
+
+Read the module calibration EEPROM ("MTK" layout, format tag 0x010B00FF)
+that the sensor driver exposes as /sys/bus/nvmem/devices/<model>-eeprom:
+module and golden-sample white balance averages, focus codes and the
+module shading table. The white balance gains are brought to the golden
+sample (divided by module / golden gains) before the colour temperature
+is looked up, so that the CCM and the shading tables, tuned on the golden
+module, are chosen for the right light on every unit.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/ipa/simple/algorithms/awb.cpp |  82 +++++++++++++++++-
+ src/ipa/simple/algorithms/awb.h   |  15 ++++
+ src/ipa/simple/meson.build        |   1 +
+ src/ipa/simple/module_eeprom.cpp  | 134 ++++++++++++++++++++++++++++++
+ src/ipa/simple/module_eeprom.h    |  52 ++++++++++++
+ 5 files changed, 282 insertions(+), 2 deletions(-)
+ create mode 100644 src/ipa/simple/module_eeprom.cpp
+ create mode 100644 src/ipa/simple/module_eeprom.h
+
+diff --git a/src/ipa/simple/algorithms/awb.cpp b/src/ipa/simple/algorithms/awb.cpp
+index f5c88ea..1fc2fe3 100644
+--- a/src/ipa/simple/algorithms/awb.cpp
++++ b/src/ipa/simple/algorithms/awb.cpp
+@@ -7,7 +7,9 @@
+ 
+ #include "awb.h"
+ 
++#include <cmath>
+ #include <numeric>
++#include <string>
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
+@@ -16,6 +18,7 @@
+ 
+ #include "libipa/colours.h"
+ #include "simple/ipa_context.h"
++#include "simple/module_eeprom.h"
+ 
+ namespace libcamera {
+ 
+@@ -23,6 +26,82 @@ LOG_DEFINE_CATEGORY(IPASoftAwb)
+ 
+ namespace ipa::soft::algorithms {
+ 
++/*
++ * Tuning (optional):
++ *   cct: sensor colour temperature axis from the module tuning
++ *     ref: log2(gainR / gainB) of the white balance at the reference
++ *          (D65) point
++ *     table: [[x, CT], ...] with x = 256 * (log2(gainR / gainB) - ref),
++ *          increasing x; interpolated in mireds
++ *   eeprom: "auto" (default; /sys/bus/nvmem/devices/<sensor>-eeprom/nvmem),
++ *     a path, or "none": module white balance calibration. The gains are
++ *     brought to the golden sample (divided by module / golden) before the
++ *     colour temperature is looked up, so that the CCM and lens shading
++ *     follow the tuning of the golden module.
++ * Without a cct table the generic estimateCCT() is used.
++ */
++int Awb::init(IPAContext &context, const ValueNode &tuningData)
++{
++	const ValueNode &cct = tuningData["cct"];
++	cctRef_ = cct["ref"].get<double>().value_or(0.0);
++	cctTable_.clear();
++	for (const ValueNode &p : cct["table"].asList()) {
++		auto x = p[0].get<double>();
++		auto t = p[1].get<double>();
++		if (!x || !t || *t <= 0.0 ||
++		    (!cctTable_.empty() && *x <= cctTable_.back().first)) {
++			LOG(IPASoftAwb, Error) << "Invalid cct table";
++			return -EINVAL;
++		}
++		cctTable_.emplace_back(*x, *t);
++	}
++
++	std::string eeprom = tuningData["eeprom"].get<std::string>().value_or("auto");
++	if (eeprom == "auto")
++		eeprom = ModuleEeprom::defaultPath(context.sensorModel);
++	if (eeprom != "none") {
++		auto e = ModuleEeprom::read(eeprom);
++		if (e && e->hasAwb) {
++			moduleRatio_ = e->unitGains / e->goldenGains;
++			LOG(IPASoftAwb, Info)
++				<< "Module white balance correction " << moduleRatio_;
++		}
++	}
++
++	return 0;
++}
++
++unsigned int Awb::estimateTemperature(const RGB<float> &gains) const
++{
++	if (cctTable_.empty()) {
++		RGB<double> rgbGains{ { 1 / gains.r(), 1 / gains.g(), 1 / gains.b() } };
++		return estimateCCT(rgbGains);
++	}
++
++	/* Gains of the golden module for the same light */
++	const double r = gains.r() / moduleRatio_.r();
++	const double b = gains.b() / moduleRatio_.b();
++	const double x = 256.0 * (std::log2(r / b) - cctRef_);
++
++	if (x <= cctTable_.front().first)
++		return cctTable_.front().second;
++	if (x >= cctTable_.back().first)
++		return cctTable_.back().second;
++
++	for (size_t i = 1; i < cctTable_.size(); i++) {
++		if (x > cctTable_[i].first)
++			continue;
++		const auto &[x0, t0] = cctTable_[i - 1];
++		const auto &[x1, t1] = cctTable_[i];
++		const double f = (x - x0) / (x1 - x0);
++		/* Linear in mireds */
++		const double mired = 1e6 / t0 + f * (1e6 / t1 - 1e6 / t0);
++		return std::lround(1e6 / mired);
++	}
++
++	return cctTable_.back().second;
++}
++
+ int Awb::configure(IPAContext &context,
+ 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+@@ -94,8 +173,7 @@ void Awb::process(IPAContext &context,
+ 		sum.b() <= sum.g() / 4 ? 4.0f : static_cast<float>(sum.g()) / sum.b(),
+ 	} };
+ 
+-	RGB<double> rgbGains{ { 1 / gains.r(), 1 / gains.g(), 1 / gains.b() } };
+-	context.activeState.awb.temperatureK = estimateCCT(rgbGains);
++	context.activeState.awb.temperatureK = estimateTemperature(gains);
+ 	metadata.set(controls::ColourTemperature, context.activeState.awb.temperatureK);
+ 
+ 	LOG(IPASoftAwb, Debug)
+diff --git a/src/ipa/simple/algorithms/awb.h b/src/ipa/simple/algorithms/awb.h
+index ad993f3..7463dfc 100644
+--- a/src/ipa/simple/algorithms/awb.h
++++ b/src/ipa/simple/algorithms/awb.h
+@@ -7,6 +7,11 @@
+ 
+ #pragma once
+ 
++#include <utility>
++#include <vector>
++
++#include "libcamera/internal/vector.h"
++
+ #include "algorithm.h"
+ 
+ namespace libcamera {
+@@ -19,6 +24,7 @@ public:
+ 	Awb() = default;
+ 	~Awb() = default;
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void prepare(IPAContext &context,
+ 		     const uint32_t frame,
+@@ -29,6 +35,15 @@ public:
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+ 		     ControlList &metadata) override;
++
++private:
++	unsigned int estimateTemperature(const RGB<float> &gains) const;
++
++	/* Sensor CCT axis: x = 256 * (log2(gR / gB) - cctRef_) -> CT */
++	double cctRef_ = 0.0;
++	std::vector<std::pair<double, double>> cctTable_;
++	/* Module / golden gains of the calibration EEPROM, 1.0 without */
++	RGB<double> moduleRatio_{ { 1.0, 1.0, 1.0 } };
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+diff --git a/src/ipa/simple/meson.build b/src/ipa/simple/meson.build
+index 2f9f15f..b30ccfb 100644
+--- a/src/ipa/simple/meson.build
++++ b/src/ipa/simple/meson.build
+@@ -7,6 +7,7 @@ ipa_name = 'ipa_soft_simple'
+ 
+ soft_simple_sources = files([
+     'ipa_context.cpp',
++    'module_eeprom.cpp',
+     'soft_simple.cpp',
+ ])
+ 
+diff --git a/src/ipa/simple/module_eeprom.cpp b/src/ipa/simple/module_eeprom.cpp
+new file mode 100644
+index 0000000..54e9625
+--- /dev/null
++++ b/src/ipa/simple/module_eeprom.cpp
+@@ -0,0 +1,134 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, serlk <22211586+Serlk@users.noreply.github.com>
++ *
++ * Calibration data of MediaTek-style camera module EEPROMs
++ */
++
++#include "module_eeprom.h"
++
++#include <algorithm>
++#include <fstream>
++#include <iterator>
++
++#include <libcamera/base/log.h>
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(IPASoftEeprom)
++
++namespace ipa::soft {
++
++namespace {
++
++constexpr size_t kTagOffset = 0x0001;
++constexpr uint8_t kTag[] = { 0xff, 0x00, 0x0b, 0x01 };
++constexpr size_t kFlagsOffset = 0x0008;
++constexpr size_t kUnitOffset = 0x0009;
++constexpr size_t kGoldenOffset = 0x000d;
++constexpr size_t kAfInfOffset = 0x0011;
++constexpr size_t kAfMacroOffset = 0x0013;
++constexpr size_t kLscLengthOffset = 0x0015;
++constexpr size_t kLscTableOffset = 0x005b;
++constexpr size_t kLscHeaderSize = kLscTableOffset - 0x0017;
++constexpr size_t kAfExtOffset = 0x0f63;
++constexpr size_t kVersionOffset = 0x0fa3;
++
++uint16_t u16(const std::vector<uint8_t> &d, size_t off)
++{
++	return d[off] | (d[off + 1] << 8);
++}
++
++bool usable(uint16_t v)
++{
++	return v != 0 && v != 0xffff;
++}
++
++/*
++ * Averages R, Gr, Gb, B to gains as the module calibration defines them:
++ * G = (Gr + Gb + 1) / 2, gain = max(R, G, B) / channel, minimum 1.0.
++ */
++std::optional<RGB<double>> gains(const std::vector<uint8_t> &d, size_t off)
++{
++	const unsigned int r = d[off];
++	const unsigned int g = (d[off + 1] + d[off + 2] + 1) / 2;
++	const unsigned int b = d[off + 3];
++
++	if (!r || !g || !b || r == 0xff || b == 0xff)
++		return std::nullopt;
++
++	const double m = std::max({ r, g, b });
++	return RGB<double>{ { m / r, m / g, m / b } };
++}
++
++} /* namespace */
++
++std::string ModuleEeprom::defaultPath(const std::string &sensorModel)
++{
++	return "/sys/bus/nvmem/devices/" + sensorModel + "-eeprom/nvmem";
++}
++
++std::optional<ModuleEeprom> ModuleEeprom::read(const std::string &path)
++{
++	std::ifstream file(path, std::ios::binary);
++	if (!file)
++		return std::nullopt;
++
++	std::vector<uint8_t> d((std::istreambuf_iterator<char>(file)),
++			       std::istreambuf_iterator<char>());
++	if (d.size() < kVersionOffset + 1 ||
++	    !std::equal(std::begin(kTag), std::end(kTag), d.begin() + kTagOffset)) {
++		LOG(IPASoftEeprom, Info) << "No MTK calibration in " << path;
++		return std::nullopt;
++	}
++
++	ModuleEeprom e;
++	const uint8_t flags = d[kFlagsOffset];
++	e.formatVersion = d[kVersionOffset];
++
++	if (flags & 0x01) {
++		auto unit = gains(d, kUnitOffset);
++		auto golden = gains(d, kGoldenOffset);
++		if (unit && golden) {
++			e.hasAwb = true;
++			e.unitGains = *unit;
++			e.goldenGains = *golden;
++		}
++	}
++
++	if (flags & 0x02) {
++		e.afInfinity = u16(d, kAfInfOffset);
++		e.afMacro = u16(d, kAfMacroOffset);
++		e.hasAf = usable(e.afInfinity) && usable(e.afMacro) &&
++			  e.afMacro > e.afInfinity;
++		if (e.hasAf && e.formatVersion >= 0x17 && e.formatVersion != 0xff) {
++			uint16_t inf = u16(d, kAfExtOffset + 6);
++			uint16_t mac = u16(d, kAfExtOffset + 8);
++			if (usable(inf) && usable(mac) && inf > mac) {
++				e.afInfinityMm = inf;
++				e.afMacroMm = mac;
++			}
++		}
++	}
++
++	const uint16_t lscLength = u16(d, kLscLengthOffset);
++	if (usable(lscLength) && lscLength > kLscHeaderSize &&
++	    kLscTableOffset + (lscLength - kLscHeaderSize) <= d.size()) {
++		const size_t n = (lscLength - kLscHeaderSize) / 2;
++		for (size_t i = 0; i < n; i++)
++			e.lscTable.push_back(u16(d, kLscTableOffset + 2 * i));
++	}
++
++	LOG(IPASoftEeprom, Info)
++		<< "Module calibration " << path << ": version 0x" << std::hex
++		<< static_cast<unsigned int>(e.formatVersion) << std::dec
++		<< (e.hasAwb ? ", AWB" : "") << (e.hasAf ? ", AF " : "")
++		<< (e.hasAf ? std::to_string(e.afInfinity) + ".." + std::to_string(e.afMacro) : "")
++		<< ", LSC " << e.lscTable.size() << " values";
++
++	return e;
++}
++
++} /* namespace ipa::soft */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/module_eeprom.h b/src/ipa/simple/module_eeprom.h
+new file mode 100644
+index 0000000..388b3c8
+--- /dev/null
++++ b/src/ipa/simple/module_eeprom.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, serlk <22211586+Serlk@users.noreply.github.com>
++ *
++ * Calibration data of MediaTek-style camera module EEPROMs
++ */
++
++#pragma once
++
++#include <array>
++#include <optional>
++#include <stdint.h>
++#include <string>
++#include <vector>
++
++#include "libcamera/internal/vector.h"
++
++namespace libcamera {
++
++namespace ipa::soft {
++
++/*
++ * The "MTK" layout of the module EEPROM (format tag 0x010B00FF at 0x0001):
++ * white balance averages of the module and of the golden sample, focus
++ * DAC codes, and the module lens shading table. Exposed by the sensor
++ * driver as /sys/bus/nvmem/devices/<sensor>-eeprom/nvmem.
++ */
++struct ModuleEeprom {
++	static std::optional<ModuleEeprom> read(const std::string &path);
++	static std::string defaultPath(const std::string &sensorModel);
++
++	uint8_t formatVersion = 0;
++
++	bool hasAwb = false;
++	/* Per-channel gains (minimum 1.0) of the module and of the golden sample */
++	RGB<double> unitGains{ { 1.0, 1.0, 1.0 } };
++	RGB<double> goldenGains{ { 1.0, 1.0, 1.0 } };
++
++	bool hasAf = false;
++	uint16_t afInfinity = 0;
++	uint16_t afMacro = 0;
++	/* Target distances of the focus calibration, 0 if unknown */
++	uint16_t afInfinityMm = 0;
++	uint16_t afMacroMm = 0;
++
++	/* Module lens shading table: raw u16 nodes as stored */
++	std::vector<uint16_t> lscTable;
++};
++
++} /* namespace ipa::soft */
++
++} /* namespace libcamera */
+-- 
+2.56.0
+

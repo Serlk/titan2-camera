@@ -1,0 +1,92 @@
+From 7ec7bec50193bb3e45395d70262b9498728171dc Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:19:22 +0300
+Subject: [PATCH 07/26] pipeline: simple: Look up sensor controls by the V4L2
+ sequence
+
+With a frame start emitter, DelayedControls is driven by the V4L2
+frame sequence (applyControls(sequence) on every start of frame), but
+the controls for the statistics of a frame are retrieved with the
+request sequence. The two differ as soon as a frame is captured
+without a request (the first frames after stream on) or dropped, and
+the difference only grows. The IPA then sees controls older than those
+the frame was taken with, and the AGC repeats the same step until the
+stale value catches up: on the MT6878 CAMSV with a frame start event,
+one 10 % exposure step took 7 to 12 frames.
+
+Record the V4L2 sequence of the captured buffer when it is handed to
+the software ISP, and use it for DelayedControls::get().
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/libcamera/pipeline/simple/simple.cpp | 32 ++++++++++++++++++++++--
+ 1 file changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 50b7d98..3a44da7 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -197,6 +197,8 @@ struct SimpleFrameInfo {
+ 	}
+ 
+ 	uint32_t frame;
++	/* V4L2 sequence of the captured buffer, as counted by frameStart */
++	std::optional<uint32_t> sensorSequence;
+ 	Request *request;
+ 	bool metadataRequired;
+ 	bool metadataProcessed;
+@@ -1056,7 +1058,17 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 
+ 		if (converter_)
+ 			converter_->queueBuffers(buffer, conversionQueue_.front().outputs);
+-		else
++		else {
++			/*
++			 * DelayedControls counts frames by the V4L2 sequence
++			 * (frameStart), the software ISP by the request
++			 * sequence. Remember the former for ispStatsReady().
++			 */
++			SimpleFrameInfo *info = request ? frameInfo_.find(request->sequence())
++							: nullptr;
++			if (info)
++				info->sensorSequence = buffer->metadata().sequence;
++
+ 			/*
+ 			 * request->sequence() cannot be retrieved from `buffer' inside
+ 			 * queueBuffers because unique_ptr's make buffer->request() invalid
+@@ -1064,6 +1076,7 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 			 */
+ 			swIsp_->queueBuffers(request->sequence(), buffer,
+ 					     conversionQueue_.front().outputs);
++		}
+ 
+ 		conversionQueue_.pop();
+ 		return;
+@@ -1125,8 +1138,23 @@ void SimpleCameraData::conversionOutputDone(FrameBuffer *buffer)
+ 
+ void SimpleCameraData::ispStatsReady(uint32_t frame, uint32_t bufferId)
+ {
++	/*
++	 * The sensor controls in effect for this frame are recorded by
++	 * DelayedControls at the V4L2 sequence of the captured buffer, which
++	 * differs from the request sequence when frames were captured without
++	 * a request (at start) or dropped. Looking them up by the request
++	 * sequence returns older values, and the AGC then waits several
++	 * frames per step.
++	 */
++	uint32_t sequence = frame;
++	if (frameStartEmitter_) {
++		SimpleFrameInfo *info = frameInfo_.find(frame);
++		if (info && info->sensorSequence)
++			sequence = *info->sensorSequence;
++	}
++
+ 	swIsp_->processStats(frame, bufferId,
+-			     delayedCtrls_->get(frame));
++			     delayedCtrls_->get(sequence));
+ }
+ 
+ void SimpleCameraData::metadataReady(uint32_t frame, const ControlList &metadata)
+-- 
+2.56.0
+

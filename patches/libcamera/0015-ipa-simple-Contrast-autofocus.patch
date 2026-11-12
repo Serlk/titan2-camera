@@ -1,0 +1,533 @@
+From eb427630897e472e470f2830371a090f0a79eb08 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:42:50 +0300
+Subject: [PATCH 15/26] ipa: simple: Contrast autofocus
+
+Add an Af algorithm to the simple IPA, on the focus measure of the
+software ISP statistics (afSharpness / afSum over the central third).
+
+The lens position is normalised, 0.0 at the far end and 1.0 at the near
+end. A scan steps the lens over the range (coarse), then around the best
+position (fine), and stops at the sharpest one; a scan whose contrast is
+too low fails and parks the lens at a default position. AfModeContinuous
+(the default) scans at start and again when the measure drops for a few
+consecutive statistics; AfModeAuto scans on AfTriggerStart; AfModeManual
+leaves the lens to LensPosition. AfState is reported in the metadata.
+
+The IPA requests lens moves through a new setLensPosition event, which
+the software ISP forwards. The simple pipeline handler maps the
+normalised position to its LensPosition range (the lens map of the
+configuration file) and moves the lens unless the camera is in
+AfModeManual; LensPosition requests apply only in AfModeManual.
+
+The algorithm is enabled per sensor by an Af entry in the tuning file,
+for sensors with a focus lens.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ .../internal/software_isp/software_isp.h      |   2 +
+ include/libcamera/ipa/soft.mojom              |   2 +
+ src/ipa/simple/algorithms/af.cpp              | 230 ++++++++++++++++++
+ src/ipa/simple/algorithms/af.h                |  76 ++++++
+ src/ipa/simple/algorithms/meson.build         |   1 +
+ src/ipa/simple/ipa_context.h                  |   6 +
+ src/ipa/simple/soft_simple.cpp                |   5 +
+ src/libcamera/pipeline/simple/simple.cpp      |  33 ++-
+ src/libcamera/software_isp/software_isp.cpp   |   6 +
+ 9 files changed, 360 insertions(+), 1 deletion(-)
+ create mode 100644 src/ipa/simple/algorithms/af.cpp
+ create mode 100644 src/ipa/simple/algorithms/af.h
+
+diff --git a/include/libcamera/internal/software_isp/software_isp.h b/include/libcamera/internal/software_isp/software_isp.h
+index cb57190..e66fbf6 100644
+--- a/include/libcamera/internal/software_isp/software_isp.h
++++ b/include/libcamera/internal/software_isp/software_isp.h
+@@ -87,10 +87,12 @@ public:
+ 	Signal<uint32_t, uint32_t> ispStatsReady;
+ 	Signal<uint32_t, const ControlList &> metadataReady;
+ 	Signal<const ControlList &> setSensorControls;
++	Signal<float> setLensPosition;
+ 
+ private:
+ 	void saveIspParams();
+ 	void setSensorCtrls(const ControlList &sensorControls);
++	void setLensPos(float position);
+ 	void statsReady(uint32_t frame, uint32_t bufferId);
+ 	void inputReady(FrameBuffer *input);
+ 	void outputReady(FrameBuffer *output);
+diff --git a/include/libcamera/ipa/soft.mojom b/include/libcamera/ipa/soft.mojom
+index 77328c5..1b926fb 100644
+--- a/include/libcamera/ipa/soft.mojom
++++ b/include/libcamera/ipa/soft.mojom
+@@ -35,4 +35,6 @@ interface IPASoftEventInterface {
+ 	setSensorControls(libcamera.ControlList sensorControls);
+ 	setIspParams();
+ 	metadataReady(uint32 frame, libcamera.ControlList metadata);
++	/* Focus lens position requested by the AF algorithm, 0.0 (far) .. 1.0 (near) */
++	setLensPosition(float position);
+ };
+diff --git a/src/ipa/simple/algorithms/af.cpp b/src/ipa/simple/algorithms/af.cpp
+new file mode 100644
+index 0000000..e65da2c
+--- /dev/null
++++ b/src/ipa/simple/algorithms/af.cpp
+@@ -0,0 +1,230 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, serlk <22211586+Serlk@users.noreply.github.com>
++ *
++ * Contrast autofocus for the software ISP
++ */
++
++#include "af.h"
++
++#include <algorithm>
++#include <cmath>
++#include <limits>
++
++#include <libcamera/base/log.h>
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++LOG_DEFINE_CATEGORY(IPASoftAf)
++
++/**
++ * \class Af
++ * \brief Contrast autofocus
++ *
++ * The focus measure is the sum of the absolute differences between
++ * neighbouring green samples in the central third of the image, divided by
++ * the sum of the samples (SwIspStats::afSharpness / afSum), so that it does
++ * not follow the exposure. The lens position is normalised, 0.0 at the far
++ * end (infinity) and 1.0 at the near end; the pipeline handler maps it to
++ * the lens driver (the LensPosition map of the configuration file).
++ *
++ * A scan steps the lens over the whole range (coarse), then around the
++ * best position (fine), and stops at the sharpest one. In AfModeContinuous
++ * a scan runs at start and again when the measure drops for a few
++ * consecutive statistics; in AfModeAuto it runs on AfTriggerStart.
++ * AfModeManual leaves the lens to LensPosition.
++ *
++ * Tuning (all optional):
++ *   steps: coarse positions over the range (11)
++ *   fine_step: fine step around the best coarse position (0.04)
++ *   settle_frames: frames to wait after a move before measuring (4)
++ *   min_contrast: (best - worst) / best below which the scan fails (0.05)
++ *   rescan_drop: relative drop of the measure that restarts a scan (0.3)
++ *   default: position after a failed scan (0.2)
++ */
++
++int Af::init(IPAContext &context, const ValueNode &tuningData)
++{
++	coarseSteps_ = std::clamp(tuningData["steps"].get<unsigned int>().value_or(11u), 3u, 64u);
++	fineStep_ = std::clamp(tuningData["fine_step"].get<double>().value_or(0.04), 0.005, 0.2);
++	settleFrames_ = std::min(tuningData["settle_frames"].get<unsigned int>().value_or(4u), 30u);
++	minContrast_ = std::clamp(tuningData["min_contrast"].get<double>().value_or(0.05), 0.0, 1.0);
++	rescanDrop_ = std::clamp(tuningData["rescan_drop"].get<double>().value_or(0.3), 0.05, 0.9);
++	defaultPosition_ = std::clamp(tuningData["default"].get<double>().value_or(0.2), 0.0, 1.0);
++
++	context.ctrlMap[&controls::AfMode] =
++		ControlInfo(controls::AfModeValues,
++			    ControlValue(static_cast<int32_t>(controls::AfModeContinuous)));
++	context.ctrlMap[&controls::AfTrigger] = ControlInfo(controls::AfTriggerValues);
++
++	return 0;
++}
++
++int Af::configure(IPAContext &context,
++		  [[maybe_unused]] const IPAConfigInfo &configInfo)
++{
++	phase_ = Phase::Idle;
++	state_ = controls::AfStateIdle;
++	settleUntil_ = 0;
++	dropCount_ = 0;
++
++	if (mode_ == controls::AfModeContinuous)
++		startScan(context, 0);
++
++	return 0;
++}
++
++void Af::moveTo(IPAContext &context, uint32_t frame, double position)
++{
++	position_ = std::clamp(position, 0.0, 1.0);
++	context.activeState.af.position = position_;
++	context.activeState.af.changed = true;
++	settleUntil_ = frame + settleFrames_;
++}
++
++void Af::startScan(IPAContext &context, uint32_t frame)
++{
++	scanPositions_.clear();
++	for (unsigned int i = 0; i < coarseSteps_; i++)
++		scanPositions_.push_back(static_cast<double>(i) / (coarseSteps_ - 1));
++
++	scanIndex_ = 0;
++	bestMeasure_ = -1.0;
++	worstMeasure_ = std::numeric_limits<double>::max();
++	phase_ = Phase::Coarse;
++	state_ = controls::AfStateScanning;
++	dropCount_ = 0;
++
++	LOG(IPASoftAf, Debug) << "Scan started at frame " << frame;
++	moveTo(context, frame, scanPositions_[0]);
++}
++
++void Af::finishScan(IPAContext &context, uint32_t frame)
++{
++	phase_ = Phase::Focused;
++	focusedMeasure_ = 0.0;
++	dropCount_ = 0;
++
++	if (bestMeasure_ <= 0.0 ||
++	    (bestMeasure_ - worstMeasure_) < minContrast_ * bestMeasure_) {
++		state_ = controls::AfStateFailed;
++		LOG(IPASoftAf, Debug)
++			<< "Scan failed (best " << bestMeasure_ << ", worst "
++			<< worstMeasure_ << ")";
++		moveTo(context, frame, defaultPosition_);
++		return;
++	}
++
++	state_ = controls::AfStateFocused;
++	LOG(IPASoftAf, Debug)
++		<< "Focused at " << bestPosition_ << " (measure " << bestMeasure_ << ")";
++	moveTo(context, frame, bestPosition_);
++}
++
++void Af::queueRequest(IPAContext &context, const uint32_t frame,
++		      [[maybe_unused]] IPAFrameContext &frameContext,
++		      const ControlList &controls)
++{
++	const auto &mode = controls.get(controls::AfMode);
++	if (mode && *mode != mode_) {
++		mode_ = *mode;
++		if (mode_ == controls::AfModeContinuous) {
++			startScan(context, frame);
++		} else {
++			phase_ = Phase::Idle;
++			state_ = controls::AfStateIdle;
++		}
++	}
++
++	const auto &trigger = controls.get(controls::AfTrigger);
++	if (trigger && mode_ == controls::AfModeAuto) {
++		if (*trigger == controls::AfTriggerStart) {
++			startScan(context, frame);
++		} else if (*trigger == controls::AfTriggerCancel) {
++			phase_ = Phase::Idle;
++			state_ = controls::AfStateIdle;
++		}
++	}
++}
++
++void Af::process(IPAContext &context, const uint32_t frame,
++		 [[maybe_unused]] IPAFrameContext &frameContext,
++		 const SwIspStats *stats,
++		 ControlList &metadata)
++{
++	metadata.set(controls::AfState, state_);
++
++	if (!stats->valid || phase_ == Phase::Idle || frame < settleUntil_)
++		return;
++
++	const double measure = stats->afSum
++				       ? static_cast<double>(stats->afSharpness) / stats->afSum
++				       : 0.0;
++
++	switch (phase_) {
++	case Phase::Coarse:
++	case Phase::Fine:
++		LOG(IPASoftAf, Debug)
++			<< "Position " << position_ << ": measure " << measure;
++		if (measure > bestMeasure_) {
++			bestMeasure_ = measure;
++			bestPosition_ = position_;
++		}
++		worstMeasure_ = std::min(worstMeasure_, measure);
++
++		if (++scanIndex_ < scanPositions_.size()) {
++			moveTo(context, frame, scanPositions_[scanIndex_]);
++			break;
++		}
++
++		if (phase_ == Phase::Coarse) {
++			/* Fine positions around the best coarse one */
++			const double best = bestPosition_;
++			scanPositions_.clear();
++			for (double d : { -2.0, -1.0, 1.0, 2.0 }) {
++				double p = best + d * fineStep_;
++				if (p >= 0.0 && p <= 1.0)
++					scanPositions_.push_back(p);
++			}
++			scanIndex_ = 0;
++			phase_ = Phase::Fine;
++			if (!scanPositions_.empty()) {
++				moveTo(context, frame, scanPositions_[0]);
++				break;
++			}
++		}
++
++		finishScan(context, frame);
++		break;
++
++	case Phase::Focused:
++		if (mode_ != controls::AfModeContinuous)
++			break;
++
++		if (focusedMeasure_ <= 0.0) {
++			focusedMeasure_ = measure;
++			break;
++		}
++
++		if (measure < focusedMeasure_ * (1.0 - rescanDrop_)) {
++			if (++dropCount_ >= rescanFrames_)
++				startScan(context, frame);
++		} else {
++			dropCount_ = 0;
++			/* Follow slow changes (light, small movements) */
++			focusedMeasure_ = 0.9 * focusedMeasure_ + 0.1 * measure;
++		}
++		break;
++
++	case Phase::Idle:
++		break;
++	}
++}
++
++REGISTER_IPA_ALGORITHM(Af, "Af")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/af.h b/src/ipa/simple/algorithms/af.h
+new file mode 100644
+index 0000000..436b0a4
+--- /dev/null
++++ b/src/ipa/simple/algorithms/af.h
+@@ -0,0 +1,76 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, serlk <22211586+Serlk@users.noreply.github.com>
++ *
++ * Contrast autofocus for the software ISP
++ */
++
++#pragma once
++
++#include <vector>
++
++#include <libcamera/control_ids.h>
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class Af : public Algorithm
++{
++public:
++	Af() = default;
++	~Af() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	int configure(IPAContext &context,
++		      const IPAConfigInfo &configInfo) override;
++	void queueRequest(IPAContext &context, const uint32_t frame,
++			  IPAFrameContext &frameContext,
++			  const ControlList &controls) override;
++	void process(IPAContext &context, const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     const SwIspStats *stats,
++		     ControlList &metadata) override;
++
++private:
++	enum class Phase {
++		Idle,
++		Coarse,
++		Fine,
++		Focused,
++	};
++
++	void startScan(IPAContext &context, uint32_t frame);
++	void moveTo(IPAContext &context, uint32_t frame, double position);
++	void finishScan(IPAContext &context, uint32_t frame);
++
++	/* Tuning */
++	unsigned int coarseSteps_ = 11;
++	double fineStep_ = 0.04;
++	unsigned int settleFrames_ = 4;
++	double minContrast_ = 0.05;
++	double rescanDrop_ = 0.3;
++	unsigned int rescanFrames_ = 3;
++	double defaultPosition_ = 0.2;
++
++	/* State */
++	int32_t mode_ = controls::AfModeContinuous;
++	int32_t state_ = controls::AfStateIdle;
++	Phase phase_ = Phase::Idle;
++	double position_ = 0.0;
++	uint32_t settleUntil_ = 0;
++
++	std::vector<double> scanPositions_;
++	size_t scanIndex_ = 0;
++	double bestPosition_ = 0.0;
++	double bestMeasure_ = 0.0;
++	double worstMeasure_ = 0.0;
++	double focusedMeasure_ = 0.0;
++	unsigned int dropCount_ = 0;
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/meson.build b/src/ipa/simple/algorithms/meson.build
+index 19123ef..db863ba 100644
+--- a/src/ipa/simple/algorithms/meson.build
++++ b/src/ipa/simple/algorithms/meson.build
+@@ -2,6 +2,7 @@
+ 
+ soft_simple_ipa_algorithms = files([
+     'adjust.cpp',
++    'af.cpp',
+     'awb.cpp',
+     'agc.cpp',
+     'blc.cpp',
+diff --git a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+index 34f7403..f8fd06a 100644
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -55,6 +55,12 @@ struct IPAActiveState {
+ 
+ 	Matrix<float, 3, 3> combinedMatrix;
+ 
++	struct {
++		/* Normalised lens position, 0.0 (far end) .. 1.0 (near end) */
++		float position;
++		bool changed;
++	} af;
++
+ 	struct {
+ 		float gamma;
+ 		/* 0..2 range, 1.0 = normal */
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index 629e1a3..f276868 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -326,6 +326,11 @@ void IPASoftSimple::processStats(const uint32_t frame,
+ 		  static_cast<int32_t>(camHelper_ ? camHelper_->gainCode(againNew) : againNew));
+ 
+ 	setSensorControls.emit(ctrls);
++
++	if (context_.activeState.af.changed) {
++		context_.activeState.af.changed = false;
++		setLensPosition.emit(context_.activeState.af.position);
++	}
+ }
+ 
+ std::string IPASoftSimple::logPrefix() const
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 3a44da7..0c27b5a 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -357,8 +357,13 @@ public:
+ 	int32_t lensMax_ = 0;
+ 	float lensDefault_ = 0.0f;
+ 	float lensPosition_ = 0.0f;
++	float lensMaxDioptres_ = 0.0f;
++	/* AfMode of the camera: LensPosition only applies in AfModeManual */
++	int32_t afMode_ = controls::AfModeManual;
++	int32_t afModeDefault_ = controls::AfModeManual;
+ 	void initLens();
+ 	void setLensPosition(float dioptres);
++	void afLensPosition(float position);
+ 
+ 	std::vector<Configuration> configs_;
+ 	std::map<PixelFormat, std::vector<const Configuration *>> formats_;
+@@ -761,6 +766,18 @@ void SimpleCameraData::initLens()
+ 
+ 	lens_ = lens;
+ 	lensPosition_ = lensDefault_;
++	lensMaxDioptres_ = maxDioptres;
++
++	/*
++	 * Autofocus is offered by the IPA (the Af algorithm of the tuning
++	 * file declares AfMode); it then drives the lens unless AfModeManual.
++	 */
++	auto afMode = controlInfo_.find(&controls::AfMode);
++	if (afMode != controlInfo_.end())
++		afModeDefault_ = afMode->second.def().get<int32_t>();
++	afMode_ = afModeDefault_;
++	if (swIsp_)
++		swIsp_->setLensPosition.connect(this, &SimpleCameraData::afLensPosition);
+ 
+ 	LOG(SimplePipeline, Debug)
+ 		<< "Manual focus on lens '" << lens->model() << "': 0 .. "
+@@ -768,6 +785,15 @@ void SimpleCameraData::initLens()
+ 		<< ", " << lensStepsPerDioptre_ << " steps per dioptre";
+ }
+ 
++/* Normalised position (0.0 far .. 1.0 near) from the AF algorithm */
++void SimpleCameraData::afLensPosition(float position)
++{
++	if (!lens_ || afMode_ == controls::AfModeManual)
++		return;
++
++	setLensPosition(std::clamp(position, 0.0f, 1.0f) * lensMaxDioptres_);
++}
++
+ void SimpleCameraData::setLensPosition(float dioptres)
+ {
+ 	int32_t steps = std::lround(lensInfinity_ +
+@@ -1780,6 +1806,8 @@ int SimplePipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	video->bufferReady.connect(data, &SimpleCameraData::imageBufferReady);
+ 
+ 	if (data->lens_) {
++		auto mode = controls ? controls->get(controls::AfMode) : std::nullopt;
++		data->afMode_ = mode.value_or(data->afModeDefault_);
+ 		auto pos = controls ? controls->get(controls::LensPosition)
+ 				    : std::nullopt;
+ 		data->setLensPosition(pos.value_or(data->lensDefault_));
+@@ -1861,8 +1889,11 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
+ 	int ret;
+ 
+ 	if (data->lens_) {
++		const auto mode = request->controls().get(controls::AfMode);
++		if (mode)
++			data->afMode_ = *mode;
+ 		const auto pos = request->controls().get(controls::LensPosition);
+-		if (pos)
++		if (pos && data->afMode_ == controls::AfModeManual)
+ 			data->setLensPosition(*pos);
+ 	}
+ 
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index 10b333a..2887c07 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -169,6 +169,7 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 					    metadataReady.emit(frame, metadata);
+ 				    });
+ 	ipa_->setSensorControls.connect(this, &SoftwareIsp::setSensorCtrls);
++	ipa_->setLensPosition.connect(this, &SoftwareIsp::setLensPos);
+ 
+ 	debayer_->moveToThread(&ispWorkerThread_);
+ }
+@@ -432,6 +433,11 @@ void SoftwareIsp::saveIspParams()
+ 	debayerParams_ = *sharedParams_;
+ }
+ 
++void SoftwareIsp::setLensPos(float position)
++{
++	setLensPosition.emit(position);
++}
++
+ void SoftwareIsp::setSensorCtrls(const ControlList &sensorControls)
+ {
+ 	setSensorControls.emit(sensorControls);
+-- 
+2.56.0
+

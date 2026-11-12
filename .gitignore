@@ -1,0 +1,6 @@
+/out/
+/external/
+__pycache__/
+*.pyc
+*.raw
+*.bin

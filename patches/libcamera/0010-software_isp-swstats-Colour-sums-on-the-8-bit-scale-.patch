@@ -1,0 +1,239 @@
+From 0e244d964556e822b7ece821f363dbf52fa4acf6 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:42:08 +0300
+Subject: [PATCH 10/26] software_isp: swstats: Colour sums on the 8-bit scale,
+ focus measure
+
+The colour sums are accumulated from the raw samples, 10 or 12 bits for
+the unpacked formats, while Awb subtracts an 8-bit black level from them:
+the pedestal is removed only partly and the white balance ratios are
+pulled towards 1. Divide the samples like the histogram does.
+
+Add a focus measure for contrast autofocus: the sum of the absolute
+differences between horizontally neighbouring green samples in the
+central third of the window (afSharpness), and the sum of those samples
+(afSum) to normalise it for the brightness.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ .../internal/software_isp/swisp_stats.h       | 15 +++++
+ .../internal/software_isp/swstats_cpu.h       |  8 +++
+ src/libcamera/software_isp/swstats_cpu.cpp    | 55 +++++++++++++++++--
+ 3 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index d9d0d9b..b0ece26 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -43,6 +43,21 @@ struct SwIspStats {
+ 	 * \brief A histogram of luminance values of all the sampled pixels
+ 	 */
+ 	Histogram yHistogram;
++	/**
++	 * \brief Focus measure: sum of the absolute differences between
++	 *        horizontally neighbouring green samples in the focus window
++	 */
++	uint64_t afSharpness;
++	/**
++	 * \brief Sum of the green samples in the focus window, to normalise
++	 *        afSharpness for the brightness
++	 */
++	uint64_t afSum;
++	/**
++	 * \brief Internal to the statistics gathering: the line being
++	 *        processed lies in the focus window
++	 */
++	bool afLine;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/include/libcamera/internal/software_isp/swstats_cpu.h b/include/libcamera/internal/software_isp/swstats_cpu.h
+index 802370b..6bd6eef 100644
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -67,6 +67,7 @@ public:
+ 		    y >= (window_.y + window_.height))
+ 			return;
+ 
++		stats_[statsBufferIndex].afLine = isAfLine(y);
+ 		(this->*stats0_)(src, stats_[statsBufferIndex]);
+ 	}
+ 
+@@ -79,6 +80,7 @@ public:
+ 		    y >= (window_.y + window_.height))
+ 			return;
+ 
++		stats_[statsBufferIndex].afLine = isAfLine(y);
+ 		(this->*stats2_)(src, stats_[statsBufferIndex]);
+ 	}
+ 
+@@ -89,6 +91,7 @@ private:
+ 	using processFrameFn = void (SwStatsCpu::*)(MappedFrameBuffer &in);
+ 
+ 	int setupStandardBayerOrder(BayerFormat::Order order);
++	bool isAfLine(unsigned int y) const { return y >= afY0_ && y < afY1_; }
+ 	/* Bayer 8 bpp unpacked */
+ 	void statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats);
+ 	/* Bayer 10 bpp unpacked */
+@@ -117,6 +120,11 @@ private:
+ 	unsigned int xShift_;
+ 	unsigned int stride_;
+ 
++	/* Focus window: x in pixels / packed bytes from the window start, y absolute */
++	unsigned int afX0_ = 0, afX1_ = 0;
++	unsigned int afX0Bytes_ = 0, afX1Bytes_ = 0;
++	unsigned int afY0_ = 0, afY1_ = 0;
++
+ 	std::vector<SwIspStats> stats_;
+ 	SharedMemObject<SwIspStats> sharedStats_;
+ 	Benchmark bench_;
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 5366e01..ae80ac0 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include "libcamera/internal/software_isp/swstats_cpu.h"
+ 
++#include <cstdlib>
++
+ #include <libcamera/base/log.h>
+ 
+ #include <libcamera/stream.h>
+@@ -177,12 +179,32 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+                                           \
+ 	uint64_t sumR = 0;                \
+ 	uint64_t sumG = 0;                \
+-	uint64_t sumB = 0;
++	uint64_t sumB = 0;                \
++	uint64_t afSharp = 0;             \
++	uint64_t afSum = 0;               \
++	int afPrev = -1;
++
++/*
++ * Focus measure over the centre of the window: x (loop units) inside
++ * [afX0, afX1) on lines flagged by processLine0() / processBayerFrame2().
++ */
++#define SWSTATS_ACCUMULATE_AF(x, afX0, afX1)                       \
++	if (stats.afLine && (x) >= (afX0) && (x) < (afX1)) {        \
++		if (afPrev >= 0)                                     \
++			afSharp += std::abs(static_cast<int>(g) - afPrev); \
++		afSum += g;                                          \
++		afPrev = g;                                          \
++	}
+ 
++/*
++ * The sums are kept on the 8-bit scale of the histogram and of the black
++ * level (Awb subtracts an 8-bit black level from them): divide the samples
++ * of the deeper unpacked formats.
++ */
+ #define SWSTATS_ACCUMULATE_LINE_STATS(div) \
+-	sumR += r;                         \
+-	sumG += g;                         \
+-	sumB += b;                         \
++	sumR += r / (div);                 \
++	sumG += g / (div);                 \
++	sumB += b / (div);                 \
+                                            \
+ 	yVal = r * kRedYMul;               \
+ 	yVal += g * kGreenYMul;            \
+@@ -192,7 +214,9 @@ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ #define SWSTATS_FINISH_LINE_STATS() \
+ 	stats.sum_.r() += sumR;     \
+ 	stats.sum_.g() += sumG;     \
+-	stats.sum_.b() += sumB;
++	stats.sum_.b() += sumB;     \
++	stats.afSharpness += afSharp; \
++	stats.afSum += afSum;
+ 
+ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
+ {
+@@ -214,6 +238,7 @@ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
+ 		g = (g + g2) / 2;
+ 
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
++		SWSTATS_ACCUMULATE_AF(x, afX0_, afX1_)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -240,6 +265,7 @@ void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats)
+ 
+ 		/* divide Y by 4 for 10 -> 8 bpp value */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(4)
++		SWSTATS_ACCUMULATE_AF(x, afX0_, afX1_)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -266,6 +292,7 @@ void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats)
+ 
+ 		/* divide Y by 16 for 12 -> 8 bpp value */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(16)
++		SWSTATS_ACCUMULATE_AF(x, afX0_, afX1_)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -292,6 +319,7 @@ void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 		g = (g + g2) / 2;
+ 		/* Data is already 8 bits, divide by 1 */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
++		SWSTATS_ACCUMULATE_AF(x, afX0Bytes_, afX1Bytes_)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -318,6 +346,7 @@ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 		g = (g + g2) / 2;
+ 		/* Data is already 8 bits, divide by 1 */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
++		SWSTATS_ACCUMULATE_AF(x, afX0Bytes_, afX1Bytes_)
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -340,6 +369,9 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		s.yHistogram.fill(0);
++		s.afSharpness = 0;
++		s.afSum = 0;
++		s.afLine = false;
+ 	}
+ }
+ 
+@@ -357,8 +389,12 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 	if (valid) {
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		sharedStats_->yHistogram.fill(0);
++		sharedStats_->afSharpness = 0;
++		sharedStats_->afSum = 0;
+ 		for (const auto &s : stats_) {
+ 			sharedStats_->sum_ += s.sum_;
++			sharedStats_->afSharpness += s.afSharpness;
++			sharedStats_->afSum += s.afSum;
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
+ 		}
+@@ -505,6 +541,14 @@ void SwStatsCpu::setWindow(const Rectangle &window)
+ 	window_.width = (window_.width > xShift_ ? window_.width - xShift_ : 0);
+ 	window_.width &= ~(patternSize_.width - 1);
+ 	window_.height &= ~(patternSize_.height - 1);
++
++	/* Focus window: the central third of the statistics window */
++	afX0_ = window_.width / 3;
++	afX1_ = window_.width * 2 / 3;
++	afX0Bytes_ = afX0_ * 5 / 4;
++	afX1Bytes_ = afX1_ * 5 / 4;
++	afY0_ = window_.y + window_.height / 3;
++	afY1_ = window_.y + window_.height * 2 / 3;
+ }
+ 
+ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+@@ -524,6 +568,7 @@ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+ 		/* linePointers[0] is not used by any stats0_ functions */
+ 		linePointers[1] = src;
+ 		linePointers[2] = src + stride_;
++		stats_[0].afLine = isAfLine(window_.y + y);
+ 		(this->*stats0_)(linePointers, stats_[0]);
+ 		src += stride_ * 2;
+ 	}
+-- 
+2.56.0
+

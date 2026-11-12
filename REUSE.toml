@@ -1,0 +1,20 @@
+version = 1
+
+[[annotations]]
+path = ["REUSE.toml", ".gitignore", "LICENSE"]
+SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+# Patches against libcamera: the licenses of the patched libcamera files (LGPL-2.1-or-later for
+# the library and IPA, BSD-2-Clause for the two debayer shaders, CC0-1.0 for the tuning files);
+# new files carry their own SPDX line.
+[[annotations]]
+path = "patches/libcamera/*.patch"
+SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
+SPDX-License-Identifier = "LGPL-2.1-or-later AND BSD-2-Clause AND CC0-1.0"
+
+# A diff against Alpine's aports APKBUILD for libcamera
+[[annotations]]
+path = "libcamera/APKBUILD.diff"
+SPDX-FileCopyrightText = "2026 serlk <22211586+Serlk@users.noreply.github.com>"
+SPDX-License-Identifier = "GPL-2.0-or-later"

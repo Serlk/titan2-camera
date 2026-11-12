@@ -1,0 +1,157 @@
+From b46160570973879940f712b524cf11ad2f0452be Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 22:03:59 +0300
+Subject: [PATCH 05/26] ipa: simple: Add tuning files for Hi-847, IMX766 and
+ S5KGD1SP
+
+Tuning files for the software ISP on the Unihertz Titan 2: black level
+(pedestal 64 at 10 bits) and colour correction matrices at three or four
+colour temperatures from the module calibration data, plus the default
+AWB, Adjust and AGC algorithms.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/ipa/simple/data/hi847.yaml    | 32 +++++++++++++++++++++++++++
+ src/ipa/simple/data/imx766.yaml   | 36 +++++++++++++++++++++++++++++++
+ src/ipa/simple/data/meson.build   |  3 +++
+ src/ipa/simple/data/s5kgd1sp.yaml | 32 +++++++++++++++++++++++++++
+ 4 files changed, 103 insertions(+)
+ create mode 100644 src/ipa/simple/data/hi847.yaml
+ create mode 100644 src/ipa/simple/data/imx766.yaml
+ create mode 100644 src/ipa/simple/data/s5kgd1sp.yaml
+
+diff --git a/src/ipa/simple/data/hi847.yaml b/src/ipa/simple/data/hi847.yaml
+new file mode 100644
+index 0000000..a3cf66b
+--- /dev/null
++++ b/src/ipa/simple/data/hi847.yaml
+@@ -0,0 +1,32 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++# Hi-847 (Unihertz Titan 2, second rear camera)
++#
++# Colour correction matrices: the module colour calibration (Q9 fixed point
++# converted to float), applied after white balance. The CWF point is left
++# out; of two points at the same colour temperature, the later one is used.
++version: 1
++algorithms:
++  - BlackLevel:
++      blackLevel: 4096
++  - Awb:
++  # The CCM costs CPU time with the CPU software ISP; comment it out
++  # for a faster preview.
++  - Ccm:
++      ccms:
++        - ct: 2812
++          ccm: [ 1.4238, -0.1914, -0.2324,
++                 -0.1895, 1.3438, -0.1543,
++                 -0.0527, -0.5938, 1.6465 ]
++        - ct: 3644
++          ccm: [ 1.4824, -0.5195, 0.0371,
++                 -0.1641, 1.2227, -0.0586,
++                 0.0098, -0.7852, 1.7754 ]
++        - ct: 6500
++          ccm: [ 1.5039, -0.5957, 0.0918,
++                 -0.1348, 1.2754, -0.1406,
++                 0.0684, -0.7520, 1.6836 ]
++  - Adjust:
++  - Agc:
++...
+diff --git a/src/ipa/simple/data/imx766.yaml b/src/ipa/simple/data/imx766.yaml
+new file mode 100644
+index 0000000..577d25a
+--- /dev/null
++++ b/src/ipa/simple/data/imx766.yaml
+@@ -0,0 +1,36 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++# IMX766 (Unihertz Titan 2, main rear camera)
++#
++# Colour correction matrices: the module colour calibration (Q9 fixed point
++# converted to float), applied after white balance. The CWF point is left
++# out; of two points at the same colour temperature, the later one is used.
++version: 1
++algorithms:
++  - BlackLevel:
++      blackLevel: 4096
++  - Awb:
++  # The CCM costs CPU time with the CPU software ISP; comment it out
++  # for a faster preview.
++  - Ccm:
++      ccms:
++        - ct: 2300
++          ccm: [ 1.5684, -0.3496, -0.2188,
++                 -0.2578, 1.4492, -0.1914,
++                 0.0371, -0.6367, 1.5996 ]
++        - ct: 2813
++          ccm: [ 1.6270, -0.3535, -0.2734,
++                 -0.3359, 1.7598, -0.4238,
++                 0.0059, -0.4961, 1.4902 ]
++        - ct: 3650
++          ccm: [ 1.5664, -0.5000, -0.0664,
++                 -0.2266, 1.3398, -0.1133,
++                 0.0254, -0.8965, 1.8711 ]
++        - ct: 6500
++          ccm: [ 1.7559, -0.7070, -0.0488,
++                 -0.1934, 1.5000, -0.3066,
++                 0.0898, -0.7949, 1.7051 ]
++  - Adjust:
++  - Agc:
++...
+diff --git a/src/ipa/simple/data/meson.build b/src/ipa/simple/data/meson.build
+index 92795ee..94e8930 100644
+--- a/src/ipa/simple/data/meson.build
++++ b/src/ipa/simple/data/meson.build
+@@ -1,6 +1,9 @@
+ # SPDX-License-Identifier: CC0-1.0
+ 
+ conf_files = files([
++    'hi847.yaml',
++    'imx766.yaml',
++    's5kgd1sp.yaml',
+     'uncalibrated.yaml',
+ ])
+ 
+diff --git a/src/ipa/simple/data/s5kgd1sp.yaml b/src/ipa/simple/data/s5kgd1sp.yaml
+new file mode 100644
+index 0000000..45307d4
+--- /dev/null
++++ b/src/ipa/simple/data/s5kgd1sp.yaml
+@@ -0,0 +1,32 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++# S5KGD1SP (Unihertz Titan 2, front camera)
++#
++# Colour correction matrices: the module colour calibration (Q9 fixed point
++# converted to float), applied after white balance. The CWF point is left
++# out; of two points at the same colour temperature, the later one is used.
++version: 1
++algorithms:
++  - BlackLevel:
++      blackLevel: 4096
++  - Awb:
++  # The CCM costs CPU time with the CPU software ISP; comment it out
++  # for a faster preview.
++  - Ccm:
++      ccms:
++        - ct: 2832
++          ccm: [ 1.8867, -0.6348, -0.2520,
++                 -0.2910, 1.7109, -0.4199,
++                 -0.0469, -0.5488, 1.5957 ]
++        - ct: 3617
++          ccm: [ 1.5020, -0.4160, -0.0859,
++                 -0.1797, 1.2715, -0.0918,
++                 0.0000, -0.7734, 1.7734 ]
++        - ct: 6500
++          ccm: [ 1.7422, -0.6445, -0.0977,
++                 -0.1445, 1.4043, -0.2598,
++                 0.0703, -0.7246, 1.6543 ]
++  - Adjust:
++  - Agc:
++...
+-- 
+2.56.0
+

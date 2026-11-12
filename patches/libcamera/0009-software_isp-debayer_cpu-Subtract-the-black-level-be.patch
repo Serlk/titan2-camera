@@ -1,0 +1,110 @@
+From 8cbce09f4ffe07bd8e4951ec6dedff13450600d2 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:42:08 +0300
+Subject: [PATCH 09/26] software_isp: debayer_cpu: Subtract the black level
+ before gains and CCM
+
+The CPU debayer applies the white balance gains or the combined colour
+matrix to the samples including the pedestal and removes a single (green)
+black level in the gamma table afterwards. With gains or a matrix whose
+rows do not sum to 1 (any white balance other than 1), every channel keeps
+an offset of black * (row sum - 1). In dark scenes, where the pedestal is
+a large part of the signal, that is a strong colour cast (magenta on the
+Hi-847 and S5KGD1SP of the Unihertz Titan 2 at 64/1023 black).
+
+Subtract the black level of each channel in the lookup tables, before the
+gains and the matrix, and stretch the remaining range to the full scale;
+the gamma table then starts at 0. The GPU debayer already subtracts the
+black level first.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/libcamera/software_isp/debayer_cpu.cpp | 51 ++++++++++++++++------
+ 1 file changed, 38 insertions(+), 13 deletions(-)
+
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index d9f5b32..c3f8488 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -880,9 +880,12 @@ void DebayerCpuThread::process4(uint32_t frame, const uint8_t *src, uint8_t *dst
+ 
+ void DebayerCpu::updateGammaTable(const DebayerParams &params)
+ {
+-	const RGB<float> blackLevel = params.blackLevel;
+-	/* Take let's say the green channel black level */
+-	const unsigned int blackIndex = blackLevel[1] * gammaTable_.size();
++	/*
++	 * The black level is subtracted per channel in the lookup tables,
++	 * before the white balance gains and the colour matrix (see
++	 * updateLookupTables()), so the gamma curve starts at 0.
++	 */
++	const unsigned int blackIndex = 0;
+ 	const float gamma = params.gamma;
+ 	const float contrastExp = params.contrastExp;
+ 
+@@ -922,6 +925,23 @@ void DebayerCpu::updateLookupTables(const DebayerParams &params)
+ 	};
+ 	const unsigned int gammaTableSize = gammaTable_.size();
+ 	const double div = static_cast<double>(kRGBLookupSize) / gammaTableSize;
++
++	/*
++	 * Subtract the black level of each channel before the gains and the
++	 * matrix, and stretch the remaining range to the full scale. Applying
++	 * the gains or the matrix to the pedestal and removing a single black
++	 * level afterwards (as the gamma table used to) leaves an offset of
++	 * black * (row sum - 1) per channel, a strong colour cast in dark
++	 * scenes as soon as the white balance gains differ from 1.
++	 */
++	const RGB<float> black = params.blackLevel * static_cast<float>(kRGBLookupSize);
++	auto linear = [&](unsigned int i, unsigned int c) -> float {
++		const float range = std::max(kRGBLookupSize - black[c], 1.0f);
++		return std::max(i - black[c], 0.0f) * kRGBLookupSize / range;
++	};
++	const unsigned int rIdx = swapRedBlueGains_ ? 2 : 0;
++	const unsigned int bIdx = swapRedBlueGains_ ? 0 : 2;
++
+ 	if (ccmEnabled_) {
+ 		if (gammaUpdateNeeded ||
+ 		    matrixChanged(params.combinedMatrix, params_.combinedMatrix)) {
+@@ -932,15 +952,19 @@ void DebayerCpu::updateLookupTables(const DebayerParams &params)
+ 			const unsigned int greenIndex = 1;
+ 			const unsigned int blueIndex = swapRedBlueGains_ ? 0 : 2;
+ 			for (unsigned int i = 0; i < kRGBLookupSize; i++) {
+-				red[i].r = std::round(i * params.combinedMatrix[redIndex][0]);
+-				red[i].g = std::round(i * params.combinedMatrix[greenIndex][0]);
+-				red[i].b = std::round(i * params.combinedMatrix[blueIndex][0]);
+-				green[i].r = std::round(i * params.combinedMatrix[redIndex][1]);
+-				green[i].g = std::round(i * params.combinedMatrix[greenIndex][1]);
+-				green[i].b = std::round(i * params.combinedMatrix[blueIndex][1]);
+-				blue[i].r = std::round(i * params.combinedMatrix[redIndex][2]);
+-				blue[i].g = std::round(i * params.combinedMatrix[greenIndex][2]);
+-				blue[i].b = std::round(i * params.combinedMatrix[blueIndex][2]);
++				const float r = linear(i, rIdx);
++				const float g = linear(i, 1);
++				const float b = linear(i, bIdx);
++
++				red[i].r = std::round(r * params.combinedMatrix[redIndex][0]);
++				red[i].g = std::round(r * params.combinedMatrix[greenIndex][0]);
++				red[i].b = std::round(r * params.combinedMatrix[blueIndex][0]);
++				green[i].r = std::round(g * params.combinedMatrix[redIndex][1]);
++				green[i].g = std::round(g * params.combinedMatrix[greenIndex][1]);
++				green[i].b = std::round(g * params.combinedMatrix[blueIndex][1]);
++				blue[i].r = std::round(b * params.combinedMatrix[redIndex][2]);
++				blue[i].g = std::round(b * params.combinedMatrix[greenIndex][2]);
++				blue[i].b = std::round(b * params.combinedMatrix[blueIndex][2]);
+ 				gammaLut_[i] = gammaTable_[i / div];
+ 			}
+ 		}
+@@ -952,7 +976,8 @@ void DebayerCpu::updateLookupTables(const DebayerParams &params)
+ 			auto &blue = swapRedBlueGains_ ? red_ : blue_;
+ 			for (unsigned int i = 0; i < kRGBLookupSize; i++) {
+ 				/* Apply gamma after gain! */
+-				const RGB<float> lutGains = (gains * i / div).min(gammaTableSize - 1);
++				const RGB<float> lin{ { linear(i, 0), linear(i, 1), linear(i, 2) } };
++				const RGB<float> lutGains = (gains * lin / div).min(gammaTableSize - 1);
+ 				red[i] = gammaTable_[static_cast<unsigned int>(lutGains.r())];
+ 				green[i] = gammaTable_[static_cast<unsigned int>(lutGains.g())];
+ 				blue[i] = gammaTable_[static_cast<unsigned int>(lutGains.b())];
+-- 
+2.56.0
+

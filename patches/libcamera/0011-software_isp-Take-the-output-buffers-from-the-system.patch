@@ -1,0 +1,73 @@
+From e56595bb66d59fcfe9ae5b7fa649f6b56c2bbaae Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:42:08 +0300
+Subject: [PATCH 11/26] software_isp: Take the output buffers from the system
+ dma-heap
+
+The output buffers of the software ISP are allocated from the first
+dma-buf provider found, a CMA heap when there is one. CMA heaps are often
+small (128 MiB on the Unihertz Titan 2, "reserved" and
+"default_cma_region"): four 4000x3000 RGB888 buffers do not fit and the
+camera fails to start ("dma-heap allocation failure").
+
+The buffers are written by the CPU or rendered by the GPU behind its MMU
+and need no contiguous memory. Allocate them from the system heap when
+it is available, and fall back to the CMA heap or udmabuf otherwise.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ .../internal/software_isp/software_isp.h        |  2 ++
+ src/libcamera/software_isp/software_isp.cpp     | 17 ++++++++++++++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/include/libcamera/internal/software_isp/software_isp.h b/include/libcamera/internal/software_isp/software_isp.h
+index 585e0d6..cb57190 100644
+--- a/include/libcamera/internal/software_isp/software_isp.h
++++ b/include/libcamera/internal/software_isp/software_isp.h
+@@ -99,6 +99,8 @@ private:
+ 	SharedMemObject<DebayerParams> sharedParams_;
+ 	DebayerParams debayerParams_;
+ 	DmaBufAllocator dmaHeap_;
++	/* Preferred for the output buffers: CMA heaps are often small */
++	DmaBufAllocator systemHeap_;
+ 	bool ccmEnabled_;
+ 
+ 	std::unique_ptr<ipa::soft::IPAProxySoft> ipa_;
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index d227bd8..10b333a 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -82,7 +82,8 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 	: ispWorkerThread_("SWIspWorker"),
+ 	  dmaHeap_(DmaBufAllocator::DmaBufAllocatorFlag::CmaHeap |
+ 		   DmaBufAllocator::DmaBufAllocatorFlag::SystemHeap |
+-		   DmaBufAllocator::DmaBufAllocatorFlag::UDmaBuf)
++		   DmaBufAllocator::DmaBufAllocatorFlag::UDmaBuf),
++	  systemHeap_(DmaBufAllocator::DmaBufAllocatorFlag::SystemHeap)
+ {
+ 	if (!dmaHeap_.isValid()) {
+ 		LOG(SoftwareIsp, Error) << "Failed to create DmaBufAllocator object";
+@@ -300,6 +301,20 @@ int SoftwareIsp::exportBuffers(const Stream *stream, unsigned int count,
+ 	if (stream == nullptr)
+ 		return -EINVAL;
+ 
++	/*
++	 * The output buffers are written by the CPU or rendered by the GPU
++	 * (behind its MMU) and need no physically contiguous memory. Take them
++	 * from the system heap when there is one: the CMA heaps are limited
++	 * (full resolution RGB frames do not fit into a 128 MiB CMA region),
++	 * and fall back to the CMA heap or udmabuf otherwise.
++	 */
++	if (systemHeap_.isValid()) {
++		int ret = systemHeap_.exportBuffers(count, { debayer_->frameSize() }, buffers);
++		if (ret >= 0)
++			return ret;
++		buffers->clear();
++	}
++
+ 	return dmaHeap_.exportBuffers(count, { debayer_->frameSize() }, buffers);
+ }
+ 
+-- 
+2.56.0
+

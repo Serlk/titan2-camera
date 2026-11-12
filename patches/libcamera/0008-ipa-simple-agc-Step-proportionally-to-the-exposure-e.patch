@@ -1,0 +1,130 @@
+From fbfa495289c9795b57f8d7d40b4df9b96d310063 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:20:53 +0300
+Subject: [PATCH 08/26] ipa: simple: agc: Step proportionally to the exposure
+ error
+
+The AGC changes the exposure or the gain by 10 % per frame. As the new
+value only shows up in the statistics after the sensor delay plus the
+pipeline latency, and each frame computes its step from the controls it
+was taken with, the effective rate is one 10 % step per round trip: a
+dark scene takes hundreds of frames to reach the exposure limit and the
+gain.
+
+Compute the step from the distance to the target instead: the MSV is
+about linear in the mean brightness, so scale the total exposure
+(exposure time x gain) by (optimal - 0.5) / (MSV - 0.5), limited to
+0.5 .. 2 per step, keeping the hysteresis. Spend the total on the
+exposure time first, at the lowest useful gain, and on the gain once the
+exposure time is at its limit (the frame length); when darkening, the
+gain goes down first. A step always moves by at least one line or one
+gain step.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/ipa/simple/algorithms/agc.cpp | 73 ++++++++++++++++++-------------
+ 1 file changed, 42 insertions(+), 31 deletions(-)
+
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index 2f7e040..1ab32a4 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "agc.h"
+ 
++#include <algorithm>
++#include <cmath>
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
+@@ -44,46 +46,55 @@ Agc::Agc()
+ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
+ {
+ 	/*
+-	 * kExpDenominator of 10 gives ~10% increment/decrement;
+-	 * kExpDenominator of 5 - about ~20%
++	 * Largest change of the total exposure (exposure time x gain) in one
++	 * step. The step is computed from the controls this frame was taken
++	 * with, so the frames captured before a change takes effect repeat
++	 * the same target instead of adding up.
+ 	 */
+-	static constexpr uint8_t kExpDenominator = 10;
+-	static constexpr uint8_t kExpNumeratorUp = kExpDenominator + 1;
+-	static constexpr uint8_t kExpNumeratorDown = kExpDenominator - 1;
++	static constexpr double kMaxStepUp = 2.0;
++	static constexpr double kMaxStepDown = 0.5;
+ 
++	const auto &agc = context.configuration.agc;
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
+ 
+-	if (exposureMSV < kExposureOptimal - kExposureSatisfactory) {
+-		if (exposure < context.configuration.agc.exposureMax) {
+-			int32_t next = exposure * kExpNumeratorUp / kExpDenominator;
+-			if (next - exposure < 1)
+-				exposure += 1;
++	if (exposureMSV < kExposureOptimal - kExposureSatisfactory ||
++	    exposureMSV > kExposureOptimal + kExposureSatisfactory) {
++		/*
++		 * The MSV is the mean bin index (1 .. kExposureBinsCount) of
++		 * the histogram above the black level, about linear in the
++		 * mean brightness: bin i covers (i - 1) .. i fifths of it.
++		 */
++		double factor = (kExposureOptimal - 0.5) /
++				std::max(exposureMSV - 0.5, 0.25);
++		factor = std::clamp(factor, kMaxStepDown, kMaxStepUp);
++
++		double target = std::max(exposure, 1) * again * factor;
++		double gainLow = std::max(agc.again10, agc.againMin);
++
++		/* Exposure time first, at the lowest useful gain, then gain. */
++		int32_t nextExposure = std::clamp<int32_t>(std::lround(target / gainLow),
++							   agc.exposureMin, agc.exposureMax);
++		double nextGain = std::clamp(target / nextExposure,
++					     agc.againMin, agc.againMax);
++
++		/* Always move by at least one step in the wanted direction. */
++		if (factor > 1.0 && nextExposure <= exposure &&
++		    nextGain - again < agc.againMinStep) {
++			if (exposure < agc.exposureMax)
++				nextExposure = exposure + 1;
+ 			else
+-				exposure = next;
+-		} else {
+-			double next = again * kExpNumeratorUp / kExpDenominator;
+-			if (next - again < context.configuration.agc.againMinStep)
+-				again += context.configuration.agc.againMinStep;
++				nextGain = again + agc.againMinStep;
++		} else if (factor < 1.0 && nextExposure >= exposure &&
++			   again - nextGain < agc.againMinStep) {
++			if (again > gainLow)
++				nextGain = again - agc.againMinStep;
+ 			else
+-				again = next;
++				nextExposure = exposure - 1;
+ 		}
+-	}
+ 
+-	if (exposureMSV > kExposureOptimal + kExposureSatisfactory) {
+-		if (again > context.configuration.agc.again10) {
+-			double next = again * kExpNumeratorDown / kExpDenominator;
+-			if (again - next < context.configuration.agc.againMinStep)
+-				again -= context.configuration.agc.againMinStep;
+-			else
+-				again = next;
+-		} else {
+-			int32_t next = exposure * kExpNumeratorDown / kExpDenominator;
+-			if (exposure - next < 1)
+-				exposure -= 1;
+-			else
+-				exposure = next;
+-		}
++		exposure = nextExposure;
++		again = nextGain;
+ 	}
+ 
+ 	exposure = std::clamp(exposure, context.configuration.agc.exposureMin,
+-- 
+2.56.0
+

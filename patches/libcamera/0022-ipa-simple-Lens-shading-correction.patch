@@ -1,0 +1,346 @@
+From bd30033c357b3f071cf7c0e9793e0293aa690a70 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:02:10 +0300
+Subject: [PATCH 22/26] ipa: simple: Lens shading correction
+
+Add an Lsc algorithm: per-channel gain tables on a 17 x 17 grid over the
+active area of the sensor, one per colour temperature, from the tuning
+file. For each frame the two tables around the AWB colour temperature are
+mixed in mireds, weakened in dark scenes (gain' = 1 + s * (gain - 1), s
+over the scene light value estimated from exposure time and gain),
+resampled on the field of view of the sensor mode (analogue crop), and
+handed to the debayer as the lens shading map. The table is rebuilt only
+when the colour temperature or the strength changes noticeably.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/ipa/simple/algorithms/lsc.cpp     | 236 ++++++++++++++++++++++++++
+ src/ipa/simple/algorithms/lsc.h       |  62 +++++++
+ src/ipa/simple/algorithms/meson.build |   1 +
+ 3 files changed, 299 insertions(+)
+ create mode 100644 src/ipa/simple/algorithms/lsc.cpp
+ create mode 100644 src/ipa/simple/algorithms/lsc.h
+
+diff --git a/src/ipa/simple/algorithms/lsc.cpp b/src/ipa/simple/algorithms/lsc.cpp
+new file mode 100644
+index 0000000..878c49c
+--- /dev/null
++++ b/src/ipa/simple/algorithms/lsc.cpp
+@@ -0,0 +1,236 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, serlk <22211586+Serlk@users.noreply.github.com>
++ *
++ * Lens shading correction for the GPU software ISP
++ */
++
++#include "lsc.h"
++
++#include <algorithm>
++#include <cmath>
++
++#include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
++
++#include "libcamera/internal/software_isp/debayer_params.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++LOG_DEFINE_CATEGORY(IPASoftLsc)
++
++/**
++ * \class Lsc
++ * \brief Lens shading correction
++ *
++ * Tables of per-channel gains on a 17 x 17 grid of nodes spread uniformly
++ * over the full field of view of the sensor (the active area), one table per
++ * colour temperature:
++ *
++ *   - Lsc:
++ *       slots:
++ *         - ct: 2850
++ *           r: [ 289 gains in 1/4096 units, row major, top left first ]
++ *           g: [ ... ]
++ *           b: [ ... ]
++ *       strength: [ [ LV, s ], ... ]   # optional, s = 0 .. 1
++ *
++ * For a frame, the tables of the two slots around the AWB colour temperature
++ * are mixed linearly in mireds, weakened in dark scenes as
++ * gain' = 1 + s * (gain - 1) with s interpolated over the scene light value
++ * (estimated from the exposure time and the gain), and resampled on the
++ * field of view of the sensor mode (analogue crop). The GPU debayer applies
++ * the result after the black level subtraction; the CPU debayer has no lens
++ * shading correction.
++ */
++
++int Lsc::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	slots_.clear();
++	for (const ValueNode &node : tuningData["slots"].asList()) {
++		Slot slot;
++		slot.ct = node["ct"].get<double>().value_or(0.0);
++		if (slot.ct <= 0.0 || (!slots_.empty() && slot.ct <= slots_.back().ct)) {
++			LOG(IPASoftLsc, Error) << "Slots need increasing colour temperatures";
++			return -EINVAL;
++		}
++
++		const char *names[] = { "r", "g", "b" };
++		for (unsigned int c = 0; c < 3; c++) {
++			const auto values = node[names[c]].get<std::vector<double>>();
++			if (!values || values->size() != kGrid * kGrid) {
++				LOG(IPASoftLsc, Error)
++					<< "Slot " << slot.ct << " K: '" << names[c]
++					<< "' needs " << kGrid * kGrid << " values";
++				return -EINVAL;
++			}
++			for (unsigned int i = 0; i < kGrid * kGrid; i++)
++				slot.gains[c][i] = std::max((*values)[i] / 4096.0, 1.0);
++		}
++		slots_.push_back(std::move(slot));
++	}
++
++	if (slots_.empty()) {
++		LOG(IPASoftLsc, Error) << "No lens shading tables";
++		return -EINVAL;
++	}
++
++	strength_.clear();
++	for (const ValueNode &p : tuningData["strength"].asList()) {
++		auto lv = p[0].get<double>();
++		auto s = p[1].get<double>();
++		if (!lv || !s || (!strength_.empty() && *lv <= strength_.back().first)) {
++			LOG(IPASoftLsc, Error) << "Invalid strength curve";
++			return -EINVAL;
++		}
++		strength_.emplace_back(*lv, std::clamp(*s, 0.0, 1.0));
++	}
++
++	return 0;
++}
++
++int Lsc::configure(IPAContext &context,
++		   [[maybe_unused]] const IPAConfigInfo &configInfo)
++{
++	const IPACameraSensorInfo &info = context.sensorInfo;
++	const Size &active = info.activeAreaSize;
++	const Rectangle &crop = info.analogCrop;
++
++	if (active.isNull() || crop.isNull()) {
++		u0_ = v0_ = 0.0;
++		du_ = dv_ = 1.0;
++	} else {
++		u0_ = static_cast<double>(crop.x) / active.width;
++		v0_ = static_cast<double>(crop.y) / active.height;
++		du_ = static_cast<double>(crop.width) / active.width;
++		dv_ = static_cast<double>(crop.height) / active.height;
++	}
++
++	valid_ = false;
++	lastMired_ = -1.0;
++	lastStrength_ = -1.0;
++
++	LOG(IPASoftLsc, Debug)
++		<< "Mode field of view " << u0_ << "," << v0_ << " + "
++		<< du_ << "x" << dv_ << " of the active area";
++	return 0;
++}
++
++double Lsc::sample(const Grid &grid, double u, double v)
++{
++	const double x = std::clamp(u, 0.0, 1.0) * (kGrid - 1);
++	const double y = std::clamp(v, 0.0, 1.0) * (kGrid - 1);
++	const unsigned int x0 = std::min(static_cast<unsigned int>(x), kGrid - 2);
++	const unsigned int y0 = std::min(static_cast<unsigned int>(y), kGrid - 2);
++	const double fx = x - x0;
++	const double fy = y - y0;
++
++	const double a = grid[y0 * kGrid + x0];
++	const double b = grid[y0 * kGrid + x0 + 1];
++	const double c = grid[(y0 + 1) * kGrid + x0];
++	const double d = grid[(y0 + 1) * kGrid + x0 + 1];
++
++	return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
++}
++
++double Lsc::strength(double lv) const
++{
++	if (strength_.empty())
++		return 1.0;
++	if (lv <= strength_.front().first)
++		return strength_.front().second;
++	if (lv >= strength_.back().first)
++		return strength_.back().second;
++
++	for (size_t i = 1; i < strength_.size(); i++) {
++		if (lv > strength_[i].first)
++			continue;
++		const auto &[l0, s0] = strength_[i - 1];
++		const auto &[l1, s1] = strength_[i];
++		return s0 + (s1 - s0) * (lv - l0) / (l1 - l0);
++	}
++
++	return strength_.back().second;
++}
++
++void Lsc::build([[maybe_unused]] IPAContext &context, double ct, double s,
++		DebayerParams *params)
++{
++	/* The two slots around ct and the weight of the upper one, in mireds */
++	size_t hi = 0;
++	while (hi < slots_.size() && slots_[hi].ct < ct)
++		hi++;
++	size_t lo = hi ? hi - 1 : 0;
++	hi = std::min(hi, slots_.size() - 1);
++	double w = 0.0;
++	if (lo != hi) {
++		const double m = 1e6 / ct;
++		const double mlo = 1e6 / slots_[lo].ct;
++		const double mhi = 1e6 / slots_[hi].ct;
++		w = std::clamp((mlo - m) / (mlo - mhi), 0.0, 1.0);
++	}
++
++	for (unsigned int j = 0; j < kGrid; j++) {
++		for (unsigned int i = 0; i < kGrid; i++) {
++			const double u = u0_ + du_ * i / (kGrid - 1);
++			const double v = v0_ + dv_ * j / (kGrid - 1);
++			uint8_t *node = &table_[(j * kGrid + i) * 4];
++
++			for (unsigned int c = 0; c < 3; c++) {
++				double g = (1.0 - w) * sample(slots_[lo].gains[c], u, v) +
++					   w * sample(slots_[hi].gains[c], u, v);
++				g = 1.0 + s * (g - 1.0);
++				g = std::clamp(g, 1.0, 8.0);
++				node[c] = std::lround(std::log2(g) / 3.0 * 255.0);
++			}
++			node[3] = 255;
++		}
++	}
++
++	params->lscTable = table_;
++	params->lscSequence = ++sequence_;
++}
++
++void Lsc::prepare(IPAContext &context,
++		  [[maybe_unused]] const uint32_t frame,
++		  [[maybe_unused]] IPAFrameContext &frameContext,
++		  DebayerParams *params)
++{
++	params->lscEnabled = true;
++
++	const double ct = context.activeState.awb.temperatureK
++				  ? context.activeState.awb.temperatureK
++				  : 5000.0;
++
++	/* Scene light value from the exposure: LV = log2(N^2 / t) - log2(gain), N = 1.8 */
++	double s = 1.0;
++	const double t = context.configuration.agc.lineDuration.get<std::ratio<1>>() *
++			 context.activeState.agc.exposure;
++	const double gain = context.activeState.agc.again;
++	if (t > 0.0 && gain > 0.0)
++		s = strength(std::log2(3.24 / t) - std::log2(gain));
++
++	const double mired = 1e6 / ct;
++	if (valid_ && std::abs(mired - lastMired_) < 5.0 &&
++	    std::abs(s - lastStrength_) < 0.03) {
++		params->lscTable = table_;
++		params->lscSequence = sequence_;
++		return;
++	}
++
++	build(context, ct, s, params);
++	valid_ = true;
++	lastMired_ = mired;
++	lastStrength_ = s;
++
++	LOG(IPASoftLsc, Debug)
++		<< "Table for " << ct << " K, strength " << s;
++}
++
++REGISTER_IPA_ALGORITHM(Lsc, "Lsc")
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/lsc.h b/src/ipa/simple/algorithms/lsc.h
+new file mode 100644
+index 0000000..db70542
+--- /dev/null
++++ b/src/ipa/simple/algorithms/lsc.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, serlk <22211586+Serlk@users.noreply.github.com>
++ *
++ * Lens shading correction for the GPU software ISP
++ */
++
++#pragma once
++
++#include <array>
++#include <utility>
++#include <vector>
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::soft::algorithms {
++
++class Lsc : public Algorithm
++{
++public:
++	Lsc() = default;
++	~Lsc() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	int configure(IPAContext &context,
++		      const IPAConfigInfo &configInfo) override;
++	void prepare(IPAContext &context,
++		     const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++
++private:
++	static constexpr unsigned int kGrid = 17;
++	using Grid = std::array<double, kGrid * kGrid>;
++
++	struct Slot {
++		double ct;
++		std::array<Grid, 3> gains; /* r, g, b over the reference frame */
++	};
++
++	static double sample(const Grid &grid, double u, double v);
++	double strength(double lv) const;
++	void build(IPAContext &context, double ct, double s, DebayerParams *params);
++
++	std::vector<Slot> slots_;
++	std::vector<std::pair<double, double>> strength_;
++
++	/* Mode crop in the reference (active area) frame, normalised */
++	double u0_ = 0.0, v0_ = 0.0, du_ = 1.0, dv_ = 1.0;
++
++	bool valid_ = false;
++	double lastMired_ = -1.0;
++	double lastStrength_ = -1.0;
++	uint32_t sequence_ = 0;
++	std::array<uint8_t, kGrid * kGrid * 4> table_ = {};
++};
++
++} /* namespace ipa::soft::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/meson.build b/src/ipa/simple/algorithms/meson.build
+index db863ba..fd99eb7 100644
+--- a/src/ipa/simple/algorithms/meson.build
++++ b/src/ipa/simple/algorithms/meson.build
+@@ -8,4 +8,5 @@ soft_simple_ipa_algorithms = files([
+     'blc.cpp',
+     'ccm.cpp',
+     'detail.cpp',
++    'lsc.cpp',
+ ])
+-- 
+2.56.0
+

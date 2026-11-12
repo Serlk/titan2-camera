@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: CC0-1.0
+# Titan 2: dma-buf heaps for the video group -> /etc/udev/rules.d/70-titan2-dma-heap.rules
+# libcamera (software ISP output buffers) runs as the session user, e.g. inside WirePlumber;
+# root-only /dev/dma_heap/* gave "Could not open any dma-buf provider" and no software ISP.
+SUBSYSTEM=="dma_heap", GROUP="video", MODE="0660"

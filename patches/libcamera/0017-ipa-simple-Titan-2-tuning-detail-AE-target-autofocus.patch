@@ -1,0 +1,97 @@
+From 3b53fb42024121972cf460179f0a52ba8cf36b02 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 22:42:50 +0300
+Subject: [PATCH 17/26] ipa: simple: Titan 2 tuning: detail, AE target,
+ autofocus
+
+Hi-847, IMX766, S5KGD1SP: gamma 2.2, GPU detail strengths over the gain,
+AE target 2.0 with a 3 % highlight limit (placeholders until measured or
+calibrated values); continuous autofocus for the two rear cameras, which
+have a focus lens.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/ipa/simple/data/hi847.yaml    | 16 ++++++++++++++++
+ src/ipa/simple/data/imx766.yaml   | 16 ++++++++++++++++
+ src/ipa/simple/data/s5kgd1sp.yaml | 11 +++++++++++
+ 3 files changed, 43 insertions(+)
+
+diff --git a/src/ipa/simple/data/hi847.yaml b/src/ipa/simple/data/hi847.yaml
+index a3cf66b..a612590 100644
+--- a/src/ipa/simple/data/hi847.yaml
++++ b/src/ipa/simple/data/hi847.yaml
+@@ -27,6 +27,22 @@ algorithms:
+           ccm: [ 1.5039, -0.5957, 0.0918,
+                  -0.1348, 1.2754, -0.1406,
+                  0.0684, -0.7520, 1.6836 ]
++  # Placeholders until calibrated values: gamma/contrast,
++  # GPU detail stage strengths over the analogue gain, AE target.
+   - Adjust:
++      gamma: 2.2
++  - Detail:
++      sharpen: [ [ 1.0, 0.6 ], [ 4.0, 0.4 ], [ 16.0, 0.15 ] ]
++      denoise: [ [ 1.0, 0.15 ], [ 4.0, 0.4 ], [ 16.0, 0.8 ] ]
++      threshold: [ [ 1.0, 0.004 ], [ 4.0, 0.008 ], [ 16.0, 0.02 ] ]
+   - Agc:
++      # mean sample value 1 .. 5 (2.5 = libcamera default, too bright)
++      target: 2.0
++      # fraction of the samples allowed near clipping
++      highlights: 0.03
++  # Contrast AF (continuous by default); lens map: /etc/libcamera/configuration.yaml
++  - Af:
++      steps: 11
++      fine_step: 0.04
++      settle_frames: 4
+ ...
+diff --git a/src/ipa/simple/data/imx766.yaml b/src/ipa/simple/data/imx766.yaml
+index 577d25a..fac47ed 100644
+--- a/src/ipa/simple/data/imx766.yaml
++++ b/src/ipa/simple/data/imx766.yaml
+@@ -31,6 +31,22 @@ algorithms:
+           ccm: [ 1.7559, -0.7070, -0.0488,
+                  -0.1934, 1.5000, -0.3066,
+                  0.0898, -0.7949, 1.7051 ]
++  # Placeholders until calibrated values: gamma/contrast,
++  # GPU detail stage strengths over the analogue gain, AE target.
+   - Adjust:
++      gamma: 2.2
++  - Detail:
++      sharpen: [ [ 1.0, 0.6 ], [ 4.0, 0.4 ], [ 16.0, 0.15 ] ]
++      denoise: [ [ 1.0, 0.15 ], [ 4.0, 0.4 ], [ 16.0, 0.8 ] ]
++      threshold: [ [ 1.0, 0.004 ], [ 4.0, 0.008 ], [ 16.0, 0.02 ] ]
+   - Agc:
++      # mean sample value 1 .. 5 (2.5 = libcamera default, too bright)
++      target: 2.0
++      # fraction of the samples allowed near clipping
++      highlights: 0.03
++  # Contrast AF (continuous by default); lens map: /etc/libcamera/configuration.yaml
++  - Af:
++      steps: 11
++      fine_step: 0.04
++      settle_frames: 4
+ ...
+diff --git a/src/ipa/simple/data/s5kgd1sp.yaml b/src/ipa/simple/data/s5kgd1sp.yaml
+index 45307d4..d956337 100644
+--- a/src/ipa/simple/data/s5kgd1sp.yaml
++++ b/src/ipa/simple/data/s5kgd1sp.yaml
+@@ -27,6 +27,17 @@ algorithms:
+           ccm: [ 1.7422, -0.6445, -0.0977,
+                  -0.1445, 1.4043, -0.2598,
+                  0.0703, -0.7246, 1.6543 ]
++  # Placeholders until calibrated values: gamma/contrast,
++  # GPU detail stage strengths over the analogue gain, AE target.
+   - Adjust:
++      gamma: 2.2
++  - Detail:
++      sharpen: [ [ 1.0, 0.6 ], [ 4.0, 0.4 ], [ 16.0, 0.15 ] ]
++      denoise: [ [ 1.0, 0.15 ], [ 4.0, 0.4 ], [ 16.0, 0.8 ] ]
++      threshold: [ [ 1.0, 0.004 ], [ 4.0, 0.008 ], [ 16.0, 0.02 ] ]
+   - Agc:
++      # mean sample value 1 .. 5 (2.5 = libcamera default, too bright)
++      target: 2.0
++      # fraction of the samples allowed near clipping
++      highlights: 0.03
+ ...
+-- 
+2.56.0
+

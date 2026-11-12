@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: CC0-1.0
+# Titan 2: GNOME Snapshot starts on the main rear camera (the WirePlumber node description
+# "Back Camera", libcamera/50-titan2-camera.conf) instead of the first PipeWire node.
+# -> /usr/share/glib-2.0/schemas/, then glib-compile-schemas (netroot/local.d/t2-camera-schemas.start)
+[org.gnome.Snapshot]
+last-camera-id='Back Camera'

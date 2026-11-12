@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+# Titan 2: the image build cannot run glib-compile-schemas (aarch64 chroot); compile the GSettings
+# schemas once the Titan 2 override is newer than the compiled database.
+d=/usr/share/glib-2.0/schemas
+[ -x /usr/bin/glib-compile-schemas ] && [ -f "$d/90-titan2-snapshot.gschema.override" ] || exit 0
+if [ ! -f "$d/gschemas.compiled" ] || [ "$d/90-titan2-snapshot.gschema.override" -nt "$d/gschemas.compiled" ]; then
+	glib-compile-schemas "$d"
+fi

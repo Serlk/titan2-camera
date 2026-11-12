@@ -1,0 +1,142 @@
+From 3008655aac101d19dde59794e49ac358531c979e Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:02:10 +0300
+Subject: [PATCH 25/26] pipeline: simple: Lens map from the module calibration
+ EEPROM
+
+The lens codes at infinity and at macro of each camera module, and the
+distances of its calibration targets, are stored in the module EEPROM
+("MTK" layout), which the sensor driver exposes as
+/sys/bus/nvmem/devices/<model>-eeprom/nvmem. Use them for the
+LensPosition (dioptres) to lens code map of this unit, and limit the
+autofocus range to the macro distance; the configured map stays the
+fallback (and wins with override: true). The configuration can name
+another EEPROM file (eeprom: <path>) or none.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+---
+ src/libcamera/pipeline/simple/simple.cpp | 80 +++++++++++++++++++++++-
+ 1 file changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index f8c7242..e44d18b 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <fstream>
+ #include <iterator>
+ #include <list>
+ #include <map>
+@@ -361,6 +362,13 @@ public:
+ 	/* AfMode of the camera: LensPosition only applies in AfModeManual */
+ 	int32_t afMode_ = controls::AfModeManual;
+ 	int32_t afModeDefault_ = controls::AfModeManual;
++	struct FocusCalibration {
++		unsigned int infinity;
++		unsigned int macro;
++		unsigned int infinityMm;
++		unsigned int macroMm;
++	};
++	static std::optional<FocusCalibration> readModuleFocusCalibration(const std::string &path);
+ 	void initLens();
+ 	void setLensPosition(float dioptres);
+ 	void afLensPosition(float position);
+@@ -748,6 +756,34 @@ void SimpleCameraData::initLens()
+ 	lensInfinity_ = cfg["infinity"].get<double>().value_or(lensMin_);
+ 	lensStepsPerDioptre_ =
+ 		cfg["steps_per_dioptre"].get<double>().value_or(100.0);
++	/* Autofocus range: up to af_max dioptres (default: the lens range) */
++	std::optional<double> afMax = cfg["af_max"].get<double>();
++
++	/*
++	 * The module calibration EEPROM, when the sensor driver exposes it
++	 * (/sys/bus/nvmem/devices/<model>-eeprom/nvmem, "MTK" layout), gives
++	 * the lens codes of this unit at infinity and macro and the distances
++	 * of the calibration targets: it replaces the configured map unless
++	 * the configuration says override: true.
++	 */
++	std::string eepromPath = cfg["eeprom"].get<std::string>().value_or("auto");
++	if (eepromPath == "auto")
++		eepromPath = "/sys/bus/nvmem/devices/" + sensor_->model() + "-eeprom/nvmem";
++	if (eepromPath != "none" && !cfg["override"].get<bool>().value_or(false)) {
++		auto cal = readModuleFocusCalibration(eepromPath);
++		if (cal) {
++			const double dInf = cal->infinityMm ? 1000.0 / cal->infinityMm : 0.0;
++			const double dMac = cal->macroMm ? 1000.0 / cal->macroMm : 10.0;
++			lensStepsPerDioptre_ = (cal->macro - cal->infinity) / (dMac - dInf);
++			lensInfinity_ = cal->infinity - dInf * lensStepsPerDioptre_;
++			afMax = dMac;
++			LOG(SimplePipeline, Info)
++				<< "Lens calibration of the module: code " << cal->infinity
++				<< " at " << dInf << " dioptres, " << cal->macro << " at "
++				<< dMac << " dioptres";
++		}
++	}
++
+ 	if (lensStepsPerDioptre_ <= 0.0) {
+ 		LOG(SimplePipeline, Error)
+ 			<< "Invalid lens steps_per_dioptre, manual focus disabled";
+@@ -766,7 +802,8 @@ void SimpleCameraData::initLens()
+ 
+ 	lens_ = lens;
+ 	lensPosition_ = lensDefault_;
+-	lensMaxDioptres_ = maxDioptres;
++	lensMaxDioptres_ = afMax ? std::clamp<float>(*afMax, 0.0f, maxDioptres)
++				 : maxDioptres;
+ 
+ 	/*
+ 	 * Autofocus is offered by the IPA (the Af algorithm of the tuning
+@@ -785,6 +822,47 @@ void SimpleCameraData::initLens()
+ 		<< ", " << lensStepsPerDioptre_ << " steps per dioptre";
+ }
+ 
++/*
++ * Focus calibration of a MediaTek "MTK" layout module EEPROM: format tag
++ * 0x010B00FF at 0x0001, flags at 0x0008 (bit 1: AF), lens codes at
++ * infinity (0x0011) and macro (0x0013), u16 little-endian; from format
++ * version 0x17 (0x0FA3) the distances of the calibration targets in mm at
++ * 0x0F69 and 0x0F6B.
++ */
++std::optional<SimpleCameraData::FocusCalibration>
++SimpleCameraData::readModuleFocusCalibration(const std::string &path)
++{
++	std::ifstream file(path, std::ios::binary);
++	if (!file)
++		return std::nullopt;
++
++	std::vector<uint8_t> d((std::istreambuf_iterator<char>(file)),
++			       std::istreambuf_iterator<char>());
++	static constexpr uint8_t kTag[] = { 0xff, 0x00, 0x0b, 0x01 };
++	if (d.size() < 0x0fa4 || !std::equal(std::begin(kTag), std::end(kTag), d.begin() + 1) ||
++	    !(d[0x0008] & 0x02))
++		return std::nullopt;
++
++	auto u16 = [&](size_t off) -> unsigned int { return d[off] | (d[off + 1] << 8); };
++	auto usable = [](unsigned int v) { return v != 0 && v != 0xffff; };
++
++	FocusCalibration cal{ u16(0x0011), u16(0x0013), 0, 0 };
++	if (!usable(cal.infinity) || !usable(cal.macro) || cal.macro <= cal.infinity)
++		return std::nullopt;
++
++	const uint8_t version = d[0x0fa3];
++	if (version >= 0x17 && version != 0xff) {
++		unsigned int inf = u16(0x0f63 + 6);
++		unsigned int mac = u16(0x0f63 + 8);
++		if (usable(inf) && usable(mac) && inf > mac) {
++			cal.infinityMm = inf;
++			cal.macroMm = mac;
++		}
++	}
++
++	return cal;
++}
++
+ /* Normalised position (0.0 far .. 1.0 near) from the AF algorithm */
+ void SimpleCameraData::afLensPosition(float position)
+ {
+-- 
+2.56.0
+
