@@ -170,3 +170,5 @@ Copyright (c) 2026 serlk. The scripts and documentation are GPL-2.0-or-later, se
 configuration snippets in `libcamera/` are CC0-1.0, like libcamera's own tuning files. Every file
 names its license in an `SPDX-License-Identifier` line or in [REUSE.toml](REUSE.toml); the texts
 are in [LICENSES/](LICENSES/).
+
+Licensing: [LICENSE](LICENSE) (GPL-2.0), per-file details in [LICENSING.md](LICENSING.md).
