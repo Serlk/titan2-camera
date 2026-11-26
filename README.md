@@ -6,10 +6,11 @@ User-space camera support for mainline Linux on the **Unihertz Titan 2** (MediaT
 patches for [libcamera](https://libcamera.org/) (simple pipeline handler + software ISP), the
 libcamera, WirePlumber and udev configuration, an Alpine package build, and test scripts. Ordinary
 applications (`cam`, `qcam`, GNOME Snapshot, GStreamer `libcamerasrc`, PipeWire and the camera
-portal) use the cameras through libcamera; there is no hardware ISP driver.
+portal) use the cameras through libcamera and its software ISP; the SoC's hardware ISP is not
+used. Design, state and test procedures: [docs/CAMERA.md](docs/CAMERA.md).
 
-> **Experimental.** The three cameras deliver pictures on the phone, but colour and lens shading
-> are not calibrated (see below), and the GPU software ISP is not the default yet.
+> **Experimental.** The three cameras deliver pictures and 1080p30 video with sound on the phone,
+> but colour and lens shading are not calibrated (see below).
 
 ## Architecture
 
@@ -38,7 +39,8 @@ front sensor probes, but streaming does not start.
 | path | what |
 |---|---|
 | `patches/libcamera/0001-0025` | libcamera 0.7.1 patches: MT6878 CAMSV in the simple pipeline, frame start from the video node, sensor helpers and properties for the three sensors, initial tuning files (CCMs, black level), manual focus and contrast autofocus with the module EEPROM lens map, AE/AWB/CPU-debayer fixes, GPU detail stage (denoise/sharpen), lens shading and tone-curve support in the software ISP, output buffers from the system dma-heap |
-| `libcamera/configuration.yaml` | `/etc/libcamera/configuration.yaml`: lens maps per sensor, software ISP mode |
+| `docs/CAMERA.md` | design, image quality state, software ISP and recording measurements, test procedures, open items |
+| `libcamera/configuration.yaml` | `/etc/libcamera/configuration.yaml`: lens maps per sensor, software ISP mode (GPU) |
 | `libcamera/50-titan2-camera.conf` | WirePlumber: cameras only through libcamera (no raw CAMSV nodes), names and priorities |
 | `libcamera/70-titan2-dma-heap.rules` | udev: `/dev/dma_heap/*` for the `video` group (libcamera as the session user) |
 | `libcamera/90-titan2-snapshot.gschema.override` | GNOME Snapshot starts on the main rear camera |
@@ -46,6 +48,7 @@ front sensor probes, but streaming does not start.
 | `libcamera/camerabin-still.py` | the still-capture path of Snapshot/libaperture without GTK, for debugging |
 | `scripts/build-libcamera.sh`, `scripts/abuild-inner.sh` | builds the patched libcamera as signed Alpine aarch64 packages |
 | `scripts/camera-raw-test.sh` | bring-up test on the phone without libcamera: sensor -> seninf -> CAMSV -> memory, focus sweep, test pattern, RAW10 -> PNG converter |
+| `scripts/camera-record-test.sh`, `scripts/video-check.py` | video recording acceptance on the phone (session user): control runs with and without sound, a Snapshot run with a check of every new clip, where the data stops; the checker decodes a clip and reports frames, rate, gaps, sound and audio/video offset |
 | `netroot/` | the hook for titan2-tools' image builder: package lists and the install script |
 | `kernel/` | the kernel part: the patch series `kernel/patches/` (on top of titan2-linux branch `titan2`), the config fragment `kernel/titan2-camera.config`, and how to build it |
 | `tools/csv2fw.py` | converts a sensor register table (CSV) into the S5KGD1SP firmware patch format; holds no data, see kernel/README.md |
@@ -67,7 +70,7 @@ front sensor probes, but streaming does not start.
 - **Mesa** with Mali-G615 (panthor/panfrost) support for the GPU software ISP and for GTK
   applications that take pictures (Snapshot).
 - This repository does **not** need `titan2-vendor-runtime` from titan2-tools: the whole camera
-  stack is open source and runs no code of the factory firmware.
+  stack is open source and runs no closed code from the phone's firmware.
 
 ## Build and install
 
@@ -104,12 +107,21 @@ cam -l; cam -c 1 --capture=10                      # libcamera
 qcam                                               # or GNOME Snapshot in the session
 ```
 
+Video recording, as the session user (copy both files to the phone, `py3-gst` needed):
+
+```
+./camera-record-test.sh env; ./camera-record-test.sh control; ./camera-record-test.sh snapshot
+```
+
+The full procedures and the expected output are in [docs/CAMERA.md](docs/CAMERA.md) section 7.
+
 Do not read camera, seninf, larb or M4U registers with devmem while their power domains are
 off: the bus hangs and the watchdog reboots the phone. The test script only uses the drivers.
 
 ## Colour and lens shading
 
-No factory tuning is shipped in this repository. What is there:
+No tuning taken from the phone's original camera software is shipped in this repository. What
+is there:
 
 - **Colour**: the colour correction matrices and the black level of patch 0005 are the module
   colour calibration (a few small measurements of each sensor's colour response), applied after
@@ -137,11 +149,15 @@ No factory tuning is shipped in this repository. What is there:
 
 - All three cameras stream (sensor modes: see `scripts/camera-raw-test.sh`) and work in `cam`,
   qcam and GNOME Snapshot through PipeWire.
-- CPU software ISP is the default (1080p at 30 fps); the GPU software ISP (detail stage, lens
-  shading, full-size output) works but is not the default yet.
+- The GPU software ISP is the default (1080p at 30 fps on the phone, detail stage, full-size
+  output; lens shading support without tables); the CPU software ISP is the fallback
+  (`software_isp.mode` in `configuration.yaml`, no environment override in libcamera 0.7.1).
+- Video: GNOME Snapshot records H.264/MP4 1080p30 with sound through the software encoder
+  `openh264enc`; the one-minute acceptance run is still open. No hardware video encoder yet.
 - Autofocus: contrast AF on the two rear cameras; lens maps from the module EEPROM, the
   Hi-847 infinity position in `configuration.yaml` is a placeholder.
-- Not done: lens shading tables, calibrated tone/noise settings, the hardware ISP.
+- Not done: lens shading tables, calibrated tone/noise settings, hardware H.264 encoding, the
+  hardware ISP (kernel work in development, no frame yet; not used by this user space).
 
 ## Related repositories
 
