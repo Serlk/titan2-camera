@@ -138,12 +138,14 @@ itself once such an encoder exists and its "hardware encoding" setting is on.
 The SoC's RAW/YUV image processing engines are not used by this user space. The kernel series
 has an experimental driver (`camraw`, board `-raw`) that replays a command queue captured from the
 phone's original camera software on both RAW engines. It **delivers frames**: on a lit scene a
-correct colour 1450x1088 picture comes out of the hardware ISP. Everything the ISP does to the
-picture (black level, white balance, colour, sharpening) is frozen in the captured request; there
-is no 3A, no auto exposure (exposure and gain by hand through the sensor controls) and no libcamera
-integration, and nothing in this repository depends on it. The request dumps it needs are captured
-on your own phone; neither the dumps nor the capture tools are published, so this is developer
-work only for now (see kernel/README.md).
+correct colour 1450x1088 picture comes out of the hardware ISP. You can reproduce this with your
+own capture: `scripts/camraw-capture.sh` on the original Android, `scripts/camraw-dump-info.py` on
+the PC, `scripts/camera-raw-replay-test.sh` on the phone (README.md, "Hardware ISP replay"). The
+limits: everything the ISP does to the picture (black level, white balance, colour, sharpening) is
+frozen in the captured request; there is no 3A, no auto exposure (exposure and gain by hand through
+the sensor controls) and no libcamera integration, and nothing else in this repository depends on
+it. The dumps contain the tuning output of the phone's camera software from your own device: never
+publish or share them.
 
 ## 7. Tests on the phone
 

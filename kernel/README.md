@@ -20,10 +20,10 @@ Since 2026-11-26 it also carries work in progress that the published user space 
   captured request: there is no 3A, no auto exposure (exposure and gain are set by hand through
   the sensor's V4L2 controls), and no libcamera integration. The right edge of a frame shows the
   line padding (pitch 1472). It needs two request dumps, `/lib/firmware/titan2/camraw-start.bin`
-  and `camraw-frame.bin`, captured on your own phone from its original camera software. No dump
-  is part of this repository and the capture tools are not published, so **without your own
-  dumps this driver is of no use yet**: the board and the module only load, and streaming fails
-  with a missing firmware file.
+  and `camraw-frame.bin`, captured on your own phone from its original camera software with
+  `scripts/camraw-capture.sh` of this repository (README.md, "Hardware ISP replay"). No dump is
+  part of this repository; without them the module loads, but streaming fails with a missing
+  firmware file.
 - **VCP host driver** (`drivers/soc/mediatek/vcp`, boards `-vcp`, `-vcp-iommu`, EXPERIMENTAL): the
   video companion processor that runs the hardware video codec firmware; the start is not
   working reliably yet, and no video codec uses it.

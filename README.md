@@ -49,6 +49,7 @@ front sensor probes, but streaming does not start.
 | `scripts/build-libcamera.sh`, `scripts/abuild-inner.sh` | builds the patched libcamera as signed Alpine aarch64 packages |
 | `scripts/camera-raw-test.sh` | bring-up test on the phone without libcamera: sensor -> seninf -> CAMSV -> memory, focus sweep, test pattern, RAW10 -> PNG converter |
 | `scripts/camera-record-test.sh`, `scripts/video-check.py` | video recording acceptance on the phone (session user): control runs with and without sound, a Snapshot run with a check of every new clip, where the data stops; the checker decodes a clip and reports frames, rate, gaps, sound and audio/video offset |
+| `scripts/camraw-capture.sh`, `scripts/camraw-dump-info.py`, `scripts/camera-raw-replay-test.sh` | hardware ISP replay (experimental, for developers): capture request dumps on the original Android, check them on the PC, replay them on the phone under Linux; see "Hardware ISP replay" below |
 | `netroot/` | the hook for titan2-tools' image builder: package lists and the install script |
 | `kernel/` | the kernel part: the patch series `kernel/patches/` (on top of titan2-linux branch `titan2`), the config fragment `kernel/titan2-camera.config`, and how to build it |
 | `tools/csv2fw.py` | converts a sensor register table (CSV) into the S5KGD1SP firmware patch format; holds no data, see kernel/README.md |
@@ -144,6 +145,70 @@ is there:
      `src/ipa/simple/data/<sensor>.yaml`.
 - **Tone, AE, detail**: our own defaults (gamma 2.2, AE target, denoise/sharpen strengths over
   the analogue gain in patch 0017); they are placeholders until calibrated values exist.
+
+## Hardware ISP replay (experimental, for developers)
+
+The kernel series has a driver for the SoC's RAW/YUV engines (`mtk-camraw-mt6878`, board
+`mt6878-unihertz-titan2-raw.dtb`) that replays a command queue captured from the phone's original
+camera software. It produces a correct colour picture through the hardware ISP, but everything the
+ISP does is frozen in the captured request: **no 3A, no auto exposure (exposure and gain by hand),
+no libcamera integration yet**. Ordinary applications do not use it.
+
+**The dumps are yours only.** They contain the tuning output of the phone's own camera software,
+captured from your own device. Never publish or share them, and do not put them in a git
+repository. Nothing in this repository contains such data.
+
+### 1. Capture on the original Android
+
+Needs root (`su`) and `adb` (from `PATH`, or `ADB=/path/to/adb`). The capture interface
+(`/proc/mtk_cam_dbg/<n>/ctrl` and `data`) is the debug interface of MediaTek's GPL camera driver on
+the phone; the camera app creates it when it opens the camera for the first time, so open the
+camera app once after boot.
+
+Camera app settings: **main rear camera, photo mode, 4:3, zoom 1x, no HDR, no night or portrait
+mode**, pointed at a **lit scene** with several colours.
+
+    scripts/camraw-capture.sh first       # start it with the camera app CLOSED
+
+The script starts a reader on the phone, asks you to open the camera app, keeps reading for
+8 seconds after you confirm that the preview shows, pulls the dumps into
+`./camraw-capture-<date>/camraw-first/camraw-p0-<request>.bin` and prints a table of them
+(`scripts/camraw-dump-info.py --table`). Take **request 1 as the start request** (it has the
+one-time block) and **a steady request, e.g. 7, as the frame request**; the table must show
+"ok" for both, and `scripts/camraw-dump-info.py --pair camraw-p0-1.bin camraw-p0-7.bin` must say
+"consistent for replay". (`steady` mode captures the 20 newest requests of a running preview; it
+gives no start request.)
+
+### 2. Install on the phone under Linux
+
+    scp camraw-capture-<date>/camraw-first/camraw-p0-1.bin root@<phone>:/lib/firmware/titan2/camraw-start.bin
+    scp camraw-capture-<date>/camraw-first/camraw-p0-7.bin root@<phone>:/lib/firmware/titan2/camraw-frame.bin
+
+The kernel must carry this repository's kernel series with `CONFIG_VIDEO_MEDIATEK_CAMRAW_REPLAY`
+(kernel/README.md), and the phone needs `v4l-utils` (`apk add v4l-utils`).
+
+### 3. Run
+
+Boot the `-raw` board as a one-shot entry. Keep it among the first 12 entries of the boot menu
+(older titan2-boot packs show only 12), e.g. `VARIANTS="all all-fb full raw"` for titan2-tools'
+`scripts/linux-update.sh`; boot `all` again afterwards. Then, as root on the phone, copy
+`scripts/camera-raw-replay-test.sh` there and run:
+
+    sh camera-raw-replay-test.sh check            # module, nodes, dumps, the driver's reading of them
+    TWIN=1 sh camera-raw-replay-test.sh run 3     # three frames with both RAW engines -> /tmp/camraw.nv21
+    sh camera-raw-replay-test.sh runlist          # five fixed variants -> /root/camraw-runs (detached)
+
+Brighter pictures need more exposure, e.g. `EXPOSURE=3128 AGAIN=16128`.
+
+**Success** looks like this: the verdict lists PASS for "the start request's lists both finished",
+"RAW-A latched the start request before VF on", "frames delivered: 3" (or more) and "no IOMMU
+fault"; with `TWIN=1` both halves of the picture are written. On the PC:
+
+    ffmpeg -f rawvideo -pix_fmt nv21 -s 1472x1088 -i camraw.nv21 -frames:v 1 camraw.png
+
+gives a correct colour picture of the scene, 1450 columns wide (1472 is the line pitch, so the right
+edge shows a narrow padding stripe). On a dark scene the frames come out nearly black: that is the
+exposure of the captured request, not a fault.
 
 ## Status
 
