@@ -1,0 +1,728 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:02:24 +0300
+Subject: [PATCH 14/19] media: mediatek: seninf: RAW engines as a second
+ destination of a CSI port
+
+An output port can now carry a second endpoint to a node with
+mediatek,raw-id. Such a port gets a third pad for it and a static route
+through its own mux of the RAW range (6..8), the first virtual mux of that
+mux (0x22..0x2d) and the cam mux of the engine (0x22 RAW-A, 0x24 RAW-B). A
+port without a RAW endpoint keeps its two pads and its graph.
+
+One destination of a port streams at a time: the route is claimed when
+the stream is enabled, before the receiver and the sensor start, and a
+mux held by another running port is -EBUSY with the holder named. A RAW
+destination filters by virtual channel and data type in the cam mux
+option register only (no tags). A RAW engine driver without a media graph
+of its own finds its CSI port sub-device and source pad through its
+endpoint.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/mediatek/seninf/mtk-seninf-drv.c | 304 ++++++++++++++----
+ .../platform/mediatek/seninf/mtk-seninf-hw.c  |  68 +++-
+ .../platform/mediatek/seninf/mtk-seninf.h     |  40 ++-
+ 3 files changed, 333 insertions(+), 79 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/seninf/mtk-seninf-drv.c b/drivers/media/platform/mediatek/seninf/mtk-seninf-drv.c
+index d72b32c6c8e6..f4028f964750 100644
+--- a/drivers/media/platform/mediatek/seninf/mtk-seninf-drv.c
++++ b/drivers/media/platform/mediatek/seninf/mtk-seninf-drv.c
+@@ -29,6 +29,8 @@
+ 
+ #define SENINF_SOURCE_PORT(n)		((n) + SENINF_NUM_PORTS)
+ 
++static struct platform_driver mtk_seninf_driver;
++
+ #define SENINF_DEF_WIDTH		1920
+ #define SENINF_DEF_HEIGHT		1080
+ #define SENINF_MIN_SIZE			16
+@@ -60,6 +62,16 @@ static const struct {
+ 	[4] = { true, false, 0x20 },
+ };
+ 
++/*
++ * RAW engines by mediatek,raw-id: the cam mux of the engine's first input,
++ * 34 + 2 * id. The one after it is the engine's second exposure input and
++ * is not used with one exposure.
++ */
++static const u8 seninf_raw_cam_mux[] = {
++	[0] = 0x22,	/* RAW-A */
++	[1] = 0x24,	/* RAW-B */
++};
++
+ static const char * const seninf_clk_names[SENINF_NUM_CLKS] = {
+ 	/* order of mtk_cam-seninf-def.h: seninf, cam, camtg gates */
+ 	"seninf", "cam", "camtg",
+@@ -146,11 +158,21 @@ static const struct v4l2_mbus_framefmt seninf_default_fmt = {
+ 	.xfer_func = V4L2_XFER_FUNC_NONE,
+ };
+ 
++/* all pads of a port carry the same format */
++static void seninf_state_set_format(struct v4l2_subdev *sd,
++				    struct v4l2_subdev_state *state,
++				    const struct v4l2_mbus_framefmt *fmt)
++{
++	unsigned int i;
++
++	for (i = 0; i < sd->entity.num_pads; i++)
++		*v4l2_subdev_state_get_format(state, i) = *fmt;
++}
++
+ static int seninf_init_state(struct v4l2_subdev *sd,
+ 			     struct v4l2_subdev_state *state)
+ {
+-	*v4l2_subdev_state_get_format(state, SENINF_PAD_SINK) = seninf_default_fmt;
+-	*v4l2_subdev_state_get_format(state, SENINF_PAD_SOURCE) = seninf_default_fmt;
++	seninf_state_set_format(sd, state, &seninf_default_fmt);
+ 	return 0;
+ }
+ 
+@@ -158,8 +180,8 @@ static int seninf_enum_mbus_code(struct v4l2_subdev *sd,
+ 				 struct v4l2_subdev_state *state,
+ 				 struct v4l2_subdev_mbus_code_enum *code)
+ {
+-	if (code->pad == SENINF_PAD_SOURCE) {
+-		/* the source pad follows the sink pad */
++	if (code->pad != SENINF_PAD_SINK) {
++		/* the source pads follow the sink pad */
+ 		if (code->index)
+ 			return -EINVAL;
+ 		code->code = v4l2_subdev_state_get_format(state,
+@@ -179,13 +201,12 @@ static int seninf_set_fmt(struct v4l2_subdev *sd,
+ {
+ 	struct mtk_seninf_port *port = sd_to_port(sd);
+ 	const struct mtk_seninf_format *f;
+-	struct v4l2_mbus_framefmt *sink;
+ 
+ 	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE && port->streaming)
+ 		return -EBUSY;
+ 
+-	/* the source pad format is the sink pad format */
+-	if (fmt->pad == SENINF_PAD_SOURCE)
++	/* the format of the source pads is the sink pad format */
++	if (fmt->pad != SENINF_PAD_SINK)
+ 		return v4l2_subdev_get_fmt(sd, state, fmt);
+ 
+ 	f = seninf_find_format(fmt->format.code);
+@@ -202,9 +223,7 @@ static int seninf_set_fmt(struct v4l2_subdev *sd,
+ 	if (fmt->format.colorspace == V4L2_COLORSPACE_DEFAULT)
+ 		fmt->format.colorspace = V4L2_COLORSPACE_RAW;
+ 
+-	sink = v4l2_subdev_state_get_format(state, SENINF_PAD_SINK);
+-	*sink = fmt->format;
+-	*v4l2_subdev_state_get_format(state, SENINF_PAD_SOURCE) = fmt->format;
++	seninf_state_set_format(sd, state, &fmt->format);
+ 	return 0;
+ }
+ 
+@@ -307,6 +326,49 @@ static int seninf_prepare_stream(struct mtk_seninf_port *port,
+ 	return 0;
+ }
+ 
++/*
++ * Take the route to @dest for a stream. Called with hw_lock held; the
++ * port counts as streaming from here until seninf_disable_streams() or
++ * the error path of seninf_enable_streams().
++ */
++static int seninf_claim_route(struct mtk_seninf_port *port, unsigned int dest)
++{
++	struct mtk_seninf *priv = port->priv;
++	const struct mtk_seninf_route *r = &port->dest_route[dest];
++	unsigned int i;
++
++	lockdep_assert_held(&priv->hw_lock);
++
++	if (port->streaming) {
++		dev_err(priv->dev, "csi%u: already streaming to cam mux 0x%x\n",
++			port->id, port->route.cam_mux);
++		return -EBUSY;
++	}
++
++	for (i = 0; i < SENINF_NUM_PORTS; i++) {
++		const struct mtk_seninf_port *other = &priv->ports[i];
++
++		if (!other->priv || !other->streaming)
++			continue;
++		if (other->route.cam_mux == r->cam_mux) {
++			dev_err(priv->dev,
++				"csi%u: cam mux 0x%x is in use by csi%u\n",
++				port->id, r->cam_mux, i);
++			return -EBUSY;
++		}
++		if (other->route.mux == r->mux ||
++		    other->route.mux_vr == r->mux_vr) {
++			dev_err(priv->dev, "csi%u: mux %u is in use by csi%u\n",
++				port->id, r->mux, i);
++			return -EBUSY;
++		}
++	}
++
++	port->route = *r;
++	port->streaming = true;
++	return 0;
++}
++
+ static int seninf_enable_streams(struct v4l2_subdev *sd,
+ 				 struct v4l2_subdev_state *state, u32 pad,
+ 				 u64 streams_mask)
+@@ -314,18 +376,33 @@ static int seninf_enable_streams(struct v4l2_subdev *sd,
+ 	struct mtk_seninf_port *port = sd_to_port(sd);
+ 	struct mtk_seninf *priv = port->priv;
+ 	struct media_pad *remote;
++	unsigned int dest;
+ 	int ret;
+ 
+ 	if (streams_mask != BIT_ULL(0))
+ 		return -EINVAL;
+ 
+-	ret = seninf_prepare_stream(port, state, &remote);
++	dest = pad == SENINF_PAD_SOURCE_RAW ? SENINF_DEST_RAW : SENINF_DEST_CAMSV;
++	if (pad == SENINF_PAD_SINK || !port->source_ep[dest])
++		return -EINVAL;
++
++	/*
++	 * One destination at a time, and no mux or cam mux that a running
++	 * port holds: said here, before the receiver and the sensor start.
++	 */
++	mutex_lock(&priv->hw_lock);
++	ret = seninf_claim_route(port, dest);
++	mutex_unlock(&priv->hw_lock);
+ 	if (ret)
+ 		return ret;
+ 
++	ret = seninf_prepare_stream(port, state, &remote);
++	if (ret)
++		goto err_claim;
++
+ 	ret = pm_runtime_resume_and_get(priv->dev);
+ 	if (ret)
+-		return ret;
++		goto err_claim;
+ 
+ 	ret = clk_prepare_enable(port->csi_clk);
+ 	if (ret)
+@@ -352,7 +429,6 @@ static int seninf_enable_streams(struct v4l2_subdev *sd,
+ 			goto err_hw;
+ 	}
+ 
+-	port->streaming = true;
+ 	v4l2_ctrl_grab(port->test_pattern, true);
+ 	return 0;
+ 
+@@ -364,6 +440,10 @@ static int seninf_enable_streams(struct v4l2_subdev *sd,
+ 	clk_disable_unprepare(port->csi_clk);
+ err_pm:
+ 	pm_runtime_put(priv->dev);
++err_claim:
++	mutex_lock(&priv->hw_lock);
++	port->streaming = false;
++	mutex_unlock(&priv->hw_lock);
+ 	return ret;
+ }
+ 
+@@ -393,7 +473,9 @@ static int seninf_disable_streams(struct v4l2_subdev *sd,
+ 	pm_runtime_put(priv->dev);
+ 
+ 	v4l2_ctrl_grab(port->test_pattern, false);
++	mutex_lock(&priv->hw_lock);
+ 	port->streaming = false;
++	mutex_unlock(&priv->hw_lock);
+ 	return 0;
+ }
+ 
+@@ -458,8 +540,12 @@ static int seninf_get_fwnode_pad(struct media_entity *entity,
+ 
+ 	if (port->sink_ep && endpoint->local_fwnode == port->sink_ep)
+ 		return SENINF_PAD_SINK;
+-	if (endpoint->local_fwnode == port->source_ep)
++	if (port->source_ep[SENINF_DEST_CAMSV] &&
++	    endpoint->local_fwnode == port->source_ep[SENINF_DEST_CAMSV])
+ 		return SENINF_PAD_SOURCE;
++	if (port->source_ep[SENINF_DEST_RAW] &&
++	    endpoint->local_fwnode == port->source_ep[SENINF_DEST_RAW])
++		return SENINF_PAD_SOURCE_RAW;
+ 	return -ENXIO;
+ }
+ 
+@@ -591,52 +677,94 @@ static int seninf_parse_sink(struct mtk_seninf_port *port)
+ 	return ret;
+ }
+ 
+-/* destination engine of the source endpoint -> static route */
++/* destination engines of the source endpoints -> static routes */
+ static int seninf_parse_source(struct mtk_seninf_port *port)
+ {
+ 	struct device *dev = port->priv->dev;
+-	struct fwnode_handle *camsv;
++	struct mtk_seninf_route *route;
++	struct fwnode_handle *engine;
+ 	u32 id;
+ 	int ret;
+ 
+-	camsv = fwnode_graph_get_remote_port_parent(port->source_ep);
+-	if (!camsv)
+-		return dev_err_probe(dev, -ENOTCONN, "csi%u: no CAMSV link\n",
+-				     port->id);
+-	ret = fwnode_property_read_u32(camsv, "mediatek,camsv-id", &id);
+-	fwnode_handle_put(camsv);
+-	if (ret || id >= ARRAY_SIZE(seninf_camsv) || !seninf_camsv[id].valid)
+-		return dev_err_probe(dev, -EINVAL,
+-				     "csi%u: unsupported CAMSV engine\n",
+-				     port->id);
+-
+-	ret = mtk_seninf_hw_route(port->id, seninf_camsv[id].sat,
+-				  seninf_camsv[id].cam_mux, SENINF_CAMSV_TAG,
+-				  &port->route);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "csi%u: no route to camsv-id %u\n",
+-				     port->id, id);
++	if (port->source_ep[SENINF_DEST_CAMSV]) {
++		route = &port->dest_route[SENINF_DEST_CAMSV];
++		engine = fwnode_graph_get_remote_port_parent(port->source_ep[SENINF_DEST_CAMSV]);
++		if (!engine)
++			return dev_err_probe(dev, -ENOTCONN,
++					     "csi%u: no CAMSV link\n", port->id);
++		ret = fwnode_property_read_u32(engine, "mediatek,camsv-id", &id);
++		fwnode_handle_put(engine);
++		if (ret || id >= ARRAY_SIZE(seninf_camsv) || !seninf_camsv[id].valid)
++			return dev_err_probe(dev, -EINVAL,
++					     "csi%u: unsupported CAMSV engine\n",
++					     port->id);
++
++		ret = mtk_seninf_hw_route(port->id,
++					  seninf_camsv[id].sat ?
++					  SENINF_TYPE_CAMSV_SAT :
++					  SENINF_TYPE_CAMSV_NORMAL,
++					  seninf_camsv[id].cam_mux,
++					  SENINF_CAMSV_TAG, route);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "csi%u: no route to camsv-id %u\n",
++					     port->id, id);
++		dev_dbg(dev, "csi%u: camsv: seninf %u mux %u vr 0x%x cam mux 0x%x\n",
++			port->id, route->seninf, route->mux, route->mux_vr,
++			route->cam_mux);
++	}
++
++	if (port->source_ep[SENINF_DEST_RAW]) {
++		route = &port->dest_route[SENINF_DEST_RAW];
++		engine = fwnode_graph_get_remote_port_parent(port->source_ep[SENINF_DEST_RAW]);
++		if (!engine)
++			return dev_err_probe(dev, -ENOTCONN,
++					     "csi%u: no RAW link\n", port->id);
++		ret = fwnode_property_read_u32(engine, "mediatek,raw-id", &id);
++		fwnode_handle_put(engine);
++		if (ret || id >= ARRAY_SIZE(seninf_raw_cam_mux))
++			return dev_err_probe(dev, -EINVAL,
++					     "csi%u: unsupported RAW engine\n",
++					     port->id);
++
++		ret = mtk_seninf_hw_route(port->id, SENINF_TYPE_RAW,
++					  seninf_raw_cam_mux[id], 0, route);
++		if (ret)
++			return dev_err_probe(dev, ret,
++					     "csi%u: no route to raw-id %u\n",
++					     port->id, id);
++		dev_dbg(dev, "csi%u: raw: seninf %u mux %u vr 0x%x cam mux 0x%x\n",
++			port->id, route->seninf, route->mux, route->mux_vr,
++			route->cam_mux);
++	}
+ 
+-	dev_dbg(dev, "csi%u: seninf %u mux %u vr 0x%x cam mux 0x%x\n",
+-		port->id, port->route.seninf, port->route.mux,
+-		port->route.mux_vr, port->route.cam_mux);
++	/* what the idle port reports */
++	port->route = port->dest_route[port->source_ep[SENINF_DEST_CAMSV] ?
++				       SENINF_DEST_CAMSV : SENINF_DEST_RAW];
+ 	return 0;
+ }
+ 
+-/* Two ports cannot share a mux or a cam mux. */
++/*
++ * Two ports cannot share a mux or a cam mux toward their CAMSV engines:
++ * those run side by side. A RAW engine may be listed by several ports, of
++ * which one at a time streams; seninf_claim_route() settles that.
++ */
+ static int seninf_check_routes(struct mtk_seninf *priv)
+ {
++	const struct mtk_seninf_route *a, *b;
+ 	unsigned int i, j;
+ 
+ 	for (i = 0; i < SENINF_NUM_PORTS; i++) {
+-		if (!priv->ports[i].priv)
++		if (!priv->ports[i].priv ||
++		    !priv->ports[i].source_ep[SENINF_DEST_CAMSV])
+ 			continue;
++		a = &priv->ports[i].dest_route[SENINF_DEST_CAMSV];
+ 		for (j = i + 1; j < SENINF_NUM_PORTS; j++) {
+-			if (!priv->ports[j].priv)
++			if (!priv->ports[j].priv ||
++			    !priv->ports[j].source_ep[SENINF_DEST_CAMSV])
+ 				continue;
+-			if (priv->ports[i].route.mux == priv->ports[j].route.mux ||
+-			    priv->ports[i].route.cam_mux ==
+-			    priv->ports[j].route.cam_mux)
++			b = &priv->ports[j].dest_route[SENINF_DEST_CAMSV];
++			if (a->mux == b->mux || a->cam_mux == b->cam_mux)
+ 				return dev_err_probe(priv->dev, -EINVAL,
+ 						     "csi%u and csi%u share a mux\n",
+ 						     i, j);
+@@ -645,6 +773,48 @@ static int seninf_check_routes(struct mtk_seninf *priv)
+ 	return 0;
+ }
+ 
++/**
++ * mtk_seninf_raw_source() - the sub-device that feeds a RAW engine
++ * @endpoint: the sensor interface's endpoint toward the RAW engine
++ * @pad: set to the source pad to enable streams on
++ *
++ * A RAW engine driver that has no media graph of its own asks for the CSI
++ * port by the endpoint its own endpoint is connected to. Returns NULL when
++ * the sensor interface is not probed or has no such destination.
++ */
++struct v4l2_subdev *mtk_seninf_raw_source(struct fwnode_handle *endpoint,
++					  unsigned int *pad)
++{
++	struct fwnode_handle *parent;
++	struct v4l2_subdev *sd = NULL;
++	struct mtk_seninf *priv;
++	struct device *dev;
++	unsigned int i;
++
++	parent = fwnode_graph_get_port_parent(endpoint);
++	if (!parent)
++		return NULL;
++	dev = bus_find_device_by_fwnode(&platform_bus_type, parent);
++	fwnode_handle_put(parent);
++	if (!dev)
++		return NULL;
++
++	priv = dev->driver == &mtk_seninf_driver.driver ?
++	       dev_get_drvdata(dev) : NULL;
++	for (i = 0; priv && i < SENINF_NUM_PORTS; i++) {
++		struct mtk_seninf_port *port = &priv->ports[i];
++
++		if (port->priv && port->source_ep[SENINF_DEST_RAW] == endpoint) {
++			sd = &port->sd;
++			*pad = SENINF_PAD_SOURCE_RAW;
++			break;
++		}
++	}
++	put_device(dev);
++	return sd;
++}
++EXPORT_SYMBOL_GPL(mtk_seninf_raw_source);
++
+ static int seninf_read_efuse(struct mtk_seninf_port *port)
+ {
+ 	struct device *dev = port->priv->dev;
+@@ -685,6 +855,7 @@ static int seninf_port_register(struct mtk_seninf_port *port)
+ 	struct device *dev = priv->dev;
+ 	struct v4l2_subdev *sd = &port->sd;
+ 	struct v4l2_async_connection *asc;
++	unsigned int i;
+ 	int ret;
+ 
+ 	v4l2_subdev_init(sd, &seninf_subdev_ops);
+@@ -710,16 +881,30 @@ static int seninf_port_register(struct mtk_seninf_port *port)
+ 	sd->entity.function = MEDIA_ENT_F_VID_IF_BRIDGE;
+ 	sd->entity.ops = &seninf_entity_ops;
+ 	port->pads[SENINF_PAD_SINK].flags = MEDIA_PAD_FL_SINK;
+-	port->pads[SENINF_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE |
+-					      MEDIA_PAD_FL_MUST_CONNECT;
+-	ret = media_entity_pads_init(&sd->entity, SENINF_NUM_PADS, port->pads);
++	/*
++	 * The RAW pad exists only on a port that has a RAW destination, so
++	 * the graph of a port without one stays as it was. With both, either
++	 * pad may be the unused one.
++	 */
++	port->pads[SENINF_PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
++	port->pads[SENINF_PAD_SOURCE_RAW].flags = MEDIA_PAD_FL_SOURCE;
++	if (!port->source_ep[SENINF_DEST_RAW])
++		port->pads[SENINF_PAD_SOURCE].flags |= MEDIA_PAD_FL_MUST_CONNECT;
++	ret = media_entity_pads_init(&sd->entity,
++				     port->source_ep[SENINF_DEST_RAW] ?
++				     SENINF_NUM_PADS : SENINF_PAD_SOURCE_RAW,
++				     port->pads);
+ 	if (ret)
+ 		goto err_ctrls;
+ 
+-	/* the CAMSV notifier matches this sub-device by its source endpoint */
+-	ret = v4l2_async_subdev_endpoint_add(sd, port->source_ep);
+-	if (ret)
+-		goto err_entity;
++	/* the engines' notifiers match this sub-device by its source endpoints */
++	for (i = 0; i < SENINF_NUM_DESTS; i++) {
++		if (!port->source_ep[i])
++			continue;
++		ret = v4l2_async_subdev_endpoint_add(sd, port->source_ep[i]);
++		if (ret)
++			goto err_entity;
++	}
+ 
+ 	ret = v4l2_subdev_init_finalize(sd);
+ 	if (ret)
+@@ -760,13 +945,15 @@ static int seninf_port_register(struct mtk_seninf_port *port)
+ 
+ static void seninf_put_endpoints(struct mtk_seninf *priv)
+ {
+-	unsigned int i;
++	unsigned int i, j;
+ 
+ 	for (i = 0; i < SENINF_NUM_PORTS; i++) {
+ 		fwnode_handle_put(priv->ports[i].sink_ep);
+-		fwnode_handle_put(priv->ports[i].source_ep);
+ 		priv->ports[i].sink_ep = NULL;
+-		priv->ports[i].source_ep = NULL;
++		for (j = 0; j < SENINF_NUM_DESTS; j++) {
++			fwnode_handle_put(priv->ports[i].source_ep[j]);
++			priv->ports[i].source_ep[j] = NULL;
++		}
+ 	}
+ }
+ 
+@@ -775,12 +962,17 @@ static int seninf_probe_port(struct mtk_seninf *priv, unsigned int id)
+ 	struct mtk_seninf_port *port = &priv->ports[id];
+ 	struct fwnode_handle *fwnode = dev_fwnode(priv->dev);
+ 	char name[8];
++	unsigned int i;
+ 	int ret;
+ 
+-	port->source_ep = fwnode_graph_get_endpoint_by_id(fwnode,
+-							  SENINF_SOURCE_PORT(id),
+-							  0, 0);
+-	if (!port->source_ep)
++	/* endpoint 0 of the output port: CAMSV engine, endpoint 1: RAW engine */
++	for (i = 0; i < SENINF_NUM_DESTS; i++)
++		port->source_ep[i] =
++			fwnode_graph_get_endpoint_by_id(fwnode,
++							SENINF_SOURCE_PORT(id),
++							i, 0);
++	if (!port->source_ep[SENINF_DEST_CAMSV] &&
++	    !port->source_ep[SENINF_DEST_RAW])
+ 		return 0;	/* port not used */
+ 
+ 	port->priv = priv;
+diff --git a/drivers/media/platform/mediatek/seninf/mtk-seninf-hw.c b/drivers/media/platform/mediatek/seninf/mtk-seninf-hw.c
+index a9dd677afd7d..c032704f305d 100644
+--- a/drivers/media/platform/mediatek/seninf/mtk-seninf-hw.c
++++ b/drivers/media/platform/mediatek/seninf/mtk-seninf-hw.c
+@@ -121,6 +121,8 @@ static void __iomem *cam_mux_gcsr(struct mtk_seninf *priv)
+ #define SENINF_SAT_CAM_MUX_FIRST	0x00
+ #define SENINF_SAT_CAM_MUX_LAST		0x0f
+ #define SENINF_NORMAL_CAM_MUX		0x20
++#define SENINF_RAW_CAM_MUX_FIRST	0x22
++#define SENINF_RAW_CAM_MUX_LAST		0x25
+ 
+ #define SENINF_SAT_MUX_FACTOR		8
+ #define SENINF_RAW_MUX_FACTOR		4
+@@ -157,8 +159,15 @@ static int seninf_tm_source(unsigned int mux)
+ 	}
+ }
+ 
+-int mtk_seninf_hw_route(unsigned int port, bool sat, u8 cam_mux_base,
+-			u8 tag, struct mtk_seninf_route *route)
++/*
++ * RAW mux per CSI port, one of the range each so that any two ports can
++ * feed two RAW engines at once. Same rule for the test model interface as
++ * for seninf_sat_mux[].
++ */
++static const u8 seninf_raw_mux[SENINF_NUM_PORTS] = { 6, 8, 7 };
++
++int mtk_seninf_hw_route(unsigned int port, enum mtk_seninf_dest_type type,
++			u8 cam_mux_base, u8 tag, struct mtk_seninf_route *route)
+ {
+ 	int tm;
+ 
+@@ -168,9 +177,23 @@ int mtk_seninf_hw_route(unsigned int port, bool sat, u8 cam_mux_base,
+ 	/* mtk_cam_seninf_init_port(): CSI_PORT_n -> SENINF_(2n + 1) */
+ 	route->seninf = port * 2;
+ 	route->tag = tag;
+-	route->sat = sat;
++	route->sat = type == SENINF_TYPE_CAMSV_SAT;
++	route->raw = type == SENINF_TYPE_RAW;
+ 
+-	if (sat) {
++	if (route->raw) {
++		route->mux = seninf_raw_mux[port];
++		/* VC offset 0: one virtual channel per port */
++		route->mux_vr = (route->mux - SENINF_RAW_MUX_FIRST) *
++				SENINF_RAW_MUX_FACTOR + SENINF_RAW_MUXVR_FIRST;
++		/* one cam mux per engine, no tags */
++		route->cam_mux = cam_mux_base;
++		route->tag = 0;
++		if (route->mux > SENINF_RAW_MUX_LAST ||
++		    route->mux_vr > SENINF_RAW_MUXVR_LAST ||
++		    route->cam_mux < SENINF_RAW_CAM_MUX_FIRST ||
++		    route->cam_mux > SENINF_RAW_CAM_MUX_LAST)
++			return -EINVAL;
++	} else if (route->sat) {
+ 		route->mux = seninf_sat_mux[port];
+ 		/* VC offset 0: one virtual channel per port */
+ 		route->mux_vr = (route->mux - SENINF_SAT_MUX_FIRST) *
+@@ -1030,8 +1053,12 @@ static void seninf_setup_mux(struct mtk_seninf_port *port, unsigned int src,
+ 	seninf_set_mux_ctrl(priv, r->mux, src, SENINF_PIXEL_MODE);
+ 	seninf_set_top_mux(priv, r->mux, seninf);
+ 
+-	/* mtk_cam_seninf_set_mux_vc_split_all(): SAT type, VC offset 0 */
+-	if (r->sat) {
++	/*
++	 * A tagged CAMSV mux and a RAW mux have several virtual outputs:
++	 * the virtual channel goes into the field of the output used
++	 * (offset 0), with the reference enable of the first channel.
++	 */
++	if (r->sat || r->raw) {
+ 		void __iomem *mux = seninf_mux(priv, r->mux);
+ 
+ 		SENINF_SET(mux, SENINF_MUX_VC_SEL0, RG_SENINF_MUX_B0_VC_SEL,
+@@ -1135,17 +1162,24 @@ static void seninf_cam_mux_program(struct mtk_seninf_port *port)
+ 	SENINF_SET(cm, SENINF_CAM_MUX_PCSR_OPT, RG_SENINF_CAM_MUX_PCSR_DT_SEL_EN,
+ 		   dt_en);
+ 
+-	/* mtk_cam_seninf_set_cammux_tag(), tags 0..31 */
+-	SENINF_SET(cm, SENINF_CAM_MUX_PCSR_OPT,
+-		   RG_SENINF_CAM_MUX_PCSR_TAG_VC_DT_PAGE_SEL, r->tag / 4);
+-	seninf_rmw(cm + SENINF_CAM_MUX_PCSR_TAG_VC_SEL,
+-		   SENINF_CAM_MUX_TAG_VC_SEL(sel) | SENINF_CAM_MUX_TAG_SEL_EN(sel),
+-		   field_prep(SENINF_CAM_MUX_TAG_VC_SEL(sel), cfg->vc) |
+-		   SENINF_CAM_MUX_TAG_SEL_EN(sel));
+-	seninf_rmw(cm + SENINF_CAM_MUX_PCSR_TAG_DT_SEL,
+-		   SENINF_CAM_MUX_TAG_DT_SEL(sel) | SENINF_CAM_MUX_TAG_SEL_EN(sel),
+-		   field_prep(SENINF_CAM_MUX_TAG_DT_SEL(sel), cfg->dt) |
+-		   SENINF_CAM_MUX_TAG_SEL_EN(sel));
++	/*
++	 * mtk_cam_seninf_set_cammux_tag(), tags 0..31. A RAW engine has no
++	 * tags: no tag page is written and the tag enables stay off.
++	 */
++	if (!r->raw) {
++		SENINF_SET(cm, SENINF_CAM_MUX_PCSR_OPT,
++			   RG_SENINF_CAM_MUX_PCSR_TAG_VC_DT_PAGE_SEL, r->tag / 4);
++		seninf_rmw(cm + SENINF_CAM_MUX_PCSR_TAG_VC_SEL,
++			   SENINF_CAM_MUX_TAG_VC_SEL(sel) |
++			   SENINF_CAM_MUX_TAG_SEL_EN(sel),
++			   field_prep(SENINF_CAM_MUX_TAG_VC_SEL(sel), cfg->vc) |
++			   SENINF_CAM_MUX_TAG_SEL_EN(sel));
++		seninf_rmw(cm + SENINF_CAM_MUX_PCSR_TAG_DT_SEL,
++			   SENINF_CAM_MUX_TAG_DT_SEL(sel) |
++			   SENINF_CAM_MUX_TAG_SEL_EN(sel),
++			   field_prep(SENINF_CAM_MUX_TAG_DT_SEL(sel), cfg->dt) |
++			   SENINF_CAM_MUX_TAG_SEL_EN(sel));
++	}
+ 
+ 	/* mtk_cam_seninf_set_cammux_src() (raw data: no YUV doubling) */
+ 	SENINF_SET(cm, SENINF_CAM_MUX_PCSR_CTRL, RG_SENINF_CAM_MUX_PCSR_SRC_SEL,
+diff --git a/drivers/media/platform/mediatek/seninf/mtk-seninf.h b/drivers/media/platform/mediatek/seninf/mtk-seninf.h
+index fb49b29c6579..912387a8b684 100644
+--- a/drivers/media/platform/mediatek/seninf/mtk-seninf.h
++++ b/drivers/media/platform/mediatek/seninf/mtk-seninf.h
+@@ -46,21 +46,41 @@
+ /* 8 pixels per clock, the GPL default and what the CAMSV driver uses */
+ #define SENINF_PIXEL_MODE		3
+ 
++/*
++ * A CSI port has one input and up to two destinations, of which one at a
++ * time streams: a CAMSV engine (Bayer to memory) and a RAW engine of the
++ * image signal processor.
++ */
+ enum mtk_seninf_pad {
+ 	SENINF_PAD_SINK,
+ 	SENINF_PAD_SOURCE,
++	SENINF_PAD_SOURCE_RAW,
+ 	SENINF_NUM_PADS,
+ };
+ 
++enum mtk_seninf_dest {
++	SENINF_DEST_CAMSV,
++	SENINF_DEST_RAW,
++	SENINF_NUM_DESTS,
++};
++
++/* kind of engine behind a cam mux, selects the mux group */
++enum mtk_seninf_dest_type {
++	SENINF_TYPE_CAMSV_SAT,
++	SENINF_TYPE_CAMSV_NORMAL,
++	SENINF_TYPE_RAW,
++};
++
+ /**
+  * struct mtk_seninf_route - static path of one CSI port
+  * @seninf: seninf interface index of the port (0 = SENINF_1)
+  * @tm_seninf: seninf interface that feeds @mux in test model mode
+  * @mux: seninf mux index (0 = SENINF_MUX1)
+  * @mux_vr: cam mux source selector ("virtual" mux) of @mux
+- * @cam_mux: cam mux index that feeds the CAMSV tag
++ * @cam_mux: cam mux index that feeds the engine (the CAMSV tag)
+  * @tag: CAMSV tag of the image
+  * @sat: the destination is a tagged ("SAT") CAMSV engine
++ * @raw: the destination is a RAW engine
+  */
+ struct mtk_seninf_route {
+ 	u8 seninf;
+@@ -70,6 +90,7 @@ struct mtk_seninf_route {
+ 	u8 cam_mux;
+ 	u8 tag;
+ 	bool sat;
++	bool raw;
+ };
+ 
+ /**
+@@ -107,7 +128,8 @@ struct mtk_seninf;
+  * @ctrls: control handler
+  * @test_pattern: V4L2_CID_TEST_PATTERN
+  * @sink_ep: endpoint toward the sensor, NULL when there is none
+- * @source_ep: endpoint toward the CAMSV engine
++ * @source_ep: endpoints toward the CAMSV and the RAW engine, NULL when the
++ *	port has no such destination
+  * @csi_clk: CSI receiver clock of the port's seninf pair
+  * @cphy: the bus is C-PHY
+  * @num_lanes: data lanes (D-PHY) or trios (C-PHY)
+@@ -115,7 +137,8 @@ struct mtk_seninf;
+  * @settle_ns: fixed C-PHY settle times, one per @link_freqs entry
+  * @num_link_freqs: number of entries of @link_freqs and @settle_ns
+  * @efuse: CSI PHY calibration word, 0 if there is none
+- * @route: static route toward the CAMSV engine
++ * @dest_route: static route toward each destination
++ * @route: route of the running stream, of the first destination while idle
+  * @sensor: bound sensor sub-device
+  * @streaming: the port is streaming
+  * @cfg: parameters of the running stream
+@@ -131,7 +154,7 @@ struct mtk_seninf_port {
+ 	struct v4l2_ctrl *test_pattern;
+ 
+ 	struct fwnode_handle *sink_ep;
+-	struct fwnode_handle *source_ep;
++	struct fwnode_handle *source_ep[SENINF_NUM_DESTS];
+ 	struct clk *csi_clk;
+ 
+ 	bool cphy;
+@@ -141,6 +164,7 @@ struct mtk_seninf_port {
+ 	unsigned int num_link_freqs;
+ 	u32 efuse;
+ 
++	struct mtk_seninf_route dest_route[SENINF_NUM_DESTS];
+ 	struct mtk_seninf_route route;
+ 	struct v4l2_subdev *sensor;
+ 	bool streaming;
+@@ -169,11 +193,15 @@ struct mtk_seninf {
+ 
+ /* mtk-seninf-hw.c, all called with @hw_lock held */
+ bool mtk_seninf_hw_efuse_valid(u32 efuse, unsigned int port);
+-int mtk_seninf_hw_route(unsigned int port, bool sat, u8 cam_mux_base,
+-			u8 tag, struct mtk_seninf_route *route);
++int mtk_seninf_hw_route(unsigned int port, enum mtk_seninf_dest_type type,
++			u8 cam_mux_base, u8 tag, struct mtk_seninf_route *route);
+ void mtk_seninf_hw_init(struct mtk_seninf *priv);
+ int mtk_seninf_hw_start(struct mtk_seninf_port *port);
+ void mtk_seninf_hw_stop(struct mtk_seninf_port *port);
+ void mtk_seninf_hw_dump(struct mtk_seninf_port *port);
+ 
++/* for the driver of a RAW engine, which is not part of the media graph */
++struct v4l2_subdev *mtk_seninf_raw_source(struct fwnode_handle *endpoint,
++					  unsigned int *pad);
++
+ #endif /* _MTK_SENINF_H */
+-- 
+2.56.1
+

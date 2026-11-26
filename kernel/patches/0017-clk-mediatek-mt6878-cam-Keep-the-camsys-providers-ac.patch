@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:02:25 +0300
+Subject: [PATCH 17/19] clk: mediatek: mt6878-cam: Keep the camsys providers
+ active through system sleep
+
+At every system resume the CAM_MAIN power domain failed to come back
+("cam-main: power on failed: -13"): genpd powers the camera SMI domain
+back on in resume_noirq, SCPSYS prepares the domain's camsys clocks, and
+the clock framework resumes their provider device through runtime PM,
+which refuses a device that is not active between the late suspend and
+the early resume. The provider devices power and clock nothing through
+their runtime state, so .prepare now takes a runtime PM reference while
+runtime PM still works and .complete drops it again.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/clk/mediatek/clk-mt6878-cam.c | 45 +++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/drivers/clk/mediatek/clk-mt6878-cam.c b/drivers/clk/mediatek/clk-mt6878-cam.c
+index 6640a624d5f5..d1051c704ce2 100644
+--- a/drivers/clk/mediatek/clk-mt6878-cam.c
++++ b/drivers/clk/mediatek/clk-mt6878-cam.c
+@@ -9,6 +9,7 @@
+ #include <linux/module.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
+ 
+ #include "clk-gate.h"
+ #include "clk-mtk.h"
+@@ -304,12 +305,56 @@ static const struct of_device_id of_match_clk_mt6878_cam[] = {
+ };
+ MODULE_DEVICE_TABLE(of, of_match_clk_mt6878_cam);
+ 
++/*
++ * The camsys gates are clocks of the CAM power domains (cam-main, cam-suba,
++ * cam-subb, cam-vcore, ...), which the SCPSYS power domain driver prepares
++ * and enables when it switches such a domain on, also in the noirq phase of
++ * a system resume (genpd powers the domain of a device back on there).
++ * Preparing a clock resumes its provider device through runtime PM, which
++ * is disabled from the late suspend to the early resume phase and then
++ * refuses (-EACCES) a device whose state and saved state are not both
++ * active: "cam-main: power on failed: -13".
++ *
++ * The provider devices have no power domain of their own and no runtime
++ * PM callbacks: an active runtime state powers or clocks nothing. So take
++ * a runtime PM reference on each in .prepare, while runtime PM still works,
++ * and drop it in .complete, which also runs for an aborted sleep. Their
++ * runtime state is then active, and saved as active, through the late and
++ * noirq phases. The CAM domains are not touched by this; they stay under
++ * SCPSYS, the gates under the clock framework.
++ */
++static int clk_mt6878_cam_pm_prepare(struct device *dev)
++{
++	int ret = pm_runtime_get_sync(dev);
++
++	if (ret < 0)
++		dev_warn(dev, "not held active for the system sleep: %d\n", ret);
++	else
++		dev_dbg(dev, "held active for the system sleep (usage %d)\n",
++			atomic_read(&dev->power.usage_count));
++	/* the reference is dropped in .complete either way */
++	return 0;
++}
++
++static void clk_mt6878_cam_pm_complete(struct device *dev)
++{
++	pm_runtime_put(dev);
++	dev_dbg(dev, "released after the system sleep (usage %d)\n",
++		atomic_read(&dev->power.usage_count));
++}
++
++static const struct dev_pm_ops clk_mt6878_cam_pm_ops = {
++	.prepare = clk_mt6878_cam_pm_prepare,
++	.complete = clk_mt6878_cam_pm_complete,
++};
++
+ static struct platform_driver clk_mt6878_cam_drv = {
+ 	.probe = mtk_clk_simple_probe,
+ 	.remove = mtk_clk_simple_remove,
+ 	.driver = {
+ 		.name = "clk-mt6878-cam",
+ 		.of_match_table = of_match_clk_mt6878_cam,
++		.pm = pm_sleep_ptr(&clk_mt6878_cam_pm_ops),
+ 	},
+ };
+ module_platform_driver(clk_mt6878_cam_drv);
+-- 
+2.56.1
+

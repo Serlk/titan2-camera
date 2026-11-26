@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 18:23:01 +0300
-Subject: [PATCH 12/12] arm64: dts: mediatek: mt6878-titan2: Add the three
+Subject: [PATCH 12/19] arm64: dts: mediatek: mt6878-titan2: Add the three
  cameras
 
 mt6878-unihertz-titan2-cameras.dtsi, included by -all: the IMX766 main,
@@ -20,13 +20,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  arch/arm64/boot/dts/mediatek/Makefile         |   1 +
  .../mt6878-unihertz-titan2-all-iommu.dts      |  17 +
- .../mediatek/mt6878-unihertz-titan2-all.dts   |  11 +-
+ .../mediatek/mt6878-unihertz-titan2-all.dts   |   5 +-
  ...-unihertz-titan2-camera-graph.dtsi.example | 121 ++++
  .../mt6878-unihertz-titan2-cameras.dtsi       | 539 ++++++++++++++++++
  ...t6878-unihertz-titan2-cameras.dtsi.example | 258 +++++++++
  ...-unihertz-titan2-iommu-camera.dtsi.example |  62 ++
  .../mediatek/mt6878-unihertz-titan2-jpeg.dts  |   4 +
- 8 files changed, 1010 insertions(+), 3 deletions(-)
+ 8 files changed, 1006 insertions(+), 1 deletion(-)
  create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all-iommu.dts
  create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-camera-graph.dtsi.example
  create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi
@@ -34,7 +34,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-iommu-camera.dtsi.example
 
 diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
-index f14bdbb56829..60534fd4a8e2 100644
+index 4d5a431e155e..9d958f4436c1 100644
 --- a/arch/arm64/boot/dts/mediatek/Makefile
 +++ b/arch/arm64/boot/dts/mediatek/Makefile
 @@ -10,6 +10,7 @@ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-nothing-tetris.dtb
@@ -42,9 +42,9 @@ index f14bdbb56829..60534fd4a8e2 100644
  dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-all.dtb
  dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-all-fb.dtb
 +dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-all-iommu.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-all-ovl34.dtb
  dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-audio.dtb
  dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-drm.dtb
- dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-dvfs.dtb
 diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all-iommu.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all-iommu.dts
 new file mode 100644
 index 000000000000..84ca701065e1
@@ -69,7 +69,7 @@ index 000000000000..84ca701065e1
 +#include "mt6878-unihertz-titan2-all.dts"
 +#include "mt6878-unihertz-titan2-iommu-disp.dtsi"
 diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts
-index b5b5fb8f5567..cae6ff13c6fa 100644
+index d55ef17c67a0..6da4fa48830a 100644
 --- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts
 +++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts
 @@ -3,7 +3,9 @@
@@ -82,23 +82,15 @@ index b5b5fb8f5567..cae6ff13c6fa 100644
 + * (mt6878-unihertz-titan2-cameras.dtsi), with the factory device tree
   * battery limits (2.05 A, CV 4.45 V).
   *
-  * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
-@@ -12,10 +14,13 @@
- #include "mt6878-unihertz-titan2-drm.dtsi"
- /*
-  * The display behind the multimedia IOMMU (OVL0 iommus) is not included
-- * yet: it works as the only IOMMU master, but together with other masters
-- * on the same M4U the screen showed stale memory.
-+ * yet: it works as the only IOMMU master, but together with the camera
-+ * ports on the same M4U the screen showed stale memory (the boot loader
-+ * frame buffer, no IOMMU fault). The test board -all-iommu adds it back
-+ * for the bisection.
-  * #include "mt6878-unihertz-titan2-iommu-disp.dtsi"
+  * System sleep as the daily default: the MCUPM and SSPM kernel side
+@@ -30,6 +32,7 @@
+  * turns their translation on, and mtk-mmsys runs it (below).
   */
+ #include "mt6878-unihertz-titan2-iommu-disp.dtsi"
 +#include "mt6878-unihertz-titan2-cameras.dtsi"
  
- &i2c5 {
- 	pmic@34 {
+ /*
+  * The M4U's secure bank 4 holds the DISP_VA program's code fetch: set up
 diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-camera-graph.dtsi.example b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-camera-graph.dtsi.example
 new file mode 100644
 index 000000000000..4cf6250935c1
@@ -1119,5 +1111,5 @@ index 2b03f6e469f7..c6caa8422b44 100644
   *
   * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
 -- 
-2.56.0
+2.56.1
 

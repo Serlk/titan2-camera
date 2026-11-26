@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:02:24 +0300
+Subject: [PATCH 13/19] dt-bindings: media: mediatek,mt6878-seninf: Describe
+ the RAW engine endpoint
+
+An output port may carry a second endpoint (endpoint 1) toward a RAW
+engine node next to its CAMSV engine.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/mediatek,mt6878-seninf.yaml         | 26 ++++++++++++++++---
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/media/mediatek,mt6878-seninf.yaml b/Documentation/devicetree/bindings/media/mediatek,mt6878-seninf.yaml
+index 6693dd030648..3242ed6013ac 100644
+--- a/Documentation/devicetree/bindings/media/mediatek,mt6878-seninf.yaml
++++ b/Documentation/devicetree/bindings/media/mediatek,mt6878-seninf.yaml
+@@ -82,8 +82,12 @@ properties:
+ 
+     description:
+       Ports 0 to 2 are the CSI ports 0 to 2. Port 3 + n is the output of
+-      CSI port n toward a CAMSV engine; a CSI port is used when its
+-      output port is connected.
++      CSI port n; a CSI port is used when its output port is connected.
++      An output port has up to two destinations, of which one at a time
++      streams: endpoint 0 goes to a CAMSV engine (a node with
++      mediatek,camsv-id), endpoint 1 to a RAW engine of the image signal
++      processor (a node with mediatek,raw-id, 0 for RAW-A and 1 for
++      RAW-B). Several CSI ports may name the same RAW engine.
+ 
+     patternProperties:
+       "^port@[0-2]$":
+@@ -127,8 +131,22 @@ properties:
+               mediatek,cphy-settle-ns: [ link-frequencies ]
+ 
+       "^port@[3-5]$":
+-        $ref: /schemas/graph.yaml#/properties/port
+-        description: Output of CSI port (n - 3), connected to a CAMSV engine.
++        $ref: /schemas/graph.yaml#/$defs/port-base
++        unevaluatedProperties: false
++        description: Output of CSI port (n - 3).
++
++        properties:
++          endpoint:
++            $ref: /schemas/graph.yaml#/properties/endpoint
++            description: Link to a CAMSV engine (same as endpoint@0).
++
++          endpoint@0:
++            $ref: /schemas/graph.yaml#/properties/endpoint
++            description: Link to a CAMSV engine.
++
++          endpoint@1:
++            $ref: /schemas/graph.yaml#/properties/endpoint
++            description: Link to a RAW engine.
+ 
+ required:
+   - compatible
+-- 
+2.56.1
+

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 18:22:58 +0300
-Subject: [PATCH 11/12] arm64: dts: mediatek: mt6878: Add disabled seninf and
+Subject: [PATCH 11/19] arm64: dts: mediatek: mt6878: Add disabled seninf and
  CAMSV nodes
 
 Describe the sensor interface with its register windows, interrupts,
@@ -23,10 +23,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 180 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/mediatek/mt6878.dtsi b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
-index f62bab2a8d94..64c4cd889a28 100644
+index 07dec46e1c46..51062cfa3827 100644
 --- a/arch/arm64/boot/dts/mediatek/mt6878.dtsi
 +++ b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
-@@ -1483,6 +1483,78 @@ smi_sub_common_cam1: smi@1a006000 {
+@@ -1520,6 +1520,78 @@ smi_sub_common_cam1: smi@1a006000 {
  			status = "disabled";
  		};
  
@@ -105,7 +105,7 @@ index f62bab2a8d94..64c4cd889a28 100644
  		larb16: smi@1a026000 {
  			compatible = "mediatek,mt6878-smi-larb";
  			reg = <0x1a026000 0x1000>;
-@@ -1575,6 +1647,114 @@ camsys_yuvb: clock-controller@1a0af000 {
+@@ -1612,6 +1684,114 @@ camsys_yuvb: clock-controller@1a0af000 {
  			status = "disabled";
  		};
  
@@ -221,5 +221,5 @@ index f62bab2a8d94..64c4cd889a28 100644
  			compatible = "mediatek,mt6878-camsys-mraw", "syscon";
  			reg = <0x1a170000 0x1000>;
 -- 
-2.56.0
+2.56.1
 

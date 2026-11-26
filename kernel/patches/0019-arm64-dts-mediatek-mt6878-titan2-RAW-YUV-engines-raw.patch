@@ -1,0 +1,538 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:02:44 +0300
+Subject: [PATCH 19/19] arm64: dts: mediatek: mt6878-titan2: RAW/YUV engines,
+ -raw, -jpeg and -vcp test boards
+
+- mt6878.dtsi: RAW-A/YUV-A and RAW-B/YUV-B engine nodes, disabled.
+- -raw: -all plus larbs 16/17 and 33/34, the engines with RAW-B as the
+  second engine of RAW-A, and RAW-A as the second destination of the main
+  camera's CSI port. Needs the request dumps camraw-start.bin and
+  camraw-frame.bin. A one-shot test board.
+- -jpeg: -all plus the JPEG encoder behind the M4U (variant B).
+- -vcp, -vcp-iommu: -all plus the VCP node, with vcp-support so that the
+  boot loader loads the VCP firmware; -vcp-iommu puts the VCP behind the
+  M4U.
+- -all-iommu is now the same as -all (the display is behind the M4U on
+  -all), kept for boot scripts.
+- -cameras.dtsi: the MT6319 comment says "downstream kernel".
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/boot/dts/mediatek/Makefile         |   3 +
+ .../mt6878-unihertz-titan2-all-iommu.dts      |  15 +--
+ .../mt6878-unihertz-titan2-cameras.dtsi       |   2 +-
+ ...78-unihertz-titan2-iommu-jpeg.dtsi.example |  10 +-
+ .../mediatek/mt6878-unihertz-titan2-jpeg.dts  |  45 +++----
+ .../mediatek/mt6878-unihertz-titan2-raw.dts   |  70 ++++++++++
+ .../mt6878-unihertz-titan2-vcp-iommu.dts      |  35 +++++
+ .../mediatek/mt6878-unihertz-titan2-vcp.dts   |  30 +++++
+ .../mediatek/mt6878-unihertz-titan2-vcp.dtsi  |  27 ++--
+ arch/arm64/boot/dts/mediatek/mt6878.dtsi      | 126 ++++++++++++++++++
+ 10 files changed, 318 insertions(+), 45 deletions(-)
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-raw.dts
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp-iommu.dts
+ create mode 100644 arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp.dts
+
+diff --git a/arch/arm64/boot/dts/mediatek/Makefile b/arch/arm64/boot/dts/mediatek/Makefile
+index 9d958f4436c1..cd60dde6cb0f 100644
+--- a/arch/arm64/boot/dts/mediatek/Makefile
++++ b/arch/arm64/boot/dts/mediatek/Makefile
+@@ -24,6 +24,9 @@ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-wifi.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-sleep.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-sleep-disp.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-sleep-disp-iommu.dtb
++dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-raw.dtb
++dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-vcp.dtb
++dtb-$(CONFIG_ARCH_MEDIATEK) += mt6878-unihertz-titan2-vcp-iommu.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt7622-rfb1.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt7622-bananapi-bpi-r64.dtb
+ dtb-$(CONFIG_ARCH_MEDIATEK) += mt7981b-cudy-wr3000-v1.dtb
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all-iommu.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all-iommu.dts
+index 84ca701065e1..b91b98070c3b 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all-iommu.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all-iommu.dts
+@@ -1,17 +1,14 @@
+ // SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+ /*
+  * Titan 2: TEST board, -all plus the display behind the M4U
+- * (mt6878-unihertz-titan2-iommu-disp.dtsi), which -all leaves out for now:
+- * with the cameras on the same M4U the screen showed the boot loader
+- * picture instead of the compositor's buffers (no IOMMU fault, with and
+- * without mtk_iommu.hyp_smc). For the bisection: kernel parameters
+- * mtk_iommu.resv_boot_fb=1 (IOVA window of the boot frame buffer kept out of
+- * the allocator), the walk_iova debug parameter, and the camera modules
+- * blacklisted to run the display alone on the same DTB.
++ * (mt6878-unihertz-titan2-iommu-disp.dtsi), for the bisection of
++ * "display + cameras".
+  *
+- * If the screen shows the boot loader picture or stays dark, boot -all.
++ * The -all board now includes iommu-disp.dtsi itself, together
++ * with the DISP_VA chain that this board lacked (the reason its screen
++ * stayed dark: the OVL ports stayed in bypass), so this board is the same
++ * as -all. It stays for the boot scripts and may be removed later.
+  *
+  * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+  */
+ #include "mt6878-unihertz-titan2-all.dts"
+-#include "mt6878-unihertz-titan2-iommu-disp.dtsi"
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi
+index fb4bdcae3832..4ecec599b3a8 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi
+@@ -66,7 +66,7 @@
+ /* VMM rail, CAM/ISP power domains, clock controllers                  */
+ 
+ /*
+- * The MT6319 as the factory kernel uses it: vbuck1 is the camera/ISP vcore,
++ * The MT6319 as the downstream kernel uses it: vbuck1 is the camera/ISP vcore,
+  * switched with the camera power domains; vbuck2 (GPU) and vbuck4 (SoC
+  * vcore) stay always on and untouched, as in the base board file. vbuck1 is
+  * held at the top camera/ISP operating point of the downstream mmdvfs tables
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-iommu-jpeg.dtsi.example b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-iommu-jpeg.dtsi.example
+index 0f8a2d0959a9..1c158465a56d 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-iommu-jpeg.dtsi.example
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-iommu-jpeg.dtsi.example
+@@ -1,10 +1,12 @@
+ // SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+ /*
+- * Titan 2: the JPEG encoder through the MM IOMMU. EXAMPLE, not built,
+- * untested.
++ * Titan 2: the JPEG encoder through the MM IOMMU. EXAMPLE, kept for the
++ * open questions that refer to it; the built board is
++ * mt6878-unihertz-titan2-jpeg.dts (the same nodes on top of -all, which
++ * runs the M4U for the cameras).
+  *
+- * Include it at the end of a copy of mt6878-unihertz-titan2-iommu.dts
+- * (which enables the smi-common, larb0 and the M4U). It enables vencsys
++ * Include it at the end of a copy of a board that enables the smi-common
++ * and the M4U (-all does, for the camera larbs). It enables vencsys
+  * and larb7 and gives the encoder its four larb7 ports, as in the factory
+  * device tree (iommus 0xe5, 0xe6, 0xe7, 0xe9 = larb 7, ports 5, 6, 7, 9).
+  *
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-jpeg.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-jpeg.dts
+index c6caa8422b44..1d090710ddf0 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-jpeg.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-jpeg.dts
+@@ -1,27 +1,26 @@
+ // SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+ /*
+- * Titan 2: JPEG encoder bring-up without the IOMMU. Same as -all, plus the
+- * vencsys clocks, the smi-common, larb7 and the JPEG encoder.
++ * Titan 2: JPEG encoder through the MM IOMMU ("variant B"). Same as -all,
++ * plus the
++ * vencsys clocks, larb7 and the JPEG encoder with its four larb7 ports
++ * (5 Y RDMA, 6 C RDMA, 7 Q table, 9 BSDMA), as in the factory device tree.
+  *
+- * The encoder reads and writes physical addresses: its buffers come from
+- * CMA below 4 GiB (32-bit DMA mask of the driver) and its four larb7 ports
+- * (5, 6, 7, 9) must be in bypass. No IOMMU binds larb7, so the SMI driver
+- * leaves MMU_EN as it is after VEN0 power-on (assumed clear, not checked)
+- * and only switches the larb clocks.
++ * -all already runs the M4U (smi_common, m4u) for the three camera larbs
++ * (13, 14, 29), so the same path is used here: the M4U binds larb7 and
++ * links the encoder to it, a runtime resume of the encoder resumes larb7
++ * (clocks, MMU_EN on the four ports) and the smi-common, with no sysfs
++ * step. The buffers are IOVAs of the 0 ~ 4G region (32-bit DMA mask of the
++ * driver, BANK_SEL 0), not CMA, so dma-buf frames from the cameras or the
++ * GPU can be imported for MJPEG recording.
+  *
+- * Nothing links the encoder to larb7 without the IOMMU: keep larb7
+- * resumed by hand during the test, else the encoder's requests stall in
+- * the unclocked larb and the frame times out after one second:
+- *   echo on > /sys/bus/platform/devices/17010000.smi/power/control
+- * The SMI common is runtime resumed through larb7 and then writes its
+- * init values and bus selection while the display is running, as with
+- * the -iommu DTB.
++ * Variant A (physical addresses, larb7 ports in bypass, larb7 kept resumed
++ * by hand) was the first version of this file (see its history); it is
++ * not kept as a board since the M4U
++ * path of the camera larbs is proven in -all.
+  *
+- * With the cameras (titan2-camera) -all has the M4U, and larb7 enabled
+- * here is bound to it too; without iommus on the encoder its ports keep
+- * MMU_EN clear and the physical addressing above still applies.
+- *
+- * If the encoder times out or the bus hangs, boot the -all DTB again.
++ * If the frame times out, the log shows M4U translation faults on ports
++ * 5/6/7/9 (the larb of a fault is reported as invalid on MT6878) or the
++ * bus hangs, boot the -all DTB again.
+  *
+  * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+  */
+@@ -31,14 +30,14 @@ &vencsys {
+ 	status = "okay";
+ };
+ 
+-&smi_common {
+-	status = "okay";
+-};
+-
+ &larb7 {
+ 	status = "okay";
+ };
+ 
+ &jpgenc {
++	iommus = <&m4u M4U_L7_P5_JPGENC_Y_RDMA>,
++		 <&m4u M4U_L7_P6_JPGENC_C_RDMA>,
++		 <&m4u M4U_L7_P7_JPGENC_Q_RDMA>,
++		 <&m4u M4U_L7_P9_JPGENC_BSDMA>;
+ 	status = "okay";
+ };
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-raw.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-raw.dts
+new file mode 100644
+index 000000000000..9c575e3cdef5
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-raw.dts
+@@ -0,0 +1,70 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
++/*
++ * Titan 2: TEST board, -all plus the RAW and YUV engines of the image
++ * signal processor for the replay of captured command queues
++ * (the mtk-camraw-mt6878 driver): larbs 16/17 (side A) and 33/34 (side B) behind
++ * the M4U, the engine nodes of both sides with RAW-B as the second engine
++ * of RAW-A, and a second destination of CSI port 2 (the main IMX766
++ * camera) toward RAW-A next to its CAMSV engine.
++ *
++ * The CSI port of the main camera has three pads on this board; its media
++ * device is otherwise the one of -all, and the sensor mode is set there.
++ * The RAW video node is outside the media graph. Nothing is powered or
++ * written until that node streams, and it needs the request dumps
++ * /lib/firmware/titan2/camraw-start.bin and camraw-frame.bin. Side B is
++ * powered only with the module parameter twin=1.
++ *
++ * Boot it as a one-shot entry, -all afterwards.
++ *
++ * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
++ */
++#include "mt6878-unihertz-titan2-all.dts"
++
++&larb16 {
++	status = "okay";
++};
++
++&larb17 {
++	status = "okay";
++};
++
++&larb33 {
++	status = "okay";
++};
++
++&larb34 {
++	status = "okay";
++};
++
++&cam_yuv_a {
++	status = "okay";
++};
++
++&cam_yuv_b {
++	status = "okay";
++};
++
++&cam_raw_b {
++	status = "okay";
++};
++
++&cam_raw_a {
++	status = "okay";
++	mediatek,twin = <&cam_raw_b>;
++
++	port {
++		cam_raw_a_in: endpoint {
++			remote-endpoint = <&seninf_csi2_raw>;
++		};
++	};
++};
++
++&seninf_port5 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	seninf_csi2_raw: endpoint@1 {
++		reg = <1>;
++		remote-endpoint = <&cam_raw_a_in>;
++	};
++};
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp-iommu.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp-iommu.dts
+new file mode 100644
+index 000000000000..cb2f139da7a1
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp-iommu.dts
+@@ -0,0 +1,35 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
++/*
++ * Titan 2: TEST board, -vcp with the VCP and its DMA helper nodes behind
++ * the MM IOMMU (mt6878-unihertz-titan2-iommu-vcp.dtsi.example, inlined):
++ * the larb-less master M4U_L41_VIDEO_UP gets the VDO_UP window of the
++ * factory layout (0x1_1000_0000 + 1.5 GiB), the VCP driver sets a 34-bit
++ * DMA mask when the device is IOMMU mapped, and the shared memory handed
++ * to the VCP is an IOVA (bits 35..32 packed into bits 3..0).
++ *
++ * The M4U (smi_common, m4u) is enabled by -all for the cameras. Open: what
++ * enables translation for the larb-less VCP port (the downstream driver
++ * maps vcp_cfgreg_mmu but never writes it). Boot it only after -vcp: if -vcp gets "VCP ready" the port is
++ * in bypass and this board is expected to fail with a dead VCP (no READY,
++ * PC stuck) or an IOMMU fault on larb 41; if -vcp fails and this one gets
++ * READY, the port translates. Either way, boot -all afterwards.
++ *
++ * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
++ */
++#include "mt6878-unihertz-titan2-vcp.dts"
++
++&{/vcp@1ea00000} {
++	iommus = <&m4u M4U_L41_VIDEO_UP>;
++};
++
++&{/vcp-iommu-vdec} {
++	iommus = <&m4u M4U_L41_VIDEO_UP>;
++};
++
++&{/vcp-iommu-venc} {
++	iommus = <&m4u M4U_L41_VIDEO_UP>;
++};
++
++&{/vcp-iommu-work} {
++	iommus = <&m4u M4U_L41_VIDEO_UP>;
++};
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp.dts
+new file mode 100644
+index 000000000000..7f593756098b
+--- /dev/null
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp.dts
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
++/*
++ * Titan 2: TEST board, -all plus the VCP (video companion processor, the
++ * RV55 that runs the video codec firmware) as described in the factory
++ * device tree, with vcp-support = <1>: the boot loader then loads the VCP
++ * firmware from the vcp_<slot> partition into me_vcp_reserved and the
++ * ported host driver (drivers/soc/mediatek/vcp) can power the
++ * VCP, hand it the shared memory and release it from reset.
++ *
++ * Stage 1 ("VCP starts and sends READY"): the
++ * shared memory is plain DMA memory below 4 GiB and the VCP node has no
++ * iommus, so the VCP must read it through its DRAM port in bypass (an
++ * assumption this board tests). The -vcp-iommu board is the same path
++ * through the MM IOMMU.
++ *
++ * Nothing starts the VCP at boot: the driver powers it only when a user
++ * registers a feature (modprobe mtk-vcp boot_test=1, or
++ * echo 1 > /sys/bus/platform/devices/vcp@1ea00000/vcp_rtos).
++ *
++ * Risk: the boot loader reads vcp-sram-size, vcp-dram-size, core-nums,
++ * memorydump and the secure dump properties of the node and stops with an
++ * assertion when they do not fit; keep "all" as the default menu entry and
++ * boot "vcp" as a one-shot entry. If the phone does not boot, hangs or the
++ * screen stays dark, boot -all.
++ *
++ * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
++ */
++#include "mt6878-unihertz-titan2-all.dts"
++/* after mt6878-titan2-lk-compat.dtsi (part of the board file): deletes its /vcp */
++#include "mt6878-unihertz-titan2-vcp.dtsi"
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp.dtsi b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp.dtsi
+index e693d5ed5f4b..d5329a96fb77 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-vcp.dtsi
+@@ -1,8 +1,9 @@
+ // SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+ /*
+  * Titan 2: the VCP (video companion processor, MMuP) for the ported
+- * downstream VCP driver (drivers/soc/mediatek/vcp). EXPERIMENTAL, not included by any board file
+- * yet; untested on hardware.
++ * downstream VCP driver (drivers/soc/mediatek/vcp). EXPERIMENTAL, included
++ * by the test boards mt6878-unihertz-titan2-vcp.dts and -vcp-iommu.dts;
++ * untested on hardware.
+  *
+  * The node follows the factory device tree (vcp@1ea00000 as the boot
+  * loader passes it to the kernel), transcribed without phandles. It replaces
+@@ -11,12 +12,13 @@
+  * vcp_<slot> partition into mblock-39-me_vcp_reserved, using
+  * vcp-sram-size, vcp-dram-size, core-nums, vcp-secure-dump-* and
+  * memorydump (titan2-docs: docs/lk-boot-requirements.md section 6; values
+- * as in the factory device tree). Only one node may carry "mediatek,vcp".
++ * as in the factory tree). Only one node may carry "mediatek,vcp".
+  *
+- * Differences from the factory device tree: no "iommus"/"dma-ranges" (no MT6878 IOMMU driver
+- * on mainline; the shared memory is plain DMA memory below 4 GiB),
+- * no "mediatek,smi" (no MT6878 SMI driver). The vcp-iommu-* nodes are kept
+- * because the vcodec drivers take their DMA devices from them.
++ * No "iommus"/"dma-ranges" here: the shared memory is plain DMA memory
++ * below 4 GiB, -vcp-iommu.dts adds the M4U_L41_VIDEO_UP port. "mediatek,smi"
++ * names the MM_INFRA SMI sub-common as a runtime PM supplier on both boards.
++ * The vcp-iommu-* nodes are kept because the vcodec drivers take their DMA
++ * devices from them.
+  *
+  * Must be included after mt6878-titan2-lk-compat.dtsi (it deletes /vcp).
+  *
+@@ -62,7 +64,7 @@ vcp@1ea00000 {
+ 		      <0 0x1ecff10c 0 0x04>,
+ 		      <0 0x1eca5030 0 0x04>;
+ 		/*
+-		 * In the factory device tree the vcp-iommu-vdec/-venc/-work/-sec nodes carry the
++		 * In the factory tree the vcp-iommu-vdec/-venc/-work/-sec nodes carry the
+ 		 * vcp_cfgreg/_core0/intc/pwr_ctl windows as their reg; they only
+ 		 * need a DMA device here, so they have no reg (and no unit
+ 		 * address) below.
+@@ -147,6 +149,11 @@ vcp@1ea00000 {
+ 			       0x09 0x1000
+ 			       0x0a 0x00>;
+ 		power-domains = <&spm MT6878_POWER_DOMAIN_MM_PROC_DORMANT>;
++		/*
++		 * Runtime PM supplier: the MM_INFRA SMI sub-common the VCP's
++		 * memory port goes through, with or without the IOMMU.
++		 */
++		mediatek,smi = <&smi_sub_common_mminfra>;
+ 		clocks = <&topckgen CLK_TOP_MMUP_SEL>,
+ 			 <&topckgen CLK_TOP_MAINPLL_D3>,
+ 			 <&topckgen CLK_TOP_TCK_26M_MX9>;
+@@ -168,3 +175,7 @@ vcp-iommu-work {
+ 		vcp-support = <4>;
+ 	};
+ };
++
++&smi_sub_common_mminfra {
++	status = "okay";
++};
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878.dtsi b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
+index 51062cfa3827..9643c685c04a 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
+@@ -1592,6 +1592,132 @@ seninf_port5: port@5 {
+ 			};
+ 		};
+ 
++		/*
++		 * RAW-A and YUV-A engines of the image signal processor, for
++		 * the driver that replays a captured command queue. The RMS-A
++		 * block at 0x1a040000, which the command queue may write,
++		 * shares the power domain and has no resources of its own.
++		 */
++		cam_raw_a: cam-raw@1a030000 {
++			compatible = "mediatek,mt6878-cam-raw";
++			reg = <0x1a030000 0x8000>, <0x1a038000 0x8000>;
++			reg-names = "base", "inner";
++			interrupts = <GIC_SPI 136 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&camsys_main CLK_CAM_MAIN_CAM>,
++				 <&camsys_main CLK_CAM_MAIN_CAMTG>,
++				 <&camsys_main CLK_CAM_MAIN_CAM2MM0_GALS>,
++				 <&camsys_main CLK_CAM_MAIN_CAM2MM1_GALS>,
++				 <&camsys_main CLK_CAM_MAIN_CAM_SUBA>,
++				 <&camsys_rawa CLK_CAM_RA_LARBX>,
++				 <&camsys_rawa CLK_CAM_RA_CAM>,
++				 <&camsys_rawa CLK_CAM_RA_CAMTG>,
++				 <&topckgen CLK_TOP_CAM_SEL>,
++				 <&topckgen CLK_TOP_CAMTG_SEL>,
++				 <&topckgen CLK_TOP_CAMTM_SEL>;
++			clock-names = "cam", "camtg", "gals0", "gals1",
++				      "cam-suba", "raw-larbx", "raw-cam",
++				      "raw-camtg", "cam-sel", "camtg-sel",
++				      "camtm-sel";
++			iommus = <&m4u M4U_L16_P0_CQI_R1_U0>,
++				 <&m4u M4U_L16_P1_RAWI_R2_U0>,
++				 <&m4u M4U_L16_P2_RAWI_R3_U0>,
++				 <&m4u M4U_L16_P4_RAWI_R5_U0>,
++				 <&m4u M4U_L16_P5_IMGO_R1_U0>,
++				 <&m4u M4U_L16_P7_FPRI_R1_U0>,
++				 <&m4u M4U_L16_P8_BPCI_R1_U0>,
++				 <&m4u M4U_L16_P10_LSCI_R1_U0>,
++				 <&m4u M4U_L16_P11_UFEO_R1_U0>,
++				 <&m4u M4U_L16_P12_LTMSO_R1_U0>,
++				 <&m4u M4U_L16_P14_AFO_R1_U0>,
++				 <&m4u M4U_L16_P15_AAO_R1_U0>;
++			power-domains = <&spm MT6878_POWER_DOMAIN_CAM_SUBA>;
++			mediatek,raw-id = <0>;
++			mediatek,camsys = <&camsys_main>;
++			mediatek,yuv = <&cam_yuv_a>;
++			status = "disabled";
++		};
++
++		cam_yuv_a: cam-yuv@1a050000 {
++			compatible = "mediatek,mt6878-cam-yuv";
++			reg = <0x1a050000 0x8000>, <0x1a058000 0x8000>;
++			reg-names = "base", "inner";
++			interrupts = <GIC_SPI 137 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&camsys_yuva CLK_CAM_YA_LARBX>,
++				 <&camsys_yuva CLK_CAM_YA_CAM>,
++				 <&camsys_yuva CLK_CAM_YA_CAMTG>;
++			clock-names = "yuv-larbx", "yuv-cam", "yuv-camtg";
++			iommus = <&m4u M4U_L17_P0_YUVO_R1_U0>,
++				 <&m4u M4U_L17_P2_YUVO_R2_U0>,
++				 <&m4u M4U_L17_P3_YUVO_R5_U0>,
++				 <&m4u M4U_L17_P5_TCYSO_R1_U0>,
++				 <&m4u M4U_L17_P6_DRZHNO_R3_U0>;
++			power-domains = <&spm MT6878_POWER_DOMAIN_CAM_SUBA>;
++			status = "disabled";
++		};
++
++		/*
++		 * RAW-B and YUV-B: the second half of a frame split between two
++		 * RAW engines. The command queue of RAW-A programs them (and
++		 * the RMS-B block at 0x1a080000); they have no input of their
++		 * own.
++		 */
++		cam_raw_b: cam-raw@1a070000 {
++			compatible = "mediatek,mt6878-cam-raw";
++			reg = <0x1a070000 0x8000>, <0x1a078000 0x8000>;
++			reg-names = "base", "inner";
++			interrupts = <GIC_SPI 138 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&camsys_main CLK_CAM_MAIN_CAM>,
++				 <&camsys_main CLK_CAM_MAIN_CAMTG>,
++				 <&camsys_main CLK_CAM_MAIN_CAM2MM0_GALS>,
++				 <&camsys_main CLK_CAM_MAIN_CAM2MM1_GALS>,
++				 <&camsys_main CLK_CAM_MAIN_CAM_SUBB>,
++				 <&camsys_rawb CLK_CAM_RB_LARBX>,
++				 <&camsys_rawb CLK_CAM_RB_CAM>,
++				 <&camsys_rawb CLK_CAM_RB_CAMTG>,
++				 <&topckgen CLK_TOP_CAM_SEL>,
++				 <&topckgen CLK_TOP_CAMTG_SEL>,
++				 <&topckgen CLK_TOP_CAMTM_SEL>;
++			clock-names = "cam", "camtg", "gals0", "gals1",
++				      "cam-subb", "raw-larbx", "raw-cam",
++				      "raw-camtg", "cam-sel", "camtg-sel",
++				      "camtm-sel";
++			iommus = <&m4u M4U_L33_P0_CQI_R1_U0>,
++				 <&m4u M4U_L33_P1_RAWI_R2_U0>,
++				 <&m4u M4U_L33_P2_RAWI_R3_U0>,
++				 <&m4u M4U_L33_P4_RAWI_R5_U0>,
++				 <&m4u M4U_L33_P5_IMGO_R1_U0>,
++				 <&m4u M4U_L33_P7_FPRI_R1_U0>,
++				 <&m4u M4U_L33_P8_BPCI_R1_U0>,
++				 <&m4u M4U_L33_P10_LSCI_R1_U0>,
++				 <&m4u M4U_L33_P11_UFEO_R1_U0>,
++				 <&m4u M4U_L33_P12_LTMSO_R1_U0>,
++				 <&m4u M4U_L33_P14_AFO_R1_U0>,
++				 <&m4u M4U_L33_P15_AAO_R1_U0>;
++			power-domains = <&spm MT6878_POWER_DOMAIN_CAM_SUBB>;
++			mediatek,raw-id = <1>;
++			mediatek,camsys = <&camsys_main>;
++			mediatek,yuv = <&cam_yuv_b>;
++			status = "disabled";
++		};
++
++		cam_yuv_b: cam-yuv@1a090000 {
++			compatible = "mediatek,mt6878-cam-yuv";
++			reg = <0x1a090000 0x8000>, <0x1a098000 0x8000>;
++			reg-names = "base", "inner";
++			interrupts = <GIC_SPI 139 IRQ_TYPE_LEVEL_HIGH 0>;
++			clocks = <&camsys_yuvb CLK_CAM_YB_LARBX>,
++				 <&camsys_yuvb CLK_CAM_YB_CAM>,
++				 <&camsys_yuvb CLK_CAM_YB_CAMTG>;
++			clock-names = "yuv-larbx", "yuv-cam", "yuv-camtg";
++			iommus = <&m4u M4U_L34_P0_YUVO_R1_U0>,
++				 <&m4u M4U_L34_P2_YUVO_R2_U0>,
++				 <&m4u M4U_L34_P3_YUVO_R5_U0>,
++				 <&m4u M4U_L34_P5_TCYSO_R1_U0>,
++				 <&m4u M4U_L34_P6_DRZHNO_R3_U0>;
++			power-domains = <&spm MT6878_POWER_DOMAIN_CAM_SUBB>;
++			status = "disabled";
++		};
++
+ 		larb16: smi@1a026000 {
+ 			compatible = "mediatek,mt6878-smi-larb";
+ 			reg = <0x1a026000 0x1000>;
+-- 
+2.56.1
+

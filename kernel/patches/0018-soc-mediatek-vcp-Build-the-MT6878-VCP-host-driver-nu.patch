@@ -1,0 +1,1454 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:02:43 +0300
+Subject: [PATCH 18/19] soc: mediatek: vcp: Build the MT6878 VCP host driver,
+ numbered starts, start diagnostics
+
+EXPERIMENTAL: whether the VCP firmware comes up on the phone is still
+open; no video codec uses it yet.
+
+- Wire the reduced VCP host port into the build
+  (CONFIG_MTK_TINYSYS_VCP_SUPPORT): 34-bit DMA mask behind the IOMMU,
+  build fixes for 7.2.
+- A start is one numbered attempt with a state: vcp_register_feature()
+  waits for the ready message of that attempt (ready_timeout_ms) and
+  returns 0 only when the firmware is ready; on failure everything is put
+  back and the failing step is named in the log and in vcp_status.
+- The start follows a fixed order step by step (clocks, domain, access
+  control call, interrupts, the shared memory registers, the core clock
+  mux switch, reset release); while the ready message is awaited the
+  core is sampled (status, reset register, PC/LR/SP) to tell the cause of
+  a failed start; vcp_request sends a first status request.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/soc/mediatek/Kconfig        |   1 +
+ drivers/soc/mediatek/Makefile       |   1 +
+ drivers/soc/mediatek/vcp/Kconfig    |   7 +-
+ drivers/soc/mediatek/vcp/vcp_core.c | 998 +++++++++++++++++++++++++---
+ drivers/soc/mediatek/vcp/vcp_reg.h  |   8 +
+ 5 files changed, 916 insertions(+), 99 deletions(-)
+
+diff --git a/drivers/soc/mediatek/Kconfig b/drivers/soc/mediatek/Kconfig
+index 56b8d7326879..111a5d72cde1 100644
+--- a/drivers/soc/mediatek/Kconfig
++++ b/drivers/soc/mediatek/Kconfig
+@@ -154,6 +154,7 @@ config MTK_TINYSYS_IPI
+ 
+ source "drivers/soc/mediatek/scp/Kconfig"
+ source "drivers/soc/mediatek/sensorhub/Kconfig"
++source "drivers/soc/mediatek/vcp/Kconfig"
+ 
+ config MTK_ATF_LOG
+ 	bool "MediaTek TF-A log buffer (debugfs, read only)"
+diff --git a/drivers/soc/mediatek/Makefile b/drivers/soc/mediatek/Makefile
+index a98a4c6c2e25..82f96686e8fb 100644
+--- a/drivers/soc/mediatek/Makefile
++++ b/drivers/soc/mediatek/Makefile
+@@ -17,5 +17,6 @@ obj-$(CONFIG_MTK_MBOX) += mtk-mbox.o
+ obj-$(CONFIG_MTK_TINYSYS_IPI) += mtk_tinysys_ipi.o
+ obj-y += scp/
+ obj-y += sensorhub/
++obj-y += vcp/
+ obj-$(CONFIG_MTK_MCUPM) += mtk-mcupm.o
+ obj-$(CONFIG_MTK_SSPM) += mtk-sspm.o
+diff --git a/drivers/soc/mediatek/vcp/Kconfig b/drivers/soc/mediatek/vcp/Kconfig
+index ddd2f0eec86b..d819c663c7ef 100644
+--- a/drivers/soc/mediatek/vcp/Kconfig
++++ b/drivers/soc/mediatek/vcp/Kconfig
+@@ -2,10 +2,9 @@
+ # Ported to mainline 7.2 for the Unihertz Titan 2 from the MediaTek GPL
+ # device-modules tree (kernel_device_modules-6.1, drivers/misc/mediatek/vcp).
+ #
+-# Not hooked up yet: add to drivers/soc/mediatek/Kconfig
+-#     source "drivers/soc/mediatek/vcp/Kconfig"
+-# and to drivers/soc/mediatek/Makefile
+-#     obj-y += vcp/
++# Hooked up through drivers/soc/mediatek/{Kconfig,Makefile}; built as a module
++# (CONFIG_MTK_TINYSYS_VCP_SUPPORT=m in the Titan 2 config), used by the -vcp
++# board variants only.
+ 
+ config MTK_TINYSYS_VCP_SUPPORT
+ 	tristate "MediaTek tinysys VCP (video companion processor) driver"
+diff --git a/drivers/soc/mediatek/vcp/vcp_core.c b/drivers/soc/mediatek/vcp/vcp_core.c
+index 2028136bc659..e5edfa05f8a7 100644
+--- a/drivers/soc/mediatek/vcp/vcp_core.c
++++ b/drivers/soc/mediatek/vcp/vcp_core.c
+@@ -19,28 +19,34 @@
+  * and releases it from reset through the SiP call, then waits for the
+  * firmware's ready IPI.
+  *
+- * Deviation from the downstream driver: the shared memory table (vcp-mem-tbl) is carved
+- * from one dma_alloc_coherent() block of the VCP device instead of per
+- * region MTK dma-heap buffers mapped through the MM IOMMU, because MT6878
+- * has no mainline IOMMU driver yet. The VCP then sees physical addresses;
+- * whether its DRAM port is in IOMMU bypass is to be checked on hardware.
++ * Deviation from downstream: the shared memory table (vcp-mem-tbl) is
++ * carved from one dma_alloc_coherent() block of the VCP device instead of
++ * per region MTK dma-heap buffers. Without an "iommus" property the VCP
++ * sees physical addresses below 4 GiB (its DRAM port must be in bypass,
++ * to be checked on hardware); with "iommus" (MM IOMMU, larb-less VIDEO_UP
++ * port) the block is an IOVA of the VDO_UP window and the mask is 34 bits.
+  */
+ 
+ #include <linux/arm-smccc.h>
+ #include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/completion.h>
+ #include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
++#include <linux/iommu.h>
++#include <linux/kstrtox.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+ #include <linux/suspend.h>
+-#include <linux/timer.h>
+ #include <linux/vmalloc.h>
+ #include <linux/workqueue.h>
+ #include <linux/soc/mediatek/mtk-mbox.h>
+@@ -70,7 +76,13 @@ enum mtk_tinysys_vcp_kernel_op {
+ #define VCP_ALL_ENABLE		0x00
+ #define VCP_ALL_SUSPEND		0x10
+ 
+-#define VCP_READY_TIMEOUT	(HZ / 5 * 4)	/* 800 ms */
++#define VCP_READY_TIMEOUT_MS	800
++#define VCP_REQUEST_TIMEOUT_MS	500
++/* the mux switch is repeated until the core clock is on its source */
++#define VCP_CLK_TRIES		10
++#define VCP_CLK_MIN_RATE	30000000UL
++#define VCP_READY_TIMEOUT_MIN	100
++#define VCP_READY_TIMEOUT_MAX	10000
+ #define VCP_AWAKE_TIMEOUT	200000		/* us, reboot handshake */
+ 
+ struct slp_ctrl_data {
+@@ -89,6 +101,7 @@ struct vcp_regs {
+ 	void __iomem *cfg;
+ 	void __iomem *cfg_core0;
+ 	void __iomem *cfg_core1;
++	void __iomem *pwr;
+ 	int irq_wdt;
+ 	unsigned int total_tcmsize;
+ 	unsigned int vcp_tcmsize;
+@@ -107,8 +120,74 @@ static struct device *vcp_dev;
+ static struct device *vcp_io_devs[VCP_IOMMU_DEV_NUM];
+ static struct clk *vcpsel, *vcpclk, *vcp26m;
+ 
++/*
++ * One start of the firmware: BOOTING from the reset release until its ready
++ * message, READY until the power goes off. A ready message is only taken in
++ * BOOTING; the work that completes the start carries the start number, so
++ * a message of an earlier start cannot complete a later one.
++ */
++enum vcp_state {
++	VCP_STATE_OFF,
++	VCP_STATE_BOOTING,
++	VCP_STATE_READY,
++	VCP_STATE_FAILED,
++};
++
++static const char * const vcp_state_names[] = {
++	"off", "booting", "ready", "failed",
++};
++
++/*
++ * What was seen at the last start, for the log and vcp_status. @stage names
++ * the first step that failed (NULL: none), the rest is kept whatever the
++ * result.
++ */
++/* the core as seen at one moment after the reset release */
++struct vcp_core_sample {
++	unsigned int ms;
++	u32 status;
++	u32 rstn_clr;
++	u32 pc, lr, sp;
++	u32 latch[3];
++	u32 hart1[R_CORE_MON_HART1_WORDS];
++	u32 cur_freq, exp_freq;
++	u32 hint;
++	u32 pwr;
++};
++
++#define VCP_MAX_SAMPLES		4
++
++struct vcp_start_diag {
++	const char *stage;
++	int err;
++	unsigned long clk_rate;
++	const char *clk_parent;
++	unsigned int clk_tries;
++	unsigned long dapc_ret;
++	unsigned long release_ret;
++	bool released;
++	u32 resv_addr, resv_size;
++	struct vcp_core_sample sample[VCP_MAX_SAMPLES];
++	unsigned int nsamples;
++	u32 ready_irqs;
++	u32 ready_cbs;
++	u32 ready_short;
++	u32 ready_stale;
++	bool stop_ack;
++};
++
+ static bool vcp_enable;
+-static unsigned int vcp_ready;
++static bool vcp_probed;
++static bool vcp_powered;
++static enum vcp_state vcp_state;
++static unsigned int vcp_start_seq;
++static unsigned int vcp_ready_seq;
++static u32 vcp_ready_image_size;
++static unsigned int vcp_ready_short, vcp_ready_stale;
++static struct vcp_start_diag vcp_diag;
++#define VCP_MAX_SMI		2
++static struct device *vcp_smi_devs[VCP_MAX_SMI];
++static int vcp_request_result = 1;	/* > 0: not sent yet */
+ static unsigned int vcp_generation;
+ static bool is_suspending;
+ static int pwclkcnt;
+@@ -119,6 +198,8 @@ static DEFINE_MUTEX(vcp_pw_clk_mutex);
+ static DEFINE_MUTEX(vcp_feature_mutex);
+ static DEFINE_MUTEX(vcp_notify_mutex);
+ static DEFINE_SPINLOCK(vcp_awake_spinlock);
++static DEFINE_SPINLOCK(vcp_state_lock);
++static DECLARE_COMPLETION(vcp_ready_done);
+ static BLOCKING_NOTIFIER_HEAD(vcp_notifier_list);
+ 
+ static struct vcp_reserve_mblock vcp_mblock[NUMS_MEM_ID];
+@@ -126,7 +207,6 @@ static void *vcp_mem_virt;
+ static dma_addr_t vcp_mem_dma;
+ static size_t vcp_mem_size;
+ 
+-static struct timer_list vcp_ready_timer;
+ static struct work_struct vcp_ready_work;
+ static struct workqueue_struct *vcp_wq;
+ 
+@@ -138,6 +218,11 @@ module_param(boot_test, bool, 0444);
+ MODULE_PARM_DESC(boot_test,
+ 		 "Power the VCP and release it from reset at probe (bring-up test)");
+ 
++static unsigned int ready_timeout_ms = VCP_READY_TIMEOUT_MS;
++module_param(ready_timeout_ms, uint, 0644);
++MODULE_PARM_DESC(ready_timeout_ms,
++		 "How long a start waits for the firmware's ready message (100..10000 ms)");
++
+ static int vcp_clr_spm_reg(void *unused);
+ 
+ struct mtk_mbox_device vcp_mboxdev = {
+@@ -170,7 +255,7 @@ static inline u32 core1_rd(u32 ofs)
+ 
+ unsigned int is_vcp_ready(enum vcp_core_id id)
+ {
+-	return id == VCP_A_ID ? READ_ONCE(vcp_ready) : 0;
++	return id == VCP_A_ID && READ_ONCE(vcp_state) == VCP_STATE_READY;
+ }
+ EXPORT_SYMBOL_GPL(is_vcp_ready);
+ 
+@@ -248,6 +333,58 @@ phys_addr_t vcp_get_reserve_mem_size(enum vcp_reserve_mem_id_t id)
+ }
+ EXPORT_SYMBOL_GPL(vcp_get_reserve_mem_size);
+ 
++/*
++ * Behind the MM IOMMU (an "iommus" property on the node) the VCP port is a
++ * larb-less master with the VDO_UP window above 4 GiB, so the DMA mask must
++ * allow the 34 bits the VCP can address (bits 35..32 travel in bits 3..0 of
++ * the packed address). Without the IOMMU the VCP sees physical addresses and
++ * the memory stays below 4 GiB, as long as the port is in bypass.
++ */
++static int vcp_set_dma_mask(struct device *dev)
++{
++	return dma_set_mask_and_coherent(dev, DMA_BIT_MASK(device_iommu_mapped(dev) ? 34 : 32));
++}
++
++/*
++ * The firmware gets the base as 32 bits with address bits 35..32 in bits
++ * 3..0, and reaches base + size. Check that the block the DMA API handed
++ * out survives that, and say through which device and IOMMU window it is
++ * mapped.
++ */
++static int vcp_check_shared_memory(struct device *dev)
++{
++	struct iommu_domain *dom = iommu_get_domain_for_dev(dev);
++	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
++	u64 base = vcp_mem_dma;
++	u64 last = base + vcp_mem_size - 1;
++	u32 packed = VCP_PACK_IOVA(base);
++
++	if (dom && device_iommu_mapped(dev))
++		dev_info(dev,
++			 "shared memory %pad size 0x%zx packed 0x%08x: IOMMU port 0x%x, window 0x%llx..0x%llx\n",
++			 &vcp_mem_dma, vcp_mem_size, packed,
++			 fwspec && fwspec->num_ids ? fwspec->ids[0] : ~0U,
++			 (u64)dom->geometry.aperture_start,
++			 (u64)dom->geometry.aperture_end);
++	else
++		dev_info(dev,
++			 "shared memory %pad size 0x%zx packed 0x%08x: no IOMMU, bus address\n",
++			 &vcp_mem_dma, vcp_mem_size, packed);
++
++	if ((base & 0xf) || last >> 36 || VCP_UNPACK_IOVA(packed) != base) {
++		dev_err(dev, "shared memory %pad..0x%llx cannot be packed for the VCP\n",
++			&vcp_mem_dma, last);
++		return -ERANGE;
++	}
++	if (dom && device_iommu_mapped(dev) && dom->geometry.force_aperture &&
++	    (base < dom->geometry.aperture_start ||
++	     last > dom->geometry.aperture_end)) {
++		dev_err(dev, "shared memory outside the IOMMU window\n");
++		return -ERANGE;
++	}
++	return 0;
++}
++
+ static int vcp_reserve_memory_init(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -284,8 +421,7 @@ static int vcp_reserve_memory_init(struct platform_device *pdev)
+ 	if (!vcp_mem_size)
+ 		return 0;
+ 
+-	/* conservative: below 4 GiB while the larbs/IOMMU are in bypass */
+-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	ret = vcp_set_dma_mask(dev);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -307,8 +443,7 @@ static int vcp_reserve_memory_init(struct platform_device *pdev)
+ 			vcp_mblock[i].start_phys, vcp_mblock[i].size);
+ 	}
+ 
+-	dev_info(dev, "shared memory %pad size 0x%zx\n", &vcp_mem_dma, vcp_mem_size);
+-	return 0;
++	return vcp_check_shared_memory(dev);
+ }
+ 
+ /* --- awake / mailbox callbacks ---------------------------------------- */
+@@ -382,7 +517,10 @@ static irqreturn_t vcp_wdt_irq_thread(int irq, void *data)
+ 		writel(B_WDT_IRQ, vcpreg.cfg_core0 + R_CORE_WDT_IRQ);
+ 	if (vcpreg.core_nums == 2 && core1_rd(R_CORE_WDT_IRQ))
+ 		writel(B_WDT_IRQ, vcpreg.cfg_core1 + R_CORE_WDT_IRQ);
+-	WRITE_ONCE(vcp_ready, 0);
++	spin_lock_irq(&vcp_state_lock);
++	if (vcp_state == VCP_STATE_READY || vcp_state == VCP_STATE_BOOTING)
++		WRITE_ONCE(vcp_state, VCP_STATE_FAILED);
++	spin_unlock_irq(&vcp_state_lock);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -412,30 +550,52 @@ static void vcp_disable_irqs(void)
+ 
+ static void vcp_ready_ws(struct work_struct *ws)
+ {
++	unsigned long flags;
++	u32 image_size;
++
++	spin_lock_irqsave(&vcp_state_lock, flags);
++	if (vcp_state != VCP_STATE_BOOTING || vcp_ready_seq != vcp_start_seq) {
++		vcp_ready_stale++;
++		spin_unlock_irqrestore(&vcp_state_lock, flags);
++		return;
++	}
++	image_size = vcp_ready_image_size;
++	WRITE_ONCE(vcp_state, VCP_STATE_READY);
++	spin_unlock_irqrestore(&vcp_state_lock, flags);
++
+ 	writel(0xff, vcpreg.cfg + VCP_TO_SPM_REG);	/* downstream: clear SPM irq */
+-	WRITE_ONCE(vcp_ready, 1);
+-	dev_info(vcp_dev, "VCP ready\n");
++	if (image_size != vcpreg.vcp_tcmsize)
++		dev_warn(vcp_dev, "image size AP 0x%x VCP 0x%x\n",
++			 vcpreg.vcp_tcmsize, image_size);
++	dev_info(vcp_dev, "VCP ready (start %u)\n", vcp_start_seq);
++	complete(&vcp_ready_done);
+ 	vcp_extern_notify(VCP_EVENT_READY);
+ }
+ 
++/* mailbox interrupt context; @len is in bytes */
+ static int vcp_ready_ipi_handler(unsigned int id, void *prdata, void *data,
+ 				 unsigned int len)
+ {
+-	u32 image_size = *(u32 *)data;
++	unsigned long flags;
+ 
+-	timer_delete(&vcp_ready_timer);
+-	if (!is_vcp_ready(VCP_A_ID))
++	spin_lock_irqsave(&vcp_state_lock, flags);
++	if (len < sizeof(u32)) {
++		vcp_ready_short++;
++	} else if (vcp_state != VCP_STATE_BOOTING) {
++		/* of a start that is over, or never asked for */
++		vcp_ready_stale++;
++	} else {
++		vcp_ready_image_size = *(u32 *)data;
++		vcp_ready_seq = vcp_start_seq;
+ 		queue_work(vcp_wq, &vcp_ready_work);
+-	if (image_size != vcpreg.vcp_tcmsize)
+-		dev_warn(vcp_dev, "image size AP 0x%x VCP 0x%x\n",
+-			 vcpreg.vcp_tcmsize, image_size);
++	}
++	spin_unlock_irqrestore(&vcp_state_lock, flags);
+ 	return 0;
+ }
+ 
+-static void vcp_ready_timeout(struct timer_list *t)
++static struct mtk_mbox_pin_recv *vcp_ready_pin(void)
+ {
+-	/* downstream: schedule a reset; here: report only */
+-	vcp_dump_regs("no ready IPI within 800 ms");
++	return vcp_ipidev.table[IPI_IN_VCP_READY_0].pin_recv;
+ }
+ 
+ /* --- power / reset ---------------------------------------------------- */
+@@ -470,14 +630,14 @@ static void vcp_wait_core_stop_timeout(void)
+ 		st0 = core0_rd(R_CORE_STATUS);
+ 		st1 = vcpreg.core_nums == 2 ? core1_rd(R_CORE_STATUS) : 0;
+ 		if (st0 == want && (vcpreg.core_nums != 2 ||
+-		    st1 == (B_CORE_GATED | B_HART0_HALT | B_HART1_HALT)))
++				    st1 == (B_CORE_GATED | B_HART0_HALT | B_HART1_HALT)))
+ 			return;
+ 		mdelay(1);
+ 	}
+ 	dev_notice(vcp_dev, "core stop timeout: 0x%x 0x%x\n", st0, st1);
+ }
+ 
+-static void vcp_wait_ready_to_reboot(void)
++static bool vcp_wait_ready_to_reboot(void)
+ {
+ 	int retry;
+ 
+@@ -492,13 +652,15 @@ static void vcp_wait_ready_to_reboot(void)
+ 		dev_notice(vcp_dev, "reboot handshake timeout, status 0x%x\n",
+ 			   core0_rd(R_CORE_STATUS));
+ 	udelay(10);
++	return retry > 0;
+ }
+ 
+-static void vcp_enable_dapc(void)
++static unsigned long vcp_enable_dapc(void)
+ {
+ 	struct arm_smccc_res res;
+ 
+ 	arm_smccc_smc(MTK_SIP_KERNEL_DAPC_MMUP_CONTROL, 1, 0, 0, 0, 0, 0, 0, &res);
++	return res.a0;
+ }
+ 
+ static void vcp_disable_dapc(void)
+@@ -507,54 +669,361 @@ static void vcp_disable_dapc(void)
+ 
+ 	arm_smccc_smc(MTK_SIP_TINYSYS_VCP_CONTROL,
+ 		      MTK_TINYSYS_VCP_KERNEL_OP_RESET_SET, 1, 0, 0, 0, 0, 0, &res);
++	/* the reset must be in place before the access control is withdrawn */
+ 	mb();
+ 	arm_smccc_smc(MTK_SIP_KERNEL_DAPC_MMUP_CONTROL, 0, 0, 0, 0, 0, 0, 0, &res);
+ }
+ 
+-static void reset_vcp(int reset)
++/* the first failure of a start names it; later ones are consequences */
++static int vcp_start_fail(const char *stage, int err)
+ {
+-	struct arm_smccc_res res;
+-	u32 addr = VCP_PACK_IOVA((u64)vcp_mem_dma);
++	if (!vcp_diag.stage) {
++		vcp_diag.stage = stage;
++		vcp_diag.err = err;
++	}
++	dev_err(vcp_dev, "start %u: %s: %d\n", vcp_start_seq, stage, err);
++	return err;
++}
++
++static bool vcp_sample_hart1_zero(const struct vcp_core_sample *c)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(c->hart1); i++)
++		if (c->hart1[i])
++			return false;
++	return true;
++}
++
++static void vcp_print_sample(const struct vcp_core_sample *c)
++{
++	dev_err(vcp_dev,
++		"start %u: +%u ms: status 0x%x (gated %u halt %u/%u) rstn_clr 0x%x pc 0x%x lr 0x%x sp 0x%x latched %*ph\n",
++		vcp_start_seq, c->ms, c->status, !!(c->status & B_CORE_GATED),
++		!!(c->status & B_HART0_HALT), !!(c->status & B_HART1_HALT),
++		c->rstn_clr, c->pc, c->lr, c->sp,
++		(int)sizeof(c->latch), c->latch);
++	dev_err(vcp_dev,
++		"start %u: +%u ms: hart1 %*ph freq cur 0x%x exp 0x%x hint 0x%x power 0x%x\n",
++		vcp_start_seq, c->ms, (int)sizeof(c->hart1), c->hart1,
++		c->cur_freq, c->exp_freq, c->hint, c->pwr);
++}
++
++/* core status, both harts, the firmware's frequency words, the debug hint */
++static void vcp_diag_sample_core(unsigned int ms)
++{
++	struct vcp_core_sample *c;
++	unsigned int i;
+ 
+-	if (!vcp_enable)
++	if (vcp_diag.nsamples >= VCP_MAX_SAMPLES)
+ 		return;
++	c = &vcp_diag.sample[vcp_diag.nsamples++];
++	c->ms = ms;
++	c->status = core0_rd(R_CORE_STATUS);
++	c->rstn_clr = core0_rd(R_CORE_SW_RSTN_CLR);
++	c->pc = core0_rd(R_CORE_MON_PC);
++	c->lr = core0_rd(R_CORE_MON_LR);
++	c->sp = core0_rd(R_CORE_MON_SP);
++	for (i = 0; i < ARRAY_SIZE(c->latch); i++)
++		c->latch[i] = core0_rd(R_CORE_MON_LATCH + 4 * i);
++	for (i = 0; i < ARRAY_SIZE(c->hart1); i++)
++		c->hart1[i] = core0_rd(R_CORE_MON_HART1 + 4 * i);
++	c->cur_freq = core0_rd(R_CORE_CURRENT_FREQ);
++	c->exp_freq = core0_rd(R_CORE_EXPECTED_FREQ);
++	c->hint = readl(vcpreg.cfg + VCP_GPR_DEBUG_HINT);
++	c->pwr = vcpreg.pwr ? readl(vcpreg.pwr + VCP_POWER_STATUS) : 0;
++}
++
++/*
++ * No ready message in time. With the domain still powered, tell apart: the
++ * message came and was not taken; the core has no clock; the core is held;
++ * it was released and shows no execution; it runs and nothing reached the
++ * mailbox. The order of the last four is the one to follow for "PC = 0".
++ */
++static int vcp_start_no_ready(u32 irqs0, u32 cbs0)
++{
++	struct mtk_mbox_pin_recv *pin = vcp_ready_pin();
++	const struct vcp_core_sample *c;
++	bool executes = false;
++	const char *stage;
++	unsigned int i;
++
++	vcp_diag.ready_irqs = pin->recv_record.recv_irq_count - irqs0;
++	vcp_diag.ready_cbs = pin->recv_record.cb_count - cbs0;
++	vcp_diag.ready_short = vcp_ready_short;
++	vcp_diag.ready_stale = vcp_ready_stale;
++
++	for (i = 0; i < vcp_diag.nsamples; i++) {
++		c = &vcp_diag.sample[i];
++		vcp_print_sample(c);
++		if (c->pc || c->cur_freq || !vcp_sample_hart1_zero(c))
++			executes = true;
++	}
++	c = &vcp_diag.sample[vcp_diag.nsamples - 1];
++
++	if (vcp_diag.ready_short)
++		stage = "ready message shorter than its size field";
++	else if (vcp_diag.ready_irqs && !vcp_diag.ready_cbs)
++		stage = "ready interrupt without a handler call (pin table)";
++	else if (vcp_diag.ready_irqs)
++		stage = "ready message seen but not taken";
++	else if (executes)
++		stage = "firmware runs, no ready interrupt";
++	else if (c->status & B_CORE_GATED)
++		stage = "core clock gated: no clock (mux switch, frequency meter)";
++	else if (c->status & (B_HART0_HALT | B_HART1_HALT))
++		stage = "core not gated but halted: held";
++	else
++		stage = "released, pc 0 on both harts: no boot image or remap (see vcp_lk_log)";
++
++	dev_err(vcp_dev,
++		"start %u: mmup %lu Hz from %s after %u switch(es); frequency meter not read (no register description)\n",
++		vcp_start_seq, vcp_diag.clk_rate,
++		vcp_diag.clk_parent ? vcp_diag.clk_parent : "?",
++		vcp_diag.clk_tries);
++	dev_err(vcp_dev,
++		"start %u: ready pin irqs %u calls %u short %u out of turn %u, mbox%u first irq status 0x%x, bus 0x%x\n",
++		vcp_start_seq, vcp_diag.ready_irqs, vcp_diag.ready_cbs,
++		vcp_diag.ready_short, vcp_diag.ready_stale, pin->mbox,
++		mtk_mbox_get_index_record(&vcp_mboxdev, pin->mbox),
++		readl(vcpreg.cfg + VCP_BUS_DEBUG_OUT));
++	return vcp_start_fail(stage, -ETIMEDOUT);
++}
++
++/* power, before any register of the VCP is touched */
++static int vcp_start_check_power(void)
++{
++	unsigned int i;
++
++	dev_info(vcp_dev, "start %u: domain %s, access control ret %lu (not judged)\n",
++		 vcp_start_seq, pm_runtime_active(vcp_dev) ? "on" : "OFF",
++		 vcp_diag.dapc_ret);
++	if (!vcp_smi_devs[0])
++		dev_info(vcp_dev, "start %u: no smi supplier linked\n", vcp_start_seq);
++
++	if (!pm_runtime_active(vcp_dev))
++		return vcp_start_fail("power domain not on", -EIO);
++	for (i = 0; i < VCP_MAX_SMI && vcp_smi_devs[i]; i++) {
++		dev_info(vcp_dev, "start %u: smi %s %s\n", vcp_start_seq,
++			 dev_name(vcp_smi_devs[i]),
++			 pm_runtime_active(vcp_smi_devs[i]) ? "on" : "OFF");
++		if (!pm_runtime_active(vcp_smi_devs[i]))
++			return vcp_start_fail("smi supplier not on", -EIO);
++	}
++	return 0;
++}
++
++/*
++ * Park the mux on 26 MHz, then switch it to the core clock, until the
++ * clock framework reports the core clock as the source at a rate above
++ * the running threshold.
++ */
++static int vcp_start_switch_clk(void)
++{
++	struct clk *parent = NULL;
++
++	if (IS_ERR_OR_NULL(vcpsel))
++		return 0;
++
++	for (vcp_diag.clk_tries = 1; ; vcp_diag.clk_tries++) {
++		vcp_set_clk();
++		parent = clk_get_parent(vcpsel);
++		vcp_diag.clk_rate = clk_get_rate(vcpsel);
++		if (vcp_diag.clk_rate > VCP_CLK_MIN_RATE &&
++		    (IS_ERR_OR_NULL(vcpclk) || clk_is_match(parent, vcpclk)))
++			break;
++		if (vcp_diag.clk_tries >= VCP_CLK_TRIES)
++			break;
++	}
++	vcp_diag.clk_parent = parent ? __clk_get_name(parent) : "none";
++	dev_info(vcp_dev, "start %u: mmup %lu Hz from %s after %u switch(es)\n",
++		 vcp_start_seq, vcp_diag.clk_rate, vcp_diag.clk_parent,
++		 vcp_diag.clk_tries);
++
++	if (vcp_diag.clk_rate <= VCP_CLK_MIN_RATE)
++		return vcp_start_fail("mmup clock not above 30 MHz", -EIO);
++	if (!IS_ERR_OR_NULL(vcpclk) && !clk_is_match(parent, vcpclk))
++		return vcp_start_fail("mmup clock not on its source", -EIO);
++	return 0;
++}
++
++/*
++ * The order of a working start: shared memory registers, clock mux switch,
++ * reset release. The return values of the two SiP calls are logged, not
++ * judged: what they mean is not known.
++ */
++static int reset_vcp(int reset)
++{
++	struct arm_smccc_res res;
++	u32 addr = VCP_PACK_IOVA((u64)vcp_mem_dma);
++	int ret;
+ 
+ 	/* tell the VCP where the AP shared memory is (it sets up its MPU) */
+ 	writel(addr, vcpreg.cfg_core0 + DRAM_RESV_ADDR_REG);
+ 	writel((u32)vcp_mem_size, vcpreg.cfg_core0 + DRAM_RESV_SIZE_REG);
+-	vcp_set_clk();
++	vcp_diag.resv_addr = core0_rd(DRAM_RESV_ADDR_REG);
++	vcp_diag.resv_size = core0_rd(DRAM_RESV_SIZE_REG);
++	if (vcp_diag.resv_addr != addr || vcp_diag.resv_size != (u32)vcp_mem_size)
++		return vcp_start_fail("shared memory registers do not hold", -EIO);
+ 
+-	mod_timer(&vcp_ready_timer, jiffies + VCP_READY_TIMEOUT);
++	ret = vcp_start_switch_clk();
++	if (ret)
++		return ret;
++
++	/* a2: 1 for a start, 0 for a resume from the all-suspend state */
+ 	arm_smccc_smc(MTK_SIP_TINYSYS_VCP_CONTROL,
+ 		      MTK_TINYSYS_VCP_KERNEL_OP_RESET_RELEASE,
+ 		      reset == VCP_ALL_SUSPEND ? 0 : 1, 0, 0, 0, 0, 0, &res);
+-	dev_info(vcp_dev, "reset release: resv 0x%x/0x%x ret %lu\n",
+-		 core0_rd(DRAM_RESV_ADDR_REG), core0_rd(DRAM_RESV_SIZE_REG), res.a0);
++	vcp_diag.release_ret = res.a0;
++	vcp_diag.released = true;
++	dev_info(vcp_dev,
++		 "start %u: reset release: resv 0x%x/0x%x read back, ret %lu (not judged)\n",
++		 vcp_start_seq, vcp_diag.resv_addr, vcp_diag.resv_size, res.a0);
++	return 0;
+ }
+ 
++/* stop the core and drop everything vcp_power_up() took */
++static void vcp_power_off_hw(void)
++{
++	vcp_disable_irqs();
++	flush_workqueue(vcp_wq);
++
++	spin_lock_irq(&vcp_state_lock);
++	if (vcp_state != VCP_STATE_FAILED)
++		WRITE_ONCE(vcp_state, VCP_STATE_OFF);
++	spin_unlock_irq(&vcp_state_lock);
++	vcp_generation++;
++
++	if (vcp_diag.released) {
++		/* trigger the halt ISR, the VCP parks in wfi */
++		writel(B_GIPC3_SETCLR_1, vcpreg.cfg + R_GIPC_IN_SET);
++		vcp_diag.stop_ack = vcp_wait_ready_to_reboot();
++		vcp_wait_core_stop_timeout();
++	}
++	vcp_wait_awake_count();
++	vcp_disable_dapc();
++
++	pm_runtime_put_sync(vcp_dev);
++	clk_disable_unprepare(vcpsel);
++	clk_disable_unprepare(vcpclk);
++	clk_disable_unprepare(vcp26m);
++	vcp_powered = false;
++}
++
++/* when the core is looked at after the reset release, in ms */
++static const unsigned int vcp_sample_ms[] = { 10, 100, 800 };
++
++/*
++ * Power the VCP, release it from reset and wait for the ready message of
++ * this start. Returns 0 only when the firmware is ready; on any error the
++ * VCP is powered off again and the next call starts from scratch.
++ */
+ static int vcp_power_up(int reset)
+ {
++	struct mtk_mbox_pin_recv *pin = vcp_ready_pin();
++	unsigned int timeout = clamp(ready_timeout_ms, VCP_READY_TIMEOUT_MIN,
++				     VCP_READY_TIMEOUT_MAX);
++	unsigned int i, waited = 0;
++	unsigned long ready = 0;
++	u32 irqs0, cbs0;
+ 	int ret;
+ 
++	lockdep_assert_held(&vcp_pw_clk_mutex);
++
++	memset(&vcp_diag, 0, sizeof(vcp_diag));
++	vcp_start_seq++;
++
+ 	ret = clk_prepare_enable(vcp26m);
+ 	if (ret)
+-		return ret;
++		return vcp_start_fail("mmup-26m clock", ret);
+ 	ret = clk_prepare_enable(vcpclk);
+-	if (ret)
++	if (ret) {
++		vcp_start_fail("mmup-clk clock", ret);
+ 		goto err_26m;
++	}
+ 	ret = clk_prepare_enable(vcpsel);
+-	if (ret)
++	if (ret) {
++		vcp_start_fail("mmup-sel clock", ret);
+ 		goto err_clk;
++	}
+ 	ret = pm_runtime_resume_and_get(vcp_dev);
+-	if (ret)
++	if (ret) {
++		vcp_start_fail("power domain", ret);
+ 		goto err_sel;
++	}
++	vcp_powered = true;
++
++	vcp_diag.dapc_ret = vcp_enable_dapc();
+ 
+-	vcp_enable_dapc();
++	/*
++	 * A message left in the mailbox by an earlier start is delivered as
++	 * soon as the interrupts are on. Let it pass while no start is
++	 * waiting, then open the window for this one.
++	 */
+ 	vcp_enable_irqs();
+-	if (!is_vcp_ready(VCP_A_ID))
+-		reset_vcp(reset);
++	for (i = 0; i < vcp_mboxdev.count; i++)
++		if (vcp_mboxdev.info_table[i].irq_num > 0)
++			synchronize_irq(vcp_mboxdev.info_table[i].irq_num);
++	flush_workqueue(vcp_wq);
++
++	ret = vcp_start_check_power();
++	if (ret)
++		goto err_off;
++
++	spin_lock_irq(&vcp_state_lock);
++	vcp_ready_short = 0;
++	vcp_ready_stale = 0;
++	irqs0 = pin->recv_record.recv_irq_count;
++	cbs0 = pin->recv_record.cb_count;
++	reinit_completion(&vcp_ready_done);
++	WRITE_ONCE(vcp_state, VCP_STATE_BOOTING);
++	spin_unlock_irq(&vcp_state_lock);
++
++	ret = reset_vcp(reset);
++	if (ret)
++		goto err_state;
++
++	/* watch the core at fixed times while the ready message is awaited */
++	for (i = 0; !ready && i < ARRAY_SIZE(vcp_sample_ms) &&
++		    vcp_sample_ms[i] < timeout; i++) {
++		ready = wait_for_completion_timeout(&vcp_ready_done,
++				msecs_to_jiffies(vcp_sample_ms[i] - waited));
++		waited = vcp_sample_ms[i];
++		if (!ready)
++			vcp_diag_sample_core(waited);
++	}
++	if (!ready) {
++		ready = wait_for_completion_timeout(&vcp_ready_done,
++						    msecs_to_jiffies(timeout - waited));
++		if (!ready)
++			vcp_diag_sample_core(timeout);
++	}
++	if (!ready) {
++		spin_lock_irq(&vcp_state_lock);
++		if (vcp_state == VCP_STATE_READY) {
++			/* the message won the race with the timeout */
++			spin_unlock_irq(&vcp_state_lock);
++			return 0;
++		}
++		WRITE_ONCE(vcp_state, VCP_STATE_FAILED);
++		spin_unlock_irq(&vcp_state_lock);
++		ret = vcp_start_no_ready(irqs0, cbs0);
++		goto err_off;
++	}
+ 	return 0;
+ 
++err_state:
++	spin_lock_irq(&vcp_state_lock);
++	WRITE_ONCE(vcp_state, VCP_STATE_FAILED);
++	spin_unlock_irq(&vcp_state_lock);
++err_off:
++	vcp_power_off_hw();
++	dev_err(vcp_dev, "start %u failed at: %s (%d), stop %s\n",
++		vcp_start_seq, vcp_diag.stage, vcp_diag.err,
++		!vcp_diag.released ? "not needed" :
++		vcp_diag.stop_ack ? "acknowledged" : "not acknowledged");
++	return ret;
++
+ err_sel:
+ 	clk_disable_unprepare(vcpsel);
+ err_clk:
+@@ -566,23 +1035,13 @@ static int vcp_power_up(int reset)
+ 
+ static void vcp_power_down(void)
+ {
+-	vcp_disable_irqs();
+-	flush_workqueue(vcp_wq);
+-	WRITE_ONCE(vcp_ready, 0);
+-	vcp_generation++;
+-
+-	/* trigger the halt ISR, the VCP parks in wfi */
+-	writel(B_GIPC3_SETCLR_1, vcpreg.cfg + R_GIPC_IN_SET);
+-	vcp_wait_ready_to_reboot();
+-	timer_delete_sync(&vcp_ready_timer);
+-	vcp_wait_core_stop_timeout();
+-	vcp_wait_awake_count();
+-	vcp_disable_dapc();
++	lockdep_assert_held(&vcp_pw_clk_mutex);
+ 
+-	pm_runtime_put_sync(vcp_dev);
+-	clk_disable_unprepare(vcpsel);
+-	clk_disable_unprepare(vcpclk);
+-	clk_disable_unprepare(vcp26m);
++	if (!vcp_powered)
++		return;
++	/* a running VCP was released from reset, whatever the diagnosis says */
++	vcp_diag.released = true;
++	vcp_power_off_hw();
+ }
+ 
+ static int vcp_enable_pm_clk(enum feature_id id)
+@@ -595,8 +1054,17 @@ static int vcp_enable_pm_clk(enum feature_id id)
+ 		usleep_range(10000, 20000);
+ 		mutex_lock(&vcp_pw_clk_mutex);
+ 	}
+-	if (pwclkcnt == 0)
++	/*
++	 * Also when other users hold it but the firmware is not there (a
++	 * start after resume failed, or the watchdog fired): start again.
++	 */
++	if (!is_vcp_ready(VCP_A_ID)) {
++		if (vcp_powered) {
++			vcp_extern_notify(VCP_EVENT_STOP);
++			vcp_power_down();
++		}
+ 		ret = vcp_power_up(VCP_ALL_ENABLE);
++	}
+ 	if (!ret)
+ 		pwclkcnt++;
+ 	mutex_unlock(&vcp_pw_clk_mutex);
+@@ -611,7 +1079,7 @@ static int vcp_disable_pm_clk(enum feature_id id)
+ 		usleep_range(10000, 20000);
+ 		mutex_lock(&vcp_pw_clk_mutex);
+ 	}
+-	if (pwclkcnt > 0 && --pwclkcnt == 0) {
++	if (pwclkcnt > 0 && --pwclkcnt == 0 && vcp_powered) {
+ 		vcp_extern_notify(VCP_EVENT_STOP);
+ 		vcp_power_down();
+ 	}
+@@ -619,11 +1087,21 @@ static int vcp_disable_pm_clk(enum feature_id id)
+ 	return 0;
+ }
+ 
++/**
++ * vcp_register_feature() - take a reference on the running firmware
++ * @id: the user
++ *
++ * Starts the VCP for the first user and waits for its ready message, for
++ * at most ready_timeout_ms. On 0 the firmware is ready and a request can be
++ * sent to it; get_vcp_generation() read after this call identifies the
++ * firmware run the reference belongs to. On an error no reference is held
++ * and the VCP is off.
++ */
+ int vcp_register_feature(enum feature_id id)
+ {
+ 	int ret;
+ 
+-	if (!vcp_enable || id >= NUM_FEATURE_ID)
++	if (!vcp_enable || !vcp_probed || id >= NUM_FEATURE_ID)
+ 		return -EINVAL;
+ 	mutex_lock(&vcp_feature_mutex);
+ 	ret = vcp_enable_pm_clk(id);
+@@ -638,7 +1116,7 @@ int vcp_deregister_feature(enum feature_id id)
+ {
+ 	int ret = -EINVAL;
+ 
+-	if (!vcp_enable || id >= NUM_FEATURE_ID)
++	if (!vcp_enable || !vcp_probed || id >= NUM_FEATURE_ID)
+ 		return -EINVAL;
+ 	mutex_lock(&vcp_feature_mutex);
+ 	if (feature_enable[id]) {
+@@ -658,13 +1136,18 @@ static int vcp_pm_event(struct notifier_block *nb, unsigned long ev, void *unuse
+ 	case PM_SUSPEND_PREPARE:
+ 		vcp_extern_notify(VCP_EVENT_SUSPEND);
+ 		mutex_lock(&vcp_pw_clk_mutex);
+-		if (!is_suspending && pwclkcnt)
++		if (!is_suspending)
+ 			vcp_power_down();
+ 		is_suspending = true;
+ 		mutex_unlock(&vcp_pw_clk_mutex);
+ 		return NOTIFY_OK;
+ 	case PM_POST_SUSPEND:
+ 		mutex_lock(&vcp_pw_clk_mutex);
++		/*
++		 * A failure leaves the VCP off with its users still counted;
++		 * they see it in is_vcp_ready() after VCP_EVENT_RESUME and
++		 * the next vcp_register_feature() starts it again.
++		 */
+ 		if (is_suspending && pwclkcnt)
+ 			vcp_power_up(VCP_ALL_SUSPEND);
+ 		is_suspending = false;
+@@ -805,22 +1288,175 @@ static void vcp_mbox_setup_pin_table(unsigned int mbox)
+ static ssize_t vcp_status_show(struct device *dev, struct device_attribute *attr,
+ 			       char *buf)
+ {
++	unsigned int i;
+ 	ssize_t len;
+ 
+-	len = sysfs_emit(buf, "ready %u gen %u users %d suspending %d\n",
+-			 is_vcp_ready(VCP_A_ID), vcp_generation, pwclkcnt,
+-			 is_suspending);
+-	if (pwclkcnt)
++	mutex_lock(&vcp_pw_clk_mutex);
++	len = sysfs_emit(buf, "ready %u state %s gen %u users %d powered %d suspending %d\n",
++			 is_vcp_ready(VCP_A_ID), vcp_state_names[vcp_state],
++			 vcp_generation, pwclkcnt, vcp_powered, is_suspending);
++	if (vcp_powered)
+ 		len += sysfs_emit_at(buf, len,
+ 				     "status 0x%x pc 0x%x lr 0x%x resv 0x%x/0x%x\n",
+ 				     core0_rd(R_CORE_STATUS), core0_rd(R_CORE_MON_PC),
+ 				     core0_rd(R_CORE_MON_LR),
+ 				     core0_rd(DRAM_RESV_ADDR_REG),
+ 				     core0_rd(DRAM_RESV_SIZE_REG));
++	if (vcp_start_seq) {
++		len += sysfs_emit_at(buf, len,
++				     "start %u: %s (%d), mmup %lu Hz from %s, access control ret %lu, reset release ret %lu\n",
++				     vcp_start_seq,
++				     vcp_diag.stage ? vcp_diag.stage : "ok",
++				     vcp_diag.err, vcp_diag.clk_rate,
++				     vcp_diag.clk_parent ? vcp_diag.clk_parent : "?",
++				     vcp_diag.dapc_ret, vcp_diag.release_ret);
++		len += sysfs_emit_at(buf, len,
++				     "start %u: resv 0x%x/0x%x read back, %u clock switch(es), ready irqs %u calls %u short %u out of turn %u, stop ack %d\n",
++				     vcp_start_seq, vcp_diag.resv_addr,
++				     vcp_diag.resv_size, vcp_diag.clk_tries,
++				     vcp_diag.ready_irqs, vcp_diag.ready_cbs,
++				     vcp_diag.ready_short, vcp_diag.ready_stale,
++				     vcp_diag.stop_ack);
++		for (i = 0; i < vcp_diag.nsamples; i++) {
++			const struct vcp_core_sample *c = &vcp_diag.sample[i];
++
++			len += sysfs_emit_at(buf, len,
++					     "start %u: +%u ms: status 0x%x rstn_clr 0x%x pc 0x%x lr 0x%x sp 0x%x latched %*ph hart1 %*ph freq cur 0x%x exp 0x%x hint 0x%x power 0x%x\n",
++					     vcp_start_seq, c->ms, c->status,
++					     c->rstn_clr, c->pc, c->lr, c->sp,
++					     (int)sizeof(c->latch), c->latch,
++					     (int)sizeof(c->hart1), c->hart1,
++					     c->cur_freq, c->exp_freq, c->hint,
++					     c->pwr);
++		}
++	}
++	if (vcp_request_result <= 0)
++		len += sysfs_emit_at(buf, len, "request: %s (%d)\n",
++				     vcp_request_result ? "failed" : "taken by the firmware",
++				     vcp_request_result);
++	mutex_unlock(&vcp_pw_clk_mutex);
+ 	return len;
+ }
+ static DEVICE_ATTR_RO(vcp_status);
+ 
++/*
++ * A request that needs no codec: the sleep channel's status command for
++ * the RTOS feature. There is no data in the answer; the firmware taking
++ * the message within the timeout is the result.
++ */
++static int vcp_send_request(void)
++{
++	struct slp_ctrl_data msg = {
++		.feature = RTOS_FEATURE_ID,
++		.cmd = SLP_STATUS_DBG,
++	};
++	int ret;
++
++	mutex_lock(&vcp_pw_clk_mutex);
++	if (!is_vcp_ready(VCP_A_ID)) {
++		ret = -ENODEV;
++	} else {
++		ret = mtk_ipi_send_compl(&vcp_ipidev, IPI_OUT_C_SLEEP_0,
++					 IPI_SEND_WAIT, &msg,
++					 PIN_OUT_C_SIZE_SLEEP_0,
++					 VCP_REQUEST_TIMEOUT_MS);
++		dev_info(vcp_dev, "request on the sleep channel: ipi result %d\n", ret);
++		switch (ret) {
++		case IPI_ACTION_DONE:
++			break;
++		case IPI_COMPL_TIMEOUT:
++			ret = -ETIMEDOUT;
++			break;
++		case IPI_PIN_BUSY:
++			ret = -EBUSY;
++			break;
++		default:
++			ret = -EIO;
++		}
++	}
++	vcp_request_result = ret;
++	mutex_unlock(&vcp_pw_clk_mutex);
++	return ret;
++}
++
++/* echo 1 > vcp_request: send that request to the ready firmware */
++static ssize_t vcp_request_store(struct device *dev, struct device_attribute *attr,
++				 const char *buf, size_t count)
++{
++	int ret = vcp_send_request();
++
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(vcp_request);
++
++/*
++ * The boot loader loads the firmware and keeps its log of the current boot
++ * in the log_store reserved memory: a header (signature, buffer size, then
++ * offset, size and flag of the first stage and of the second stage log)
++ * followed by the text. Show the second stage's lines that mention the
++ * VCP, to see in the same boot whether both image parts were loaded.
++ */
++#define LOG_STORE_SIG		0xcdab3412
++
++static ssize_t vcp_lk_log_show(struct device *dev, struct device_attribute *attr,
++			       char *buf)
++{
++	struct device_node *np;
++	struct resource res;
++	const __le32 *hdr;
++	const char *text, *line, *end, *eol;
++	u32 size, off, len;
++	ssize_t out = 0;
++	void *mem;
++	int ret;
++
++	np = of_find_compatible_node(NULL, NULL, "mediatek,log_store");
++	if (!np)
++		return sysfs_emit(buf, "no log_store reserved memory node\n");
++	ret = of_address_to_resource(np, 0, &res);
++	of_node_put(np);
++	if (ret)
++		return ret;
++	if (resource_size(&res) < 32)
++		return -EINVAL;
++
++	mem = memremap(res.start, resource_size(&res), MEMREMAP_WB);
++	if (!mem)
++		return -ENOMEM;
++	hdr = mem;
++	size = le32_to_cpu(hdr[1]);
++	off = le32_to_cpu(hdr[5]);
++	len = le32_to_cpu(hdr[6]);
++	if (le32_to_cpu(hdr[0]) != LOG_STORE_SIG) {
++		out = sysfs_emit(buf, "no boot loader log at %pa: signature 0x%x\n",
++				 &res.start, le32_to_cpu(hdr[0]));
++		goto out;
++	}
++	if (off >= resource_size(&res) || len > resource_size(&res) - off) {
++		out = sysfs_emit(buf, "boot loader log header out of range: size 0x%x offset 0x%x length 0x%x\n",
++				 size, off, len);
++		goto out;
++	}
++
++	out = sysfs_emit(buf, "log_store %pa: buffer 0x%x, second stage log at 0x%x, 0x%x bytes\n",
++			 &res.start, size, off, len);
++	text = mem + off;
++	end = text + len;
++	for (line = text; line < end; line = eol + 1) {
++		eol = memchr(line, '\n', end - line);
++		if (!eol)
++			eol = end;
++		if ((strnstr(line, "vcp", eol - line) ||
++		     strnstr(line, "VCP", eol - line)) && out < PAGE_SIZE - 160)
++			out += sysfs_emit_at(buf, out, "%.*s\n",
++					     (int)min_t(size_t, eol - line, 150), line);
++	}
++out:
++	memunmap(mem);
++	return out;
++}
++static DEVICE_ATTR_RO(vcp_lk_log);
++
+ /* echo 1 > vcp_rtos: hold the VCP powered (RTOS feature), 0: release */
+ static ssize_t vcp_rtos_store(struct device *dev, struct device_attribute *attr,
+ 			      const char *buf, size_t count)
+@@ -840,14 +1476,156 @@ static DEVICE_ATTR_WO(vcp_rtos);
+ static struct attribute *vcp_attrs[] = {
+ 	&dev_attr_vcp_status.attr,
+ 	&dev_attr_vcp_rtos.attr,
++	&dev_attr_vcp_request.attr,
++	&dev_attr_vcp_lk_log.attr,
+ 	NULL,
+ };
++
+ static const struct attribute_group vcp_group = {
+ 	.attrs = vcp_attrs,
+ };
+ 
+ /* --- probe ------------------------------------------------------------ */
+ 
++/*
++ * The mailbox copies msg_size words into the buffer given here, so a pin
++ * is only registered when the table gives it the size of its buffer. A
++ * start cannot succeed without the ready pin and the interrupt of its
++ * mailbox; the others are reported.
++ */
++static int vcp_register_pin(struct device *dev, int ipi_id, mbox_pin_cb_t cb,
++			    void *buf, unsigned int words, const char *name)
++{
++	struct mtk_mbox_pin_recv *pin = vcp_ipidev.table[ipi_id].pin_recv;
++	int ret;
++
++	if (!pin) {
++		dev_notice(dev, "%s pin %d: not in the receive table\n", name, ipi_id);
++		return -ENOENT;
++	}
++	if (!buf) {
++		/* no fixed size: take what the table says */
++		words = pin->msg_size;
++		buf = devm_kcalloc(dev, words, sizeof(u32), GFP_KERNEL);
++		if (!buf)
++			return -ENOMEM;
++	}
++	if (pin->msg_size != words) {
++		dev_err(dev, "%s pin %d: %u words in the table, %u expected\n",
++			name, ipi_id, pin->msg_size, words);
++		return -EMSGSIZE;
++	}
++	if (pin->mbox >= vcp_mboxdev.count ||
++	    vcp_mboxdev.info_table[pin->mbox].irq_num <= 0) {
++		dev_err(dev, "%s pin %d: mailbox %u has no interrupt\n",
++			name, ipi_id, pin->mbox);
++		return -ENXIO;
++	}
++	ret = mtk_ipi_register(&vcp_ipidev, ipi_id, cb, (void *)name, buf);
++	if (ret != IPI_ACTION_DONE) {
++		dev_err(dev, "%s pin %d: register: %d\n", name, ipi_id, ret);
++		return -EIO;
++	}
++	dev_dbg(dev, "%s pin %d: mailbox %u irq %d bit %u\n", name, ipi_id,
++		pin->mbox, vcp_mboxdev.info_table[pin->mbox].irq_num,
++		pin->pin_index);
++	return 0;
++}
++
++/*
++ * Messages nobody handles yet. They are taken (the mailbox needs a buffer
++ * for every pin that can fire) and shown: an error report of the firmware
++ * is the first thing to read when a start goes wrong.
++ */
++static int vcp_unhandled_ipi_handler(unsigned int id, void *prdata, void *data,
++				     unsigned int len)
++{
++	dev_warn_ratelimited(vcp_dev, "%s message, %u bytes: %*ph\n",
++			     (const char *)prdata, len, (int)min(len, 40U), data);
++	return 0;
++}
++
++static const struct {
++	int ipi_id;
++	const char *name;
++} vcp_unhandled_pins[] = {
++	{ IPI_IN_VCP_ERROR_INFO_0, "error info" },
++	{ IPI_IN_VCP_ERROR_INFO_1, "error info 1" },
++	{ IPI_IN_VCP_RAM_DUMP_0, "ram dump" },
++	{ IPI_IN_VCP_RAM_DUMP_1, "ram dump 1" },
++	{ IPI_IN_LOGGER_CTRL, "logger" },
++};
++
++static int vcp_register_pins(struct device *dev)
++{
++	unsigned int i;
++	int ret;
++
++	ret = vcp_register_pin(dev, IPI_IN_VCP_READY_0, vcp_ready_ipi_handler,
++			       &msg_vcp_ready0, PIN_IN_SIZE_VCP_READY_0, "ready");
++	if (ret)
++		return ret;
++
++	/* the sleep acknowledge and the second hart's ready are not waited for */
++	vcp_register_pin(dev, IPI_OUT_C_SLEEP_0, NULL, &slp_ipi_ack_data, 1,
++			 "sleep ack");
++	vcp_register_pin(dev, IPI_IN_VCP_READY_1, vcp_ready_ipi_handler,
++			 &msg_vcp_ready1, PIN_IN_SIZE_VCP_READY_0, "ready 1");
++	for (i = 0; i < ARRAY_SIZE(vcp_unhandled_pins); i++)
++		vcp_register_pin(dev, vcp_unhandled_pins[i].ipi_id,
++				 vcp_unhandled_ipi_handler, NULL, 0,
++				 vcp_unhandled_pins[i].name);
++	return 0;
++}
++
++/*
++ * Optional "mediatek,smi": the SMI (sub-)common the VCP's memory port goes
++ * through. Linked as a runtime PM supplier, it is powered and clocked
++ * whenever the VCP is.
++ */
++static void vcp_unlink_smi(struct device *dev)
++{
++	unsigned int i;
++
++	for (i = 0; i < VCP_MAX_SMI; i++) {
++		if (vcp_smi_devs[i])
++			device_link_remove(dev, vcp_smi_devs[i]);
++		vcp_smi_devs[i] = NULL;
++	}
++}
++
++static int vcp_link_smi(struct device *dev)
++{
++	struct platform_device *smi_pdev;
++	struct device_node *np;
++	struct device_link *link;
++	unsigned int i;
++
++	for (i = 0; i < VCP_MAX_SMI; i++) {
++		np = of_parse_phandle(dev->of_node, "mediatek,smi", i);
++		if (!np)
++			break;
++		smi_pdev = of_find_device_by_node(np);
++		of_node_put(np);
++		if (!smi_pdev || !platform_get_drvdata(smi_pdev)) {
++			if (smi_pdev)
++				put_device(&smi_pdev->dev);
++			vcp_unlink_smi(dev);
++			return -EPROBE_DEFER;
++		}
++		link = device_link_add(dev, &smi_pdev->dev,
++				       DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);
++		put_device(&smi_pdev->dev);
++		if (!link) {
++			vcp_unlink_smi(dev);
++			return dev_err_probe(dev, -ENODEV,
++					     "cannot link to the smi\n");
++		}
++		vcp_smi_devs[i] = &smi_pdev->dev;
++	}
++	return 0;
++}
++
+ static void __iomem *vcp_ioremap_byname(struct platform_device *pdev,
+ 					const char *name, bool optional,
+ 					unsigned int *size)
+@@ -871,6 +1649,10 @@ static int vcp_main_probe(struct platform_device *pdev)
+ 	unsigned int i;
+ 	int ret;
+ 
++	ret = vcp_link_smi(dev);
++	if (ret)
++		return ret;
++
+ 	vcp_dev = dev;
+ 	vcp_io_devs[VCP_IOMMU_256MB1] = dev;
+ 
+@@ -879,15 +1661,22 @@ static int vcp_main_probe(struct platform_device *pdev)
+ 	vcpreg.cfg = vcp_ioremap_byname(pdev, "vcp_cfgreg", false, NULL);
+ 	vcpreg.cfg_core0 = vcp_ioremap_byname(pdev, "vcp_cfgreg_core0", false, NULL);
+ 	vcpreg.cfg_core1 = vcp_ioremap_byname(pdev, "vcp_cfgreg_core1", true, NULL);
++	vcpreg.pwr = vcp_ioremap_byname(pdev, "vcp_pwr_ctl", true, NULL);
++	if (IS_ERR(vcpreg.pwr))
++		vcpreg.pwr = NULL;
+ 	if (IS_ERR(vcpreg.sram) || IS_ERR(vcpreg.cfg) || IS_ERR(vcpreg.cfg_core0) ||
+-	    IS_ERR(vcpreg.cfg_core1))
+-		return -ENODEV;
++	    IS_ERR(vcpreg.cfg_core1)) {
++		ret = -ENODEV;
++		goto err_dev;
++	}
+ 
+ 	of_property_read_u32(dev->of_node, "vcp-sram-size", &vcpreg.vcp_tcmsize);
+ 	of_property_read_u32(dev->of_node, "core-nums", &vcpreg.core_nums);
+ 	of_property_read_u32(dev->of_node, "twohart", &vcpreg.twohart);
+-	if (!vcpreg.vcp_tcmsize || !vcpreg.core_nums)
+-		return -ENODEV;
++	if (!vcpreg.vcp_tcmsize || !vcpreg.core_nums) {
++		ret = -ENODEV;
++		goto err_dev;
++	}
+ 	if (!of_property_read_string(dev->of_node, "core-0", &core0) &&
+ 	    !strcmp(core0, "enable"))
+ 		vcp_enable = true;
+@@ -899,18 +1688,25 @@ static int vcp_main_probe(struct platform_device *pdev)
+ 	vcpsel = devm_clk_get_optional(dev, "mmup-sel");
+ 	vcpclk = devm_clk_get_optional(dev, "mmup-clk");
+ 	vcp26m = devm_clk_get_optional(dev, "mmup-26m");
+-	if (IS_ERR(vcpsel))
+-		return dev_err_probe(dev, PTR_ERR(vcpsel), "mmup-sel\n");
+-	if (IS_ERR(vcpclk))
+-		return dev_err_probe(dev, PTR_ERR(vcpclk), "mmup-clk\n");
+-	if (IS_ERR(vcp26m))
+-		return dev_err_probe(dev, PTR_ERR(vcp26m), "mmup-26m\n");
++	if (IS_ERR(vcpsel)) {
++		ret = dev_err_probe(dev, PTR_ERR(vcpsel), "mmup-sel\n");
++		goto err_dev;
++	}
++	if (IS_ERR(vcpclk)) {
++		ret = dev_err_probe(dev, PTR_ERR(vcpclk), "mmup-clk\n");
++		goto err_dev;
++	}
++	if (IS_ERR(vcp26m)) {
++		ret = dev_err_probe(dev, PTR_ERR(vcp26m), "mmup-26m\n");
++		goto err_dev;
++	}
+ 
+ 	vcp_wq = alloc_ordered_workqueue("vcp_wq", 0);
+-	if (!vcp_wq)
+-		return -ENOMEM;
++	if (!vcp_wq) {
++		ret = -ENOMEM;
++		goto err_dev;
++	}
+ 	INIT_WORK(&vcp_ready_work, vcp_ready_ws);
+-	timer_setup(&vcp_ready_timer, vcp_ready_timeout, 0);
+ 
+ 	vcpreg.irq_wdt = platform_get_irq_byname_optional(pdev, "wdt");
+ 	if (vcpreg.irq_wdt > 0) {
+@@ -941,11 +1737,9 @@ static int vcp_main_probe(struct platform_device *pdev)
+ 		dev_err(dev, "ipi device register: %d\n", ret);
+ 		goto err_wq;
+ 	}
+-	mtk_ipi_register(&vcp_ipidev, IPI_OUT_C_SLEEP_0, NULL, NULL, &slp_ipi_ack_data);
+-	mtk_ipi_register(&vcp_ipidev, IPI_IN_VCP_READY_0, vcp_ready_ipi_handler,
+-			 NULL, &msg_vcp_ready0);
+-	mtk_ipi_register(&vcp_ipidev, IPI_IN_VCP_READY_1, vcp_ready_ipi_handler,
+-			 NULL, &msg_vcp_ready1);
++	ret = vcp_register_pins(dev);
++	if (ret)
++		goto err_wq;
+ 
+ 	ret = vcp_reserve_memory_init(pdev);
+ 	if (ret)
+@@ -965,8 +1759,14 @@ static int vcp_main_probe(struct platform_device *pdev)
+ 		 vcpreg.total_tcmsize, vcpreg.vcp_tcmsize, vcp_mboxdev.count,
+ 		 vcp_mboxdev.send_count, vcp_mboxdev.recv_count);
+ 
+-	if (boot_test)
+-		vcp_register_feature(RTOS_FEATURE_ID);
++	vcp_probed = true;
++
++	if (boot_test) {
++		ret = vcp_register_feature(RTOS_FEATURE_ID);
++		dev_info(dev, "boot test: start %d\n", ret);
++		if (!ret)
++			dev_info(dev, "boot test: request %d\n", vcp_send_request());
++	}
+ 	return 0;
+ 
+ err_pm:
+@@ -974,6 +1774,11 @@ static int vcp_main_probe(struct platform_device *pdev)
+ err_wq:
+ 	destroy_workqueue(vcp_wq);
+ 	vcp_wq = NULL;
++err_dev:
++	vcp_enable = false;
++	vcp_io_devs[VCP_IOMMU_256MB1] = NULL;
++	vcp_dev = NULL;
++	vcp_unlink_smi(dev);
+ 	return ret;
+ }
+ 
+@@ -988,12 +1793,10 @@ static int vcp_io_probe(struct platform_device *pdev)
+ 	if (support < 2 || support > VCP_IOMMU_DEV_NUM)
+ 		return -ENODEV;
+ 
+-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+-	if (ret)
+-		return ret;
+-	ret = dma_set_max_seg_size(dev, UINT_MAX);
++	ret = vcp_set_dma_mask(dev);
+ 	if (ret)
+ 		return ret;
++	dma_set_max_seg_size(dev, UINT_MAX);
+ 	vcp_io_devs[support - 1] = dev;
+ 	return 0;
+ }
+@@ -1017,18 +1820,23 @@ static void vcp_remove(struct platform_device *pdev)
+ 	if (&pdev->dev != vcp_dev)
+ 		return;
+ 
++	if (!vcp_probed)
++		return;
++
++	vcp_probed = false;
+ 	mutex_lock(&vcp_pw_clk_mutex);
+-	if (pwclkcnt) {
++	if (vcp_powered) {
+ 		vcp_extern_notify(VCP_EVENT_STOP);
+ 		vcp_power_down();
+-		pwclkcnt = 0;
+ 	}
++	pwclkcnt = 0;
+ 	mutex_unlock(&vcp_pw_clk_mutex);
+ 	unregister_pm_notifier(&vcp_pm_nb);
+ 	pm_runtime_disable(&pdev->dev);
+ 	if (vcp_wq)
+ 		destroy_workqueue(vcp_wq);
+ 	vcp_wq = NULL;
++	vcp_unlink_smi(&pdev->dev);
+ 	vcp_dev = NULL;
+ }
+ 
+diff --git a/drivers/soc/mediatek/vcp/vcp_reg.h b/drivers/soc/mediatek/vcp/vcp_reg.h
+index 09abfdd6d395..2069e3f3916d 100644
+--- a/drivers/soc/mediatek/vcp/vcp_reg.h
++++ b/drivers/soc/mediatek/vcp/vcp_reg.h
+@@ -27,6 +27,8 @@
+ #define R_CORE_GENERAL_REG0		0x0040
+ #define R_CORE_GENERAL_REG1		0x0044	/* DRAM_RESV_ADDR */
+ #define R_CORE_GENERAL_REG2		0x0048	/* DRAM_RESV_SIZE */
++#define R_CORE_EXPECTED_FREQ		0x004c	/* written by the running firmware */
++#define R_CORE_CURRENT_FREQ		0x0050
+ #define R_CORE_GENERAL_REG5		0x0054	/* hart0 reboot handshake */
+ #define R_CORE_GENERAL_REG6		0x0058	/* hart1 reboot handshake */
+ #define  CORE_RDY_TO_REBOOT		0x34
+@@ -38,6 +40,12 @@
+ #define R_CORE_MON_PC			0x0080
+ #define R_CORE_MON_LR			0x0084
+ #define R_CORE_MON_SP			0x0088
++#define R_CORE_MON_LATCH		0x00d0	/* latched PC, LR, SP: 3 words */
++#define R_CORE_MON_HART1		0x0160	/* hart 1 monitor: 7 words */
++#define R_CORE_MON_HART1_WORDS		7
++
++/* "vcp_pwr_ctl" */
++#define VCP_POWER_STATUS		0x0068
+ 
+ #define DRAM_RESV_ADDR_REG		R_CORE_GENERAL_REG1
+ #define DRAM_RESV_SIZE_REG		R_CORE_GENERAL_REG2
+-- 
+2.56.1
+

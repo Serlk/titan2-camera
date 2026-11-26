@@ -1,0 +1,3435 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 04:02:24 +0300
+Subject: [PATCH 16/19] media: mediatek: Add an MT6878 RAW/YUV engine driver
+ for a replayed command queue
+
+EXPERIMENTAL: on the phone the first frame overruns the timing generator
+on its first line; no frame is delivered yet.
+
+The register settings of a frame of the RAW/YUV engines are made by a
+composer that is not available. The kernel side resets the engines, sets
+a handful of fixed values, points the engine at the two command lists,
+starts them, switches the viewfinder on and handles the interrupts. This
+driver does that part and takes the lists from request dumps that the
+user captures on their own device (request_firmware,
+titan2/camraw-start.bin for the first request of a stream and
+titan2/camraw-frame.bin for the per-frame one). No dump is part of the
+kernel.
+
+mtk-camraw-replay.c reads a dump as it is (the 64 KiB command queue
+slot, the settings buffer, the image outputs and statistics buffers of
+the frame parameters, the sensor input of the configuration parameters).
+Every descriptor must write slot or settings values into one of the six
+blocks (RAW, RMS and YUV of both halves of a frame split between RAW-A
+and RAW-B); every address pair at a DMA port must point into one of the
+request's buffers, or the request is refused. The buffers are replaced by
+buffers of this driver at their own addresses. Pure data code.
+
+mtk-camraw-drv.c: the video node outside the media graph, power, clocks,
+larbs through the M4U, interrupts, side B only with twin=1, and for the
+first-frame overrun: clock rates at stream start (cam_mhz), register
+snapshots at the first start of frame and the first error, prestart,
+apply_delay_us and err_mask switches. Depends on MFD_SYSCON (selecting it
+closed a Kconfig dependency loop).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/media/platform/mediatek/Kconfig       |    1 +
+ drivers/media/platform/mediatek/Makefile      |    1 +
+ .../media/platform/mediatek/camraw/Kconfig    |   22 +
+ .../media/platform/mediatek/camraw/Makefile   |    3 +
+ .../platform/mediatek/camraw/mtk-camraw-drv.c | 2043 +++++++++++++++++
+ .../mediatek/camraw/mtk-camraw-regs.h         |  175 ++
+ .../mediatek/camraw/mtk-camraw-replay.c       |  669 ++++++
+ .../mediatek/camraw/mtk-camraw-replay.h       |  200 ++
+ .../platform/mediatek/camraw/mtk-camraw.h     |  201 ++
+ 9 files changed, 3315 insertions(+)
+ create mode 100644 drivers/media/platform/mediatek/camraw/Kconfig
+ create mode 100644 drivers/media/platform/mediatek/camraw/Makefile
+ create mode 100644 drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+ create mode 100644 drivers/media/platform/mediatek/camraw/mtk-camraw-regs.h
+ create mode 100644 drivers/media/platform/mediatek/camraw/mtk-camraw-replay.c
+ create mode 100644 drivers/media/platform/mediatek/camraw/mtk-camraw-replay.h
+ create mode 100644 drivers/media/platform/mediatek/camraw/mtk-camraw.h
+
+diff --git a/drivers/media/platform/mediatek/Kconfig b/drivers/media/platform/mediatek/Kconfig
+index 5bfe7782b07d..ec3ca4530dbf 100644
+--- a/drivers/media/platform/mediatek/Kconfig
++++ b/drivers/media/platform/mediatek/Kconfig
+@@ -2,6 +2,7 @@
+ 
+ comment "Mediatek media platform drivers"
+ 
++source "drivers/media/platform/mediatek/camraw/Kconfig"
+ source "drivers/media/platform/mediatek/camsv/Kconfig"
+ source "drivers/media/platform/mediatek/jpeg/Kconfig"
+ source "drivers/media/platform/mediatek/mdp/Kconfig"
+diff --git a/drivers/media/platform/mediatek/Makefile b/drivers/media/platform/mediatek/Makefile
+index f45bd72cd0c5..3f5dd5db362f 100644
+--- a/drivers/media/platform/mediatek/Makefile
++++ b/drivers/media/platform/mediatek/Makefile
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0-only
++obj-y += camraw/
+ obj-y += camsv/
+ obj-y += jpeg/
+ obj-y += mdp/
+diff --git a/drivers/media/platform/mediatek/camraw/Kconfig b/drivers/media/platform/mediatek/camraw/Kconfig
+new file mode 100644
+index 000000000000..bfea89355970
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camraw/Kconfig
+@@ -0,0 +1,22 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config VIDEO_MEDIATEK_CAMRAW_REPLAY
++	tristate "MediaTek MT6878 RAW/YUV engine, replay of a captured command queue"
++	depends on V4L_PLATFORM_DRIVERS
++	depends on VIDEO_DEV
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on PM
++	depends on VIDEO_MEDIATEK_SENINF
++	depends on MFD_SYSCON
++	select FW_LOADER
++	select VIDEOBUF2_VMALLOC
++	help
++	  Bring-up driver for the RAW-A and YUV-A engines of the image
++	  signal processor of the MediaTek MT6878 SoC. The register
++	  settings of a frame are not made by this driver: it takes the
++	  command queue of a frame from a request dump loaded as a firmware
++	  file, places it at its own address with its own buffers and runs
++	  it, with the sensor in the mode of the capture. The processed
++	  picture is delivered by a V4L2 capture node.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called mtk-camraw-mt6878.
+diff --git a/drivers/media/platform/mediatek/camraw/Makefile b/drivers/media/platform/mediatek/camraw/Makefile
+new file mode 100644
+index 000000000000..705deb80cf12
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camraw/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0-only
++mtk-camraw-mt6878-y := mtk-camraw-drv.o mtk-camraw-replay.o
++obj-$(CONFIG_VIDEO_MEDIATEK_CAMRAW_REPLAY) += mtk-camraw-mt6878.o
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+new file mode 100644
+index 000000000000..1eb50fa4082e
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+@@ -0,0 +1,2043 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * MediaTek MT6878 RAW / YUV engine pair driven by a replayed command queue.
++ *
++ * The register settings of a frame of these engines are made by a composer
++ * that is not available. What the kernel side does by itself is small:
++ * reset, a handful of fixed values, pointing the engine at the two command
++ * lists, starting them, switching the viewfinder on, and the interrupts.
++ * This driver does that part and takes the lists from request dumps
++ * captured elsewhere (mtk-camraw-replay.c), placed at its own addresses with
++ * its own buffers. Nothing in the picture can be changed: size, crop,
++ * colour and gains are those of the captured frame, and the sensor has to
++ * run the mode it ran then.
++ *
++ * Two requests are replayed, each always as a whole:
++ *  - the start request (module parameter start_fw), the first request of a
++ *    captured stream: it alone sets up the timing generator, the grab
++ *    window, the time stamp counter and the interrupt enables. It is
++ *    applied once, before the sensor streams, and produces no picture;
++ *  - the per-frame request (frame_fw), a steady request of the same mode,
++ *    applied after every start of frame, alternately from two copies that
++ *    differ only in the picture buffers. The frame number value of each
++ *    copy is replaced by the number of the application.
++ *
++ * The captured lists program both halves of a frame split between RAW-A
++ * and RAW-B (with their RMS and YUV blocks). With twin=1 the second engine
++ * (mediatek,twin) is powered, reset and initialised as well and the lists
++ * are run as captured. With twin=0 (default) the side B descriptors are
++ * left out and only the left part of the picture is expected.
++ *
++ * The video node delivers the two planes of the picture output in one
++ * buffer, copied at the start of the frame after the one that wrote them.
++ * It is not part of a media graph: the sensor and the sensor interface are
++ * set up through the media device of the CAMSV engine of the same CSI port,
++ * and this driver only asks the sensor interface to stream toward its RAW
++ * destination. See debugfs "status" for what was seen.
++ *
++ * Copyright (c) 2026 serlk
++ */
++
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/firmware.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iommu.h>
++#include <linux/iopoll.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/property.h>
++#include <linux/regmap.h>
++#include <linux/seq_file.h>
++#include <linux/unaligned.h>
++
++#include <media/v4l2-ioctl.h>
++#include <media/v4l2-subdev.h>
++#include <media/videobuf2-vmalloc.h>
++
++#include "../seninf/mtk-seninf.h"
++#include "mtk-camraw.h"
++
++#define CAMRAW_CQ_TIMEOUT_MS		200
++#define CAMRAW_WATCHDOG_MS		1000
++#define CAMRAW_IRQ_BURST		500
++#define CAMRAW_FILL			0xa5
++#define CAMRAW_PROBE_BYTES		64
++
++/*
++ * Start period of the command queue and frame done tolerance, set after
++ * the start request has programmed the time stamp counter divider: the
++ * counter runs at 208 MHz / ((divider + 1) * 2).
++ */
++#define CAMRAW_TS_CLK_KHZ		208000
++#define CAMRAW_SCQ_PERIOD_MS		16
++#define CAMRAW_DONE_TOLERANCE_MS	12
++
++static char *start_fw = "titan2/camraw-start.bin";
++module_param(start_fw, charp, 0644);
++MODULE_PARM_DESC(start_fw, "Start request (request 1 of a stream), below the firmware directory");
++
++static char *frame_fw = "titan2/camraw-frame.bin";
++module_param(frame_fw, charp, 0644);
++MODULE_PARM_DESC(frame_fw, "Steady request applied for every frame, below the firmware directory");
++
++static bool twin;
++module_param(twin, bool, 0644);
++MODULE_PARM_DESC(twin, "Run both RAW engines as captured (1), or only the side A descriptors (0, left part of the picture)");
++
++static unsigned int reapply = 1;
++module_param(reapply, uint, 0644);
++MODULE_PARM_DESC(reapply,
++		 "At each start of frame: 0 nothing (start request only), 1 apply the per-frame request, 2 also toggle the double buffer enable");
++
++static bool stats_off;
++module_param(stats_off, bool, 0644);
++MODULE_PARM_DESC(stats_off, "Clear the statistics writers in the writer enables of the lists");
++
++static bool extra_off;
++module_param(extra_off, bool, 0644);
++MODULE_PARM_DESC(extra_off, "Clear the YUV writers other than the picture in the writer enables of the lists");
++
++static unsigned int cam_mhz;
++module_param(cam_mhz, uint, 0644);
++MODULE_PARM_DESC(cam_mhz, "Set the cam-sel clock to this rate in MHz while streaming (0: leave it; the captured stream ran 312)");
++
++static bool prestart;
++module_param(prestart, bool, 0644);
++MODULE_PARM_DESC(prestart, "Also apply the per-frame request before the viewfinder is switched on, after the start request");
++
++static unsigned int apply_delay_us;
++module_param(apply_delay_us, uint, 0644);
++MODULE_PARM_DESC(apply_delay_us, "Wait this long after a start of frame before applying the per-frame request (0..30000)");
++
++static unsigned int err_mask;
++module_param(err_mask, uint, 0644);
++MODULE_PARM_DESC(err_mask,
++		 "Error reporting mask 0xfffe0000 of FLKO/UFEO/PDO/AAO/AAHO: 0 written at the port bases (as before), 1 at the error status words (base + 0x34), 2 not written");
++
++static const char * const camyuv_clk_names[CAMYUV_NUM_CLKS] = {
++	"yuv-larbx", "yuv-cam", "yuv-camtg",
++};
++
++static inline u32 raw_rd(struct mtk_camraw *raw, u32 reg)
++{
++	return readl(raw->base + reg);
++}
++
++static inline void raw_wr(struct mtk_camraw *raw, u32 reg, u32 val)
++{
++	writel(val, raw->base + reg);
++}
++
++/* the few control registers that are written to both copies */
++static void raw_wr_both(struct mtk_camraw *raw, u32 reg, u32 val)
++{
++	writel(val, raw->base + reg);
++	writel(val, raw->inner + reg);
++}
++
++static inline u32 yuv_rd(struct mtk_camraw *raw, u32 reg)
++{
++	return readl(raw->yuv->base + reg);
++}
++
++static inline void yuv_wr(struct mtk_camraw *raw, u32 reg, u32 val)
++{
++	writel(val, raw->yuv->base + reg);
++}
++
++static char raw_name(struct mtk_camraw *raw)
++{
++	return 'A' + raw->raw_id;
++}
++
++/* ------------------------------------------------------------------ */
++/* Hardware                                                            */
++
++static void camraw_hw_reset(struct mtk_camraw *raw)
++{
++	u32 mod6, mod6_inner, val;
++
++	raw_wr(raw, CAMCTL_MOD5_DCM_DIS, ~0U);
++	raw_wr(raw, CAMCTL_MOD6_DCM_DIS, ~0U);
++	yuv_wr(raw, CAMCTL_MOD5_DCM_DIS, ~0U);
++	yuv_wr(raw, CAMCTL_MOD6_DCM_DIS, ~0U);
++
++	mod6 = readl(raw->base + CAMCTL_MOD6_EN);
++	mod6_inner = readl(raw->inner + CAMCTL_MOD6_EN);
++	writel(mod6 | CAMCTL_MOD6_CQI_ALL, raw->base + CAMCTL_MOD6_EN);
++	writel(mod6_inner | CAMCTL_MOD6_CQI_ALL, raw->inner + CAMCTL_MOD6_EN);
++
++	raw_wr(raw, CAMCTL_SW_CTL, 0);
++	raw_wr(raw, CAMCTL_SW_CTL, CAMCTL_SW_RST_TRIG);
++	if (readl_poll_timeout(raw->base + CAMCTL_SW_CTL, val,
++			       val & CAMCTL_SW_RST_ST, 50, 5000))
++		dev_warn(raw->dev, "RAW-%c reset: no reset state within 5 ms, SW_CTL 0x%x\n",
++			 raw_name(raw), val);
++	raw_wr(raw, CAMCTL_SW_CTL, CAMCTL_HW_RST);
++	raw_wr(raw, CAMCTL_SW_CTL, 0);
++
++	writel(mod6, raw->base + CAMCTL_MOD6_EN);
++	writel(mod6_inner, raw->inner + CAMCTL_MOD6_EN);
++
++	raw_wr(raw, CAMCTL_MOD5_DCM_DIS, 0);
++	raw_wr(raw, CAMCTL_MOD6_DCM_DIS, 0);
++	yuv_wr(raw, CAMCTL_MOD5_DCM_DIS, 0);
++	yuv_wr(raw, CAMCTL_MOD6_DCM_DIS, 0);
++
++	raw_wr(raw, CAMRAW_LTM_RESET, 1);
++	raw_wr(raw, CAMRAW_LTM_RESET, 0);
++}
++
++static void camraw_expect(struct mtk_camraw *raw, const char *name, u32 reg,
++			  u32 want)
++{
++	u32 val = raw_rd(raw, reg);
++
++	if (val != want)
++		dev_warn(raw->dev, "RAW-%c %s (0x%x) reads 0x%x, 0x%x was written\n",
++			 raw_name(raw), name, reg, val, want);
++}
++
++/* bus halt and urgent settings in the camsys main block, on the fly path */
++static void camraw_camsys_init(struct mtk_camraw *raw, bool side_b)
++{
++	regmap_write(raw->camsys, CAM_MAIN_HALT1, 0x6);
++	regmap_write(raw->camsys, CAM_MAIN_HALT2, 0x6);
++	regmap_write(raw->camsys, CAM_MAIN_HALT3, 0xc0a);
++	regmap_write(raw->camsys, CAM_MAIN_HALT4, 0xc0a);
++	regmap_write(raw->camsys, CAM_MAIN_HALT13, 0xf0);
++	regmap_write(raw->camsys, CAM_MAIN_HALT5, 0x2860);
++	regmap_write(raw->camsys, CAM_MAIN_HALT6, 0x3);
++	if (side_b) {
++		regmap_write(raw->camsys, CAM_MAIN_HALT7, 0x2860);
++		regmap_write(raw->camsys, CAM_MAIN_HALT8, 0x3);
++	}
++}
++
++/* the values the kernel side sets once per stream, on each RAW engine */
++static void camraw_hw_init(struct mtk_camraw *raw)
++{
++	static const u32 cqi_ports[] = {
++		CAMRAW_CQI_R1, CAMRAW_CQI_R2, CAMRAW_CQI_R3, CAMRAW_CQI_R4,
++	};
++	/* FIFO of 64 entries, thresholds at 20/10, 40/30, 60/50, 10/0 % */
++	static const u32 cqi_fifo[] = {
++		0x10000040, 0x100c0006, 0x10190013, 0x80260020, 0x80060000,
++	};
++	static const u32 masked_err[] = {
++		CAMRAW_FLKO_R1, CAMRAW_UFEO_R1, CAMRAW_PDO_R1, CAMRAW_AAO_R1,
++		CAMRAW_AAHO_R1,
++	};
++	unsigned int i, j;
++
++	raw_wr_both(raw, CAMCQ_CQ_EN, CAMCQ_CQ_EN_INIT);
++	raw_wr_both(raw, CAMCTL_SW_PASS1_DONE, 0);
++	raw_wr_both(raw, CAMCTL_SW_SUB_CTL, 0);
++	raw_wr(raw, CAMCQ_SCQ_START_PERIOD, ~0U);
++	raw_wr(raw, CAMCQ_CQ_THR0_CTL, CAMCQ_THR_CTL_INIT);
++	raw_wr(raw, CAMCQ_CQ_SUB_THR0_CTL, CAMCQ_THR_CTL_INIT);
++	raw_wr(raw, CAMCTL_INT_EN(6), CAMCTL_INT6_CQ_BOTH);
++
++	for (i = 0; i < ARRAY_SIZE(cqi_ports); i++)
++		for (j = 0; j < ARRAY_SIZE(cqi_fifo); j++)
++			raw_wr(raw, cqi_ports[i] + CAMRAW_DMA_CON0 + 4 * j,
++			       cqi_fifo[j]);
++
++	/* low latency off */
++	raw_wr(raw, CAMRAW_LOW_LATENCY, 0xffff);
++	yuv_wr(raw, YUV_LOW_LATENCY0, 0xffff);
++	yuv_wr(raw, YUV_LOW_LATENCY1, 0xffff);
++	yuv_wr(raw, YUV_LOW_LATENCY2, 0xffff);
++
++	/* these writers do not report DMA errors */
++	for (i = 0; err_mask < 2 && i < ARRAY_SIZE(masked_err); i++)
++		raw_wr(raw, masked_err[i] + (err_mask ? CAMRAW_DMA_ERR_STAT : 0),
++		       CAMRAW_ERR_STAT_MASKED);
++
++	camraw_expect(raw, "CQ_EN", CAMCQ_CQ_EN, CAMCQ_CQ_EN_INIT);
++	camraw_expect(raw, "THR0_CTL", CAMCQ_CQ_THR0_CTL, CAMCQ_THR_CTL_INIT);
++	camraw_expect(raw, "SUB_THR0_CTL", CAMCQ_CQ_SUB_THR0_CTL,
++		      CAMCQ_THR_CTL_INIT);
++	camraw_expect(raw, "INT6_EN", CAMCTL_INT_EN(6), CAMCTL_INT6_CQ_BOTH);
++}
++
++/* point RAW-A at both lists of a slot and start them */
++static void camraw_apply_cq(struct mtk_camraw *raw, dma_addr_t slot,
++			    const struct camraw_replay *rp, const u32 *size)
++{
++	u64 main = (u64)slot + rp->list_off[CAMRAW_LIST_MAIN];
++	u64 sub = (u64)slot + rp->list_off[CAMRAW_LIST_SUB];
++
++	raw_wr(raw, CAMCQ_CQ_THR0_BASEADDR, lower_32_bits(main));
++	raw_wr(raw, CAMCQ_CQ_THR0_BASEADDR_MSB, upper_32_bits(main));
++	raw_wr(raw, CAMCQ_CQ_THR0_DESC_SIZE, size[CAMRAW_LIST_MAIN]);
++	raw_wr(raw, CAMCQ_CQ_SUB_THR0_BASEADDR, lower_32_bits(sub));
++	raw_wr(raw, CAMCQ_CQ_SUB_THR0_BASEADDR_MSB, upper_32_bits(sub));
++	raw_wr(raw, CAMCQ_CQ_SUB_THR0_DESC_SIZE, size[CAMRAW_LIST_SUB]);
++	raw_wr(raw, CAMCTL_START, CAMCTL_CQ_THR0_START);
++	raw->n_applied++;
++}
++
++/* double buffer enable off and on, with a read between */
++static void camraw_toggle_db(struct mtk_camraw *raw)
++{
++	u32 misc = raw_rd(raw, CAMCTL_MISC);
++
++	raw_wr_both(raw, CAMCTL_MISC, misc & ~CAMCTL_MISC_DB_EN);
++	raw_rd(raw, CAMCTL_MISC);
++	raw_wr_both(raw, CAMCTL_MISC, misc | CAMCTL_MISC_DB_EN);
++}
++
++static void camraw_pulse_db_load(struct mtk_camraw *raw)
++{
++	u32 val = raw_rd(raw, TG_PATH_CFG);
++
++	raw_wr(raw, TG_PATH_CFG, val | TG_DB_LOAD_DIS);
++	raw_wr(raw, TG_PATH_CFG, val & ~TG_DB_LOAD_DIS);
++}
++
++#define CAMRAW_OUT(fmt, ...) do {					\
++	if (m)								\
++		seq_printf(m, fmt "\n", ##__VA_ARGS__);			\
++	else								\
++		dev_info(raw->dev, "%s: " fmt "\n", when, ##__VA_ARGS__); \
++} while (0)
++
++/* registers of one RAW engine and its YUV engine; only while powered */
++static void camraw_show_hw(struct mtk_camraw *raw, struct mtk_camraw *eng,
++			   struct seq_file *m, const char *when)
++{
++	char line[200];
++	char side = raw_name(eng);
++	int len = 0;
++	unsigned int n;
++
++	for (n = 1; n <= CAMRAW_NUM_INT; n++)
++		len += scnprintf(line + len, sizeof(line) - len, " %u:%08x/%08x",
++				 n, raw_rd(eng, CAMCTL_INT_EN(n)),
++				 raw_rd(eng, CAMCTL_INT_STATUSX(n)));
++	CAMRAW_OUT("RAW-%c interrupt groups, enable/status mirror:%s", side, line);
++	for (len = 0, n = 1; n <= CAMRAW_NUM_INT; n++)
++		len += scnprintf(line + len, sizeof(line) - len, " %u:%08x/%08x",
++				 n, yuv_rd(eng, CAMCTL_INT_EN(n)),
++				 yuv_rd(eng, CAMCTL_INT_STATUSX(n)));
++	CAMRAW_OUT("YUV-%c interrupt groups, enable/status mirror:%s", side, line);
++	CAMRAW_OUT("RAW-%c CQ_EN 0x%x start period 0x%x done tolerance 0x%x THR0 ctl 0x%x base 0x%x:%08x size 0x%x, SUB ctl 0x%x base 0x%x:%08x size 0x%x",
++		   side, raw_rd(eng, CAMCQ_CQ_EN),
++		   raw_rd(eng, CAMCQ_SCQ_START_PERIOD),
++		   raw_rd(eng, CAMCTL_DC_STAG_CTL),
++		   raw_rd(eng, CAMCQ_CQ_THR0_CTL),
++		   raw_rd(eng, CAMCQ_CQ_THR0_BASEADDR_MSB),
++		   raw_rd(eng, CAMCQ_CQ_THR0_BASEADDR),
++		   raw_rd(eng, CAMCQ_CQ_THR0_DESC_SIZE),
++		   raw_rd(eng, CAMCQ_CQ_SUB_THR0_CTL),
++		   raw_rd(eng, CAMCQ_CQ_SUB_THR0_BASEADDR_MSB),
++		   raw_rd(eng, CAMCQ_CQ_SUB_THR0_BASEADDR),
++		   raw_rd(eng, CAMCQ_CQ_SUB_THR0_DESC_SIZE));
++	CAMRAW_OUT("RAW-%c TG sensor mode 0x%x viewfinder 0x%x grab 0x%08x/0x%08x path 0x%x frame size 0x%08x state 0x%08x time stamp counter %u columns 0x%08x",
++		   side, raw_rd(eng, TG_SEN_MODE), raw_rd(eng, TG_VF_CON),
++		   raw_rd(eng, TG_SEN_GRAB_PXL), raw_rd(eng, TG_SEN_GRAB_LIN),
++		   raw_rd(eng, TG_PATH_CFG), raw_rd(eng, TG_FRMSIZE_ST),
++		   raw_rd(eng, TG_INTER_ST), raw_rd(eng, TG_TIME_STAMP_CNT),
++		   raw_rd(eng, CAMRAW_SPLIT_COLS));
++	CAMRAW_OUT("RAW-%c frame number register 0x%x (latched 0x%x); writer enables RAW 0x%x (latched 0x%x) YUV 0x%x, YUV format select 0x%x, misc 0x%x",
++		   side, raw_rd(eng, CAMRAW_FRAME_SEQ_NUM),
++		   readl(eng->inner + CAMRAW_FRAME_SEQ_NUM),
++		   raw_rd(eng, CAMCTL_MOD5_EN), readl(eng->inner + CAMCTL_MOD5_EN),
++		   yuv_rd(eng, YUV_CAMCTL2_MOD5_EN),
++		   yuv_rd(eng, YUV_CAMCTL2_FMT3_SEL), raw_rd(eng, CAMCTL_MISC));
++	CAMRAW_OUT("RAW-%c DMA error status: YUVO_R1 0x%x YUVBO_R1 0x%x AAO 0x%x AAHO 0x%x CQI_R1 0x%x",
++		   side, yuv_rd(eng, YUV_YUVO_R1 + CAMRAW_DMA_ERR_STAT),
++		   yuv_rd(eng, YUV_YUVBO_R1 + CAMRAW_DMA_ERR_STAT),
++		   raw_rd(eng, CAMRAW_AAO_R1 + CAMRAW_DMA_ERR_STAT),
++		   raw_rd(eng, CAMRAW_AAHO_R1 + CAMRAW_DMA_ERR_STAT),
++		   raw_rd(eng, CAMRAW_CQI_R1 + CAMRAW_DMA_ERR_STAT));
++}
++
++static void camraw_show_all_hw(struct mtk_camraw *raw, struct seq_file *m,
++			       const char *when)
++{
++	camraw_show_hw(raw, raw, m, when);
++	if (raw->twin_on)
++		camraw_show_hw(raw, raw->twin, m, when);
++}
++
++static void camraw_show_counters(struct mtk_camraw *raw, struct seq_file *m,
++				 const char *when)
++{
++	static const char * const names[CAMRAW_NUM_IRQS] = { "RAW", "YUV" };
++	struct mtk_camraw_irq q[CAMRAW_NUM_IRQS];
++	unsigned int n_sof, n_main, n_sub, n_p1, n_yuvo, n_err, i;
++	unsigned long flags;
++	u32 err_bits;
++
++	spin_lock_irqsave(&raw->irq_lock, flags);
++	memcpy(q, raw->irqs, sizeof(q));
++	n_sof = raw->n_sof;
++	n_main = raw->n_cq_main;
++	n_sub = raw->n_cq_sub;
++	n_p1 = raw->n_pass1;
++	n_yuvo = raw->n_yuvo;
++	n_err = raw->n_err;
++	err_bits = raw->err_bits;
++	spin_unlock_irqrestore(&raw->irq_lock, flags);
++
++	CAMRAW_OUT("lists started %u (per-frame request %u times), main list done %u, sub list done %u, start of frame %u, pass 1 done %u, YUVO_R1 done %u, frames delivered %u, without a buffer %u",
++		   raw->n_applied, raw->n_frame_applied, n_main, n_sub, n_sof,
++		   n_p1, n_yuvo, raw->n_frames, raw->n_no_buffer);
++	CAMRAW_OUT("error interrupts %u, bits seen 0x%08x (6 overrun 7 grab 10 SOF drop 14-15 list start delay 16-17 main list 18 trigger delay 19-20 sub list 25 DMA)",
++		   n_err, err_bits);
++	for (i = 0; i < CAMRAW_NUM_IRQS; i++)
++		CAMRAW_OUT("%s-A interrupt: %u taken, %u with no status; status read again: %u clear, %u still set => read to clear %s%s%s",
++			   names[i], q[i].count, q[i].empty, q[i].reread_clear,
++			   q[i].reread_set,
++			   q[i].reread_set ? "DOES NOT HOLD" :
++			   q[i].reread_clear ? "holds" : "not seen yet",
++			   q[i].w1c_tried ? ", burst: status written back" : "",
++			   q[i].storm ? ", LINE SWITCHED OFF" : "");
++	for (i = 0; i < min(raw->n_sof_log, CAMRAW_SOF_LOG); i++)
++		CAMRAW_OUT("start of frame %u: %u us after viewfinder on, after %u per-frame applications, frame number 0x%x latched 0x%x, frame size 0x%08x",
++			   i + 1, raw->sof_log[i].t_us, raw->sof_log[i].applied,
++			   raw->sof_log[i].seq, raw->sof_log[i].seq_inner,
++			   raw->sof_log[i].frmsize);
++	if (raw->err_us)
++		CAMRAW_OUT("first error interrupt %u us after viewfinder on", raw->err_us);
++}
++
++#undef CAMRAW_OUT
++
++/* ------------------------------------------------------------------ */
++/* Register snapshots at the first start of frame and the first error  */
++
++static const struct {
++	bool yuv;
++	u16 off;
++	u16 num;
++} camraw_snap_ranges[] = {
++	{ false, 0x000, 64 },	/* control: enables, selects, misc, start */
++	{ false, 0x100, 36 },	/* interrupt groups 1..9 */
++	{ false, 0x700, 32 },	/* timing generator */
++	{ true, 0x000, 32 },	/* YUV control */
++	{ true, 0x100, 36 },	/* YUV interrupt groups */
++};
++
++static const char * const camraw_snap_names[] = {
++	"first start of frame", "first error interrupt",
++};
++
++/* the register window of a list address on the side of @eng, or NULL */
++static void __iomem *camraw_port_base(struct mtk_camraw *eng, u32 reg)
++{
++	u32 blk = reg & 0xffff0000;
++	u32 raw_blk = eng->raw_id ? CAMRAW_RAW_B_BASE : CAMRAW_RAW_A_BASE;
++	u32 yuv_blk = eng->raw_id ? CAMRAW_YUV_B_BASE : CAMRAW_YUV_A_BASE;
++
++	if ((reg & 0xffff) >= CAMRAW_WIN_SIZE)
++		return NULL;
++	if (blk == raw_blk)
++		return eng->base;
++	if (blk == yuv_blk)
++		return eng->yuv->base;
++	return NULL;	/* RMS: not mapped */
++}
++
++static void camraw_snap_take(struct mtk_camraw *raw, struct mtk_camraw *eng,
++			     struct mtk_camraw_snap *s, u32 t_us)
++{
++	const struct camraw_replay *rp = &raw->frame;
++	unsigned int i, j, n = 0;
++	void __iomem *base;
++
++	if (s->taken)
++		return;
++	for (i = 0; i < ARRAY_SIZE(camraw_snap_ranges); i++) {
++		base = camraw_snap_ranges[i].yuv ? eng->yuv->base : eng->base;
++		for (j = 0; j < camraw_snap_ranges[i].num; j++)
++			s->val[n++] = readl(base + camraw_snap_ranges[i].off + 4 * j);
++	}
++	s->num_ports = 0;
++	for (i = 0; i < rp->num_relocs && s->num_ports < CAMRAW_SNAP_PORTS; i++) {
++		base = camraw_port_base(eng, rp->relocs[i].reg);
++		if (!base)
++			continue;
++		s->port_reg[s->num_ports] = rp->relocs[i].reg;
++		s->port[s->num_ports++] =
++			readl(base + (rp->relocs[i].reg & 0xffff) + CAMRAW_DMA_ERR_STAT);
++	}
++	s->t_us = t_us;
++	s->taken = true;
++}
++
++static void camraw_snap_show(struct mtk_camraw *raw, struct mtk_camraw *eng,
++			     const struct mtk_camraw_snap *s, const char *what,
++			     struct seq_file *m)
++{
++	char line[160];
++	unsigned int i, j, k, n = 0;
++	int len;
++
++	if (!s->taken)
++		return;
++	for (i = 0; i < ARRAY_SIZE(camraw_snap_ranges); i++) {
++		for (j = 0; j < camraw_snap_ranges[i].num; j += 8) {
++			len = 0;
++			for (k = j; k < j + 8 && k < camraw_snap_ranges[i].num; k++)
++				len += scnprintf(line + len, sizeof(line) - len,
++						 " %08x", s->val[n + k]);
++			if (m)
++				seq_printf(m, "snapshot %s (%u us) %s-%c +0x%03x:%s\n",
++					   what, s->t_us,
++					   camraw_snap_ranges[i].yuv ? "YUV" : "RAW",
++					   'A' + eng->raw_id,
++					   camraw_snap_ranges[i].off + 4 * j, line);
++			else
++				dev_info(raw->dev, "snapshot %s (%u us) %s-%c +0x%03x:%s\n",
++					 what, s->t_us,
++					 camraw_snap_ranges[i].yuv ? "YUV" : "RAW",
++					 'A' + eng->raw_id,
++					 camraw_snap_ranges[i].off + 4 * j, line);
++		}
++		n += camraw_snap_ranges[i].num;
++	}
++	for (i = 0; i < s->num_ports; i += 6) {
++		len = 0;
++		for (k = i; k < i + 6 && k < s->num_ports; k++)
++			len += scnprintf(line + len, sizeof(line) - len,
++					 " %05x:%08x", s->port_reg[k] & 0xfffff,
++					 s->port[k]);
++		if (m)
++			seq_printf(m, "snapshot %s side %c port error status:%s\n",
++				   what, 'A' + eng->raw_id, line);
++		else
++			dev_info(raw->dev, "snapshot %s side %c port error status:%s\n",
++				 what, 'A' + eng->raw_id, line);
++	}
++}
++
++static void camraw_snaps_show(struct mtk_camraw *raw, struct seq_file *m)
++{
++	unsigned int ev;
++
++	for (ev = 0; ev < 2; ev++) {
++		camraw_snap_show(raw, raw, &raw->snap[ev][0],
++				 camraw_snap_names[ev], m);
++		if (raw->twin)
++			camraw_snap_show(raw, raw->twin, &raw->snap[ev][1],
++					 camraw_snap_names[ev], m);
++	}
++}
++
++static u32 camraw_us_since_vf(struct mtk_camraw *raw)
++{
++	return raw->vf_ns ? div_u64(ktime_get_ns() - raw->vf_ns, 1000) : 0;
++}
++
++static void camraw_snap_event(struct mtk_camraw *raw, unsigned int ev)
++{
++	u32 t = camraw_us_since_vf(raw);
++
++	camraw_snap_take(raw, raw, &raw->snap[ev][0], t);
++	if (raw->twin_on)
++		camraw_snap_take(raw, raw->twin, &raw->snap[ev][1], t);
++}
++
++/* ------------------------------------------------------------------ */
++/* Interrupts                                                          */
++
++static irqreturn_t camraw_irq_common(struct mtk_camraw *raw, unsigned int line,
++				     void __iomem *base, int irq)
++{
++	struct mtk_camraw_irq *q = &raw->irqs[line];
++	u32 st[CAMRAW_NUM_INT + 1];
++	u32 any = 0, again;
++	unsigned int n;
++
++	for (n = 1; n <= CAMRAW_NUM_INT; n++) {
++		st[n] = readl(base + CAMCTL_INT_STATUS(n));
++		any |= st[n];
++	}
++
++	spin_lock(&raw->irq_lock);
++	q->count++;
++	if (!any)
++		q->empty++;
++
++	/* is a status word cleared by reading it? look again, the first times */
++	if (any && q->reread_set + q->reread_clear < 16) {
++		for (n = 1; n <= CAMRAW_NUM_INT; n++) {
++			if (!st[n])
++				continue;
++			again = readl(base + CAMCTL_INT_STATUS(n));
++			if (again & st[n])
++				q->reread_set++;
++			else
++				q->reread_clear++;
++			st[n] |= again;
++		}
++	}
++
++	/*
++	 * A level interrupt that reading does not quiet would hold the CPU:
++	 * write the status back once, and switch the line off if that does
++	 * not help either.
++	 */
++	if (q->burst_jiffies != jiffies) {
++		q->burst_jiffies = jiffies;
++		q->burst = 0;
++	} else if (++q->burst > CAMRAW_IRQ_BURST) {
++		if (!q->w1c_tried) {
++			for (n = 1; n <= CAMRAW_NUM_INT; n++)
++				writel(st[n], base + CAMCTL_INT_STATUS(n));
++			q->w1c_tried = true;
++			q->burst = 0;
++		} else if (q->enabled) {
++			disable_irq_nosync(irq);
++			q->enabled = false;
++			q->storm = true;
++		}
++	}
++
++	for (n = 1; n <= CAMRAW_NUM_INT; n++)
++		q->pend[n] |= st[n];
++
++	if (line == CAMRAW_IRQ_RAW) {
++		if (st[1] & CAMCTL_INT_TG_SOF) {
++			raw->n_sof++;
++			raw->sof_ns = ktime_get_ns();
++		}
++		if (st[1] & (CAMCTL_INT_PASS1_DONE | CAMCTL_INT_RAW_PASS1_DONE))
++			raw->n_pass1++;
++		if (st[1] & CAMCTL_INT_ERRORS) {
++			raw->n_err++;
++			raw->err_bits |= st[1] & CAMCTL_INT_ERRORS;
++		}
++		if (st[6] & CAMCTL_INT6_CQ_THR0_DONE)
++			raw->n_cq_main++;
++		if (st[6] & CAMCTL_INT6_CQ_THRSUB_DONE)
++			raw->n_cq_sub++;
++	} else if (st[2] & YUV_INT2_YUVO_R1_DONE) {
++		raw->n_yuvo++;
++	}
++	spin_unlock(&raw->irq_lock);
++
++	return IRQ_WAKE_THREAD;
++}
++
++static irqreturn_t camraw_raw_irq(int irq, void *data)
++{
++	struct mtk_camraw *raw = data;
++
++	return camraw_irq_common(raw, CAMRAW_IRQ_RAW, raw->base, irq);
++}
++
++static irqreturn_t camraw_yuv_irq(int irq, void *data)
++{
++	struct mtk_camraw *raw = data;
++
++	return camraw_irq_common(raw, CAMRAW_IRQ_YUV, raw->yuv->base, irq);
++}
++
++static void camraw_take_pending(struct mtk_camraw *raw, unsigned int line,
++				u32 *pend, bool *storm)
++{
++	struct mtk_camraw_irq *q = &raw->irqs[line];
++	unsigned long flags;
++
++	spin_lock_irqsave(&raw->irq_lock, flags);
++	memcpy(pend, q->pend, sizeof(q->pend));
++	memset(q->pend, 0, sizeof(q->pend));
++	*storm = q->storm;
++	spin_unlock_irqrestore(&raw->irq_lock, flags);
++}
++
++/* how much of the fill pattern the first frame left, left and right */
++static void camraw_check_picture(struct mtk_camraw *raw, unsigned int set)
++{
++	static const char * const where[] = { "left", "right" };
++	unsigned int p, i, j, same;
++	u32 line, col[2];
++	const u8 *q;
++
++	for (p = 0; p < CAMRAW_PICTURE_PLANES; p++) {
++		line = (p ? raw->height / 2 : raw->height) / 2;
++		col[0] = CAMRAW_PROBE_BYTES;
++		col[1] = raw->width - 2 * CAMRAW_PROBE_BYTES;
++		for (i = 0; i < ARRAY_SIZE(col); i++) {
++			q = (const u8 *)raw->pic_cpu[set][p] + line * raw->stride +
++			    col[i];
++			for (same = 0, j = 0; j < CAMRAW_PROBE_BYTES; j++)
++				same += q[j] == CAMRAW_FILL;
++			dev_info(raw->dev,
++				 "first frame: plane %u line %u %s (column %u): %u of %u bytes still the fill pattern%s, first bytes %*ph\n",
++				 p, line, where[i], col[i], same,
++				 CAMRAW_PROBE_BYTES,
++				 same == CAMRAW_PROBE_BYTES ? " (NOT WRITTEN)" : "",
++				 8, q);
++		}
++	}
++}
++
++/* the picture of set @set is complete: copy it into the next buffer */
++static void camraw_deliver(struct mtk_camraw *raw, unsigned int set)
++{
++	struct mtk_camraw_buffer *buf;
++	unsigned long flags;
++	u8 *dst;
++
++	if (!raw->n_frames++)
++		camraw_check_picture(raw, set);
++
++	spin_lock_irqsave(&raw->buf_lock, flags);
++	buf = list_first_entry_or_null(&raw->bufs, struct mtk_camraw_buffer, list);
++	if (buf)
++		list_del(&buf->list);
++	spin_unlock_irqrestore(&raw->buf_lock, flags);
++	if (!buf) {
++		raw->n_no_buffer++;
++		return;
++	}
++
++	dst = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
++	memcpy(dst, raw->pic_cpu[set][0], raw->pic_size[0]);
++	memcpy(dst + raw->pic_size[0], raw->pic_cpu[set][1], raw->pic_size[1]);
++	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, raw->sizeimage);
++	buf->vb.field = V4L2_FIELD_NONE;
++	buf->vb.sequence = raw->sequence++;
++	buf->vb.vb2_buf.timestamp = raw->sof_ns ? raw->sof_ns : ktime_get_ns();
++	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
++}
++
++/*
++ * Start of frame. Application j of the per-frame request, made after one
++ * start of frame, is taken for the next frame (double buffered registers),
++ * which writes the picture set j % 2. So at this start of frame the frame
++ * of application j - 1 has ended: deliver its set, then apply j + 1 from
++ * the copy of that same set (its frame starts one frame later).
++ */
++static void camraw_sof(struct mtk_camraw *raw)
++{
++	unsigned int j = raw->n_frame_applied, set;
++	struct mtk_camraw_sof *log;
++
++	if (!raw->n_sof_log)
++		camraw_snap_event(raw, 0);
++	if (raw->n_sof_log < CAMRAW_SOF_LOG) {
++		log = &raw->sof_log[raw->n_sof_log];
++		log->t_us = camraw_us_since_vf(raw);
++		log->applied = j;
++		log->seq = raw_rd(raw, CAMRAW_FRAME_SEQ_NUM);
++		log->seq_inner = readl(raw->inner + CAMRAW_FRAME_SEQ_NUM);
++		log->frmsize = raw_rd(raw, TG_FRMSIZE_ST);
++	}
++	raw->n_sof_log++;
++
++	if (j >= 2)
++		camraw_deliver(raw, (j - 1) % CAMRAW_NUM_SETS);
++	if (!reapply)
++		return;
++
++	if (apply_delay_us)
++		usleep_range(min(apply_delay_us, 30000U),
++			     min(apply_delay_us, 30000U) + 100);
++	j++;
++	set = j % CAMRAW_NUM_SETS;
++	if (raw->frame.frame_seq_off != CAMRAW_NO_OFFSET)
++		put_unaligned_le32(j, (u8 *)raw->slot_frame[set].cpu +
++				   raw->frame.frame_seq_off);
++	camraw_apply_cq(raw, raw->slot_frame[set].dma, &raw->frame,
++			raw->frame_size);
++	raw->n_frame_applied = j;
++	if (reapply > 1) {
++		camraw_toggle_db(raw);
++		if (raw->twin_on)
++			camraw_toggle_db(raw->twin);
++	}
++}
++
++static irqreturn_t camraw_raw_thread(int irq, void *data)
++{
++	struct mtk_camraw *raw = data;
++	u32 pend[CAMRAW_NUM_INT + 1];
++	bool storm;
++
++	camraw_take_pending(raw, CAMRAW_IRQ_RAW, pend, &storm);
++	if (storm)
++		dev_err_once(raw->dev,
++			     "RAW interrupt would not go quiet (status 1: 0x%x), line switched off\n",
++			     pend[1]);
++
++	if (pend[6] & CAMCTL_INT6_CQ_BOTH) {
++		raw->cq_seen |= pend[6] & CAMCTL_INT6_CQ_BOTH;
++		if (raw->cq_seen == CAMCTL_INT6_CQ_BOTH)
++			complete(&raw->cq_done);
++	}
++
++	if ((pend[1] & CAMCTL_INT_ERRORS) && !raw->err_us) {
++		raw->err_us = camraw_us_since_vf(raw) ? : 1;
++		camraw_snap_event(raw, 1);
++	}
++	if (pend[1] & CAMCTL_INT_ERRORS)
++		dev_warn_ratelimited(raw->dev,
++				     "error interrupt 0x%08x; DMA error status YUVO_R1 0x%x YUVBO_R1 0x%x AAO 0x%x CQI_R1 0x%x\n",
++				     (u32)(pend[1] & CAMCTL_INT_ERRORS),
++				     yuv_rd(raw, YUV_YUVO_R1 + CAMRAW_DMA_ERR_STAT),
++				     yuv_rd(raw, YUV_YUVBO_R1 + CAMRAW_DMA_ERR_STAT),
++				     raw_rd(raw, CAMRAW_AAO_R1 + CAMRAW_DMA_ERR_STAT),
++				     raw_rd(raw, CAMRAW_CQI_R1 + CAMRAW_DMA_ERR_STAT));
++
++	if ((pend[1] & CAMCTL_INT_TG_SOF) && READ_ONCE(raw->streaming))
++		camraw_sof(raw);
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t camraw_yuv_thread(int irq, void *data)
++{
++	struct mtk_camraw *raw = data;
++	u32 pend[CAMRAW_NUM_INT + 1];
++	bool storm;
++
++	camraw_take_pending(raw, CAMRAW_IRQ_YUV, pend, &storm);
++	if (storm)
++		dev_err_once(raw->dev,
++			     "YUV interrupt would not go quiet (status 2: 0x%x), line switched off\n",
++			     pend[2]);
++	return IRQ_HANDLED;
++}
++
++static void camraw_irqs_on(struct mtk_camraw *raw)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&raw->irq_lock, flags);
++	memset(raw->irqs, 0, sizeof(raw->irqs));
++	raw->irqs[CAMRAW_IRQ_RAW].enabled = true;
++	raw->irqs[CAMRAW_IRQ_YUV].enabled = true;
++	raw->n_sof = 0;
++	raw->n_cq_main = 0;
++	raw->n_cq_sub = 0;
++	raw->n_pass1 = 0;
++	raw->n_yuvo = 0;
++	raw->n_err = 0;
++	raw->err_bits = 0;
++	raw->sof_ns = 0;
++	spin_unlock_irqrestore(&raw->irq_lock, flags);
++	enable_irq(raw->irq);
++	enable_irq(raw->yuv->irq);
++}
++
++static void camraw_irqs_off(struct mtk_camraw *raw)
++{
++	const int irqs[CAMRAW_NUM_IRQS] = { raw->irq, raw->yuv->irq };
++	unsigned long flags;
++	unsigned int i;
++	bool enabled;
++
++	for (i = 0; i < CAMRAW_NUM_IRQS; i++) {
++		spin_lock_irqsave(&raw->irq_lock, flags);
++		enabled = raw->irqs[i].enabled;
++		raw->irqs[i].enabled = false;
++		spin_unlock_irqrestore(&raw->irq_lock, flags);
++		if (enabled)
++			disable_irq(irqs[i]);
++		else
++			synchronize_irq(irqs[i]);
++	}
++}
++
++/* ------------------------------------------------------------------ */
++/* The captured requests: load, buffers, format                        */
++
++static void camraw_free_dma(struct mtk_camraw *raw, struct mtk_camraw_dma *d)
++{
++	if (d->cpu)
++		dma_free_coherent(raw->dev, d->size, d->cpu, d->dma);
++	d->cpu = NULL;
++}
++
++static int camraw_alloc_dma(struct mtk_camraw *raw, struct mtk_camraw_dma *d,
++			    size_t size)
++{
++	d->size = PAGE_ALIGN(size);
++	d->cpu = dma_alloc_coherent(raw->dev, d->size, &d->dma, GFP_KERNEL);
++	return d->cpu ? 0 : -ENOMEM;
++}
++
++static void camraw_free_request(struct mtk_camraw *raw, struct camraw_replay *rp)
++{
++	unsigned int i;
++
++	for (i = 0; i < rp->num_bufs; i++) {
++		struct camraw_capbuf *b = &rp->bufs[i];
++
++		if (b->cpu)
++			dma_free_coherent(b->dma_dev, PAGE_ALIGN(b->size), b->cpu,
++					  b->dma);
++		b->cpu = NULL;
++	}
++	camraw_replay_free(rp);
++}
++
++static void camraw_unload(struct mtk_camraw *raw)
++{
++	unsigned int i;
++
++	debugfs_remove_recursive(raw->debugfs_bufs);
++	raw->debugfs_bufs = NULL;
++	camraw_free_request(raw, &raw->start);
++	camraw_free_request(raw, &raw->frame);
++	camraw_free_dma(raw, &raw->slot_start);
++	for (i = 0; i < CAMRAW_NUM_SETS; i++)
++		camraw_free_dma(raw, &raw->slot_frame[i]);
++	for (i = 0; i < CAMRAW_PICTURE_PLANES; i++)
++		camraw_free_dma(raw, &raw->pic1[i]);
++	raw->loaded = false;
++	raw->pair_problem = NULL;
++	raw->sizeimage = 0;
++}
++
++static void camraw_debugfs_blob(struct mtk_camraw *raw, const char *name,
++				void *data, size_t size)
++{
++	struct debugfs_blob_wrapper *blob;
++
++	blob = devm_kzalloc(raw->dev, sizeof(*blob), GFP_KERNEL);
++	if (!blob)
++		return;
++	blob->data = data;
++	blob->size = size;
++	debugfs_create_blob(name, 0400, raw->debugfs_bufs, blob);
++}
++
++/*
++ * Replacement buffers of one request: every buffer an address word points
++ * into, except the slot, which gets copies of its own. All engines of the
++ * frame are behind the same IOMMU domain (checked at probe), so one
++ * allocation is valid for every larb port.
++ */
++static int camraw_alloc_request(struct mtk_camraw *raw, struct camraw_replay *rp,
++				const char *tag)
++{
++	char name[24];
++	unsigned int i;
++
++	for (i = CAMRAW_BUFIDX_SETTINGS; i < rp->num_bufs; i++) {
++		struct camraw_capbuf *b = &rp->bufs[i];
++
++		if (!b->hits && i != CAMRAW_BUFIDX_SETTINGS)
++			continue;
++		b->dma_dev = raw->dev;
++		b->cpu = dma_alloc_coherent(b->dma_dev, PAGE_ALIGN(b->size),
++					    &b->dma, GFP_KERNEL);
++		if (!b->cpu) {
++			dev_err(raw->dev, "%s: no memory for buffer %u (0x%x bytes)\n",
++				tag, i, b->size);
++			return -ENOMEM;
++		}
++		if (b->content)
++			memcpy(b->cpu, b->content, b->size);
++		dev_dbg(raw->dev, "%s: buffer %u: 0x%x bytes at %pad\n", tag, i,
++			b->size, &b->dma);
++		snprintf(name, sizeof(name), "%s-%u", tag, i);
++		camraw_debugfs_blob(raw, name, b->cpu, b->size);
++	}
++	return 0;
++}
++
++static int camraw_set_format(struct mtk_camraw *raw)
++{
++	struct camraw_replay *rp = &raw->frame;
++	unsigned int p;
++
++	for (p = 0; p < CAMRAW_PICTURE_PLANES; p++) {
++		const struct camraw_capbuf *b = &rp->bufs[rp->out_plane[p]];
++
++		raw->pic_size[p] = b->size;
++		raw->pic_cpu[0][p] = b->cpu;
++		raw->pic_dma[0][p] = b->dma;
++		raw->pic_cpu[1][p] = raw->pic1[p].cpu;
++		raw->pic_dma[1][p] = raw->pic1[p].dma;
++	}
++	raw->width = rp->width;
++	raw->height = rp->height;
++	raw->stride = rp->stride;
++	raw->sizeimage = raw->pic_size[0] + raw->pic_size[1];
++	if (!raw->width || raw->width > raw->stride ||
++	    (u64)raw->stride * raw->height > raw->pic_size[0] ||
++	    (u64)raw->stride * raw->height / 2 > raw->pic_size[1]) {
++		dev_err(raw->dev, "picture %ux%u pitch %u does not fit its planes (0x%x, 0x%x bytes)\n",
++			raw->width, raw->height, raw->stride, raw->pic_size[0],
++			raw->pic_size[1]);
++		return -EINVAL;
++	}
++	if (rp->fmt_id == CAMRAW_FMT_YVU420_2P) {
++		raw->pixfmt = V4L2_PIX_FMT_NV21;
++	} else {
++		raw->pixfmt = V4L2_PIX_FMT_NV12;
++		dev_warn(raw->dev, "picture format id %u is not known, labelled NV12\n",
++			 rp->fmt_id);
++	}
++	dev_info(raw->dev, "video node: %p4cc %ux%u pitch %u, %u bytes\n",
++		 &raw->pixfmt, raw->width, raw->height, raw->stride,
++		 raw->sizeimage);
++	return 0;
++}
++
++static int camraw_load_one(struct mtk_camraw *raw, struct camraw_replay *rp,
++			   const char *file)
++{
++	const struct firmware *fw;
++	int ret;
++
++	ret = request_firmware(&fw, file, raw->dev);
++	if (ret) {
++		dev_err(raw->dev, "no request dump \"%s\" in the firmware directory: %d\n",
++			file, ret);
++		return ret;
++	}
++	ret = camraw_replay_parse(rp, raw->dev, file, fw->data, fw->size);
++	release_firmware(fw);
++	return ret;
++}
++
++static int camraw_load(struct mtk_camraw *raw)
++{
++	unsigned int i;
++	int ret;
++
++	lockdep_assert_held(&raw->lock);
++
++	camraw_unload(raw);
++	ret = camraw_load_one(raw, &raw->start, start_fw);
++	if (ret)
++		return ret;
++	ret = camraw_load_one(raw, &raw->frame, frame_fw);
++	if (ret) {
++		camraw_replay_free(&raw->start);
++		return ret;
++	}
++	raw->pair_problem = camraw_replay_pair_check(&raw->start, &raw->frame);
++	if (raw->pair_problem)
++		dev_err(raw->dev, "start request %u and per-frame request %u cannot be replayed together: %s\n",
++			raw->start.sequence, raw->frame.sequence,
++			raw->pair_problem);
++
++	raw->debugfs_bufs = debugfs_create_dir("buffers", raw->debugfs);
++	ret = camraw_alloc_request(raw, &raw->start, "start");
++	if (!ret)
++		ret = camraw_alloc_request(raw, &raw->frame, "frame");
++	if (!ret)
++		ret = camraw_alloc_dma(raw, &raw->slot_start,
++				       raw->start.slot_size);
++	for (i = 0; !ret && i < CAMRAW_NUM_SETS; i++)
++		ret = camraw_alloc_dma(raw, &raw->slot_frame[i],
++				       raw->frame.slot_size);
++	if (ret)
++		goto err;
++	camraw_debugfs_blob(raw, "slot-start", raw->slot_start.cpu,
++			    raw->start.slot_size);
++	camraw_debugfs_blob(raw, "slot-frame0", raw->slot_frame[0].cpu,
++			    raw->frame.slot_size);
++	camraw_debugfs_blob(raw, "slot-frame1", raw->slot_frame[1].cpu,
++			    raw->frame.slot_size);
++
++	if (camraw_replay_has_picture(&raw->frame)) {
++		for (i = 0; !ret && i < CAMRAW_PICTURE_PLANES; i++)
++			ret = camraw_alloc_dma(raw, &raw->pic1[i],
++					       raw->frame.bufs[raw->frame.out_plane[i]].size);
++		if (ret)
++			goto err;
++		camraw_debugfs_blob(raw, "picture1-0", raw->pic1[0].cpu,
++				    raw->frame.bufs[raw->frame.out_plane[0]].size);
++		camraw_debugfs_blob(raw, "picture1-1", raw->pic1[1].cpu,
++				    raw->frame.bufs[raw->frame.out_plane[1]].size);
++		ret = camraw_set_format(raw);
++		if (ret)
++			goto err;
++	}
++	if ((raw->slot_start.dma | raw->slot_frame[0].dma |
++	     raw->slot_frame[1].dma) & 0xf)
++		dev_warn(raw->dev, "a queue slot is not 16 byte aligned\n");
++	raw->loaded = true;
++	return 0;
++
++err:
++	camraw_unload(raw);
++	return ret;
++}
++
++/* ------------------------------------------------------------------ */
++/* Stream                                                              */
++
++static int camraw_find_source(struct mtk_camraw *raw)
++{
++	struct fwnode_handle *ep, *remote;
++
++	ep = fwnode_graph_get_next_endpoint(dev_fwnode(raw->dev), NULL);
++	if (!ep) {
++		dev_err(raw->dev, "no endpoint toward the sensor interface\n");
++		return -ENOLINK;
++	}
++	remote = fwnode_graph_get_remote_endpoint(ep);
++	fwnode_handle_put(ep);
++	if (!remote)
++		return -ENOLINK;
++	raw->source = mtk_seninf_raw_source(remote, &raw->source_pad);
++	fwnode_handle_put(remote);
++	if (!raw->source) {
++		dev_err(raw->dev, "the sensor interface has no RAW destination for this engine (not probed?)\n");
++		return -ENODEV;
++	}
++	return 0;
++}
++
++/* the sensor must run the mode of the capture */
++static void camraw_check_source_format(struct mtk_camraw *raw)
++{
++	struct v4l2_subdev_format fmt = {
++		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
++		.pad = raw->source_pad,
++	};
++	struct camraw_replay *rp = &raw->start;
++
++	if (v4l2_subdev_call_state_active(raw->source, pad, get_fmt, &fmt))
++		return;
++	dev_info(raw->dev,
++		 "sensor interface %ux%u code 0x%04x; captured input %ux%u, grab window pixels %u-%u lines %u-%u\n",
++		 fmt.format.width, fmt.format.height, fmt.format.code,
++		 rp->in_width, rp->in_height, rp->grab_pxl & 0xffff,
++		 rp->grab_pxl >> 16, rp->grab_lin & 0xffff, rp->grab_lin >> 16);
++	if (fmt.format.width != rp->in_width || fmt.format.height != rp->in_height)
++		dev_warn(raw->dev, "SENSOR MODE DIFFERS FROM THE CAPTURE\n");
++}
++
++static void camraw_watchdog(struct work_struct *work)
++{
++	struct mtk_camraw *raw = container_of(to_delayed_work(work),
++					      struct mtk_camraw, watchdog);
++
++	camraw_show_counters(raw, NULL, "1 s after viewfinder on");
++	camraw_show_all_hw(raw, NULL, "1 s after viewfinder on");
++}
++
++static int camraw_emit_all(struct mtk_camraw *raw)
++{
++	unsigned int i;
++	int ret;
++
++	raw->emit_flags = (raw->twin_on ? 0 : CAMRAW_EMIT_A_ONLY) |
++			  (stats_off ? CAMRAW_EMIT_STATS_OFF : 0) |
++			  (extra_off ? CAMRAW_EMIT_EXTRA_OFF : 0);
++	ret = camraw_replay_emit(&raw->start, raw->slot_start.cpu,
++				 raw->slot_start.dma, raw->emit_flags, NULL,
++				 raw->start_size);
++	for (i = 0; !ret && i < CAMRAW_NUM_SETS; i++)
++		ret = camraw_replay_emit(&raw->frame, raw->slot_frame[i].cpu,
++					 raw->slot_frame[i].dma, raw->emit_flags,
++					 raw->pic_dma[i], raw->frame_size);
++	if (ret) {
++		dev_err(raw->dev, "the queue slots cannot be written: %d\n", ret);
++		return ret;
++	}
++	for (i = 0; i < CAMRAW_NUM_SETS; i++) {
++		memset(raw->pic_cpu[i][0], CAMRAW_FILL, raw->pic_size[0]);
++		memset(raw->pic_cpu[i][1], CAMRAW_FILL, raw->pic_size[1]);
++	}
++	dev_info(raw->dev,
++		 "%s: start request %u lists 0x%x + 0x%x bytes, per-frame request %u lists 0x%x + 0x%x bytes%s%s\n",
++		 raw->twin_on ? "both RAW engines" : "side A only",
++		 raw->start.sequence, raw->start_size[0], raw->start_size[1],
++		 raw->frame.sequence, raw->frame_size[0], raw->frame_size[1],
++		 stats_off ? ", statistics writers off" : "",
++		 extra_off ? ", extra YUV outputs off" : "");
++	return 0;
++}
++
++/* start period and done tolerance in time stamp counter ticks */
++static void camraw_set_scq_period(struct mtk_camraw *raw)
++{
++	u32 div = raw_rd(raw, TG_TIME_STAMP_CNT);
++	u32 khz;
++
++	if (div != raw->start.time_stamp_cnt)
++		dev_warn(raw->dev, "time stamp counter divider reads %u, the start request writes %u: the start request was not taken\n",
++			 div, raw->start.time_stamp_cnt);
++	khz = CAMRAW_TS_CLK_KHZ / ((raw->start.time_stamp_cnt + 1) * 2);
++	raw_wr(raw, CAMCQ_SCQ_START_PERIOD, CAMRAW_SCQ_PERIOD_MS * khz);
++	raw_wr(raw, CAMCTL_DC_STAG_CTL, CAMRAW_DONE_TOLERANCE_MS * khz);
++	dev_info(raw->dev, "start period 0x%x, done tolerance 0x%x (counter %u kHz)\n",
++		 CAMRAW_SCQ_PERIOD_MS * khz, CAMRAW_DONE_TOLERANCE_MS * khz, khz);
++}
++
++/* the clock rates of the stream, and cam-sel set to cam_mhz */
++static void camraw_clocks(struct mtk_camraw *raw)
++{
++	char line[400];
++	unsigned int i;
++	int len = 0, ret;
++
++	raw->cam_rate_saved = 0;
++	if (cam_mhz && raw->cam_sel) {
++		raw->cam_rate_saved = clk_get_rate(raw->cam_sel);
++		ret = clk_set_rate(raw->cam_sel, cam_mhz * 1000000UL);
++		dev_info(raw->dev, "cam-sel %lu Hz -> asked %u MHz: %d, now %lu Hz\n",
++			 raw->cam_rate_saved, cam_mhz, ret,
++			 clk_get_rate(raw->cam_sel));
++	}
++	for (i = 0; i < raw->num_clks; i++)
++		len += scnprintf(line + len, sizeof(line) - len, " %s %lu",
++				 raw->clks[i].id, clk_get_rate(raw->clks[i].clk));
++	for (i = 0; i < CAMYUV_NUM_CLKS; i++)
++		len += scnprintf(line + len, sizeof(line) - len, " %s %lu",
++				 raw->yuv->clks[i].id,
++				 clk_get_rate(raw->yuv->clks[i].clk));
++	dev_info(raw->dev, "clock rates (Hz):%s\n", line);
++}
++
++static void camraw_clocks_restore(struct mtk_camraw *raw)
++{
++	if (raw->cam_rate_saved)
++		clk_set_rate(raw->cam_sel, raw->cam_rate_saved);
++	raw->cam_rate_saved = 0;
++}
++
++/* the per-frame request before the viewfinder: application 1, set 1 */
++static void camraw_prestart(struct mtk_camraw *raw)
++{
++	if (raw->frame.frame_seq_off != CAMRAW_NO_OFFSET)
++		put_unaligned_le32(1, (u8 *)raw->slot_frame[1].cpu +
++				   raw->frame.frame_seq_off);
++	raw->cq_seen = 0;
++	reinit_completion(&raw->cq_done);
++	camraw_apply_cq(raw, raw->slot_frame[1].dma, &raw->frame,
++			raw->frame_size);
++	raw->n_frame_applied = 1;
++	if (!wait_for_completion_timeout(&raw->cq_done,
++					 msecs_to_jiffies(CAMRAW_CQ_TIMEOUT_MS)))
++		dev_warn(raw->dev, "prestart: the per-frame request's lists did not both finish: done bits 0x%x\n",
++			 raw->cq_seen);
++	else
++		dev_info(raw->dev, "prestart: per-frame request applied before the viewfinder\n");
++}
++
++static int camraw_stream_start(struct mtk_camraw *raw)
++{
++	struct mtk_camraw *b = raw->twin;
++	int ret;
++
++	lockdep_assert_held(&raw->lock);
++
++	if (!raw->loaded || !raw->sizeimage)
++		return -ENODATA;
++	if (raw->pair_problem) {
++		dev_err(raw->dev, "not started: %s\n", raw->pair_problem);
++		return -EINVAL;
++	}
++	if (twin && !b) {
++		dev_err(raw->dev, "twin=1, but the board gives no second RAW engine (mediatek,twin)\n");
++		return -ENODEV;
++	}
++	if (twin != raw->start.twin)
++		dev_info(raw->dev, "twin=%d, the captured lists are for %s\n",
++			 twin, raw->start.twin ? "two RAW engines" : "one");
++
++	ret = camraw_find_source(raw);
++	if (ret)
++		return ret;
++
++	raw->twin_on = twin;
++	ret = camraw_emit_all(raw);
++	if (ret)
++		return ret;
++
++	ret = pm_runtime_resume_and_get(raw->dev);
++	if (ret)
++		return ret;
++	if (raw->twin_on) {
++		ret = pm_runtime_resume_and_get(b->dev);
++		if (ret)
++			goto err_pm;
++	}
++	camraw_clocks(raw);
++
++	/* reset, camsys settings, initialise, double buffer toggle: A and B */
++	camraw_hw_reset(raw);
++	if (raw->twin_on)
++		camraw_hw_reset(b);
++	camraw_camsys_init(raw, raw->twin_on);
++	camraw_hw_init(raw);
++	if (raw->twin_on)
++		camraw_hw_init(b);
++	camraw_toggle_db(raw);
++	if (raw->twin_on)
++		camraw_toggle_db(b);
++
++	raw->sequence = 0;
++	raw->n_frames = 0;
++	raw->n_no_buffer = 0;
++	raw->n_applied = 0;
++	raw->n_frame_applied = 0;
++	raw->n_sof_log = 0;
++	raw->vf_ns = 0;
++	raw->err_us = 0;
++	memset(raw->snap, 0, sizeof(raw->snap));
++	raw->cq_seen = 0;
++	reinit_completion(&raw->cq_done);
++	camraw_irqs_on(raw);
++
++	/* the start request, before the sensor streams */
++	camraw_apply_cq(raw, raw->slot_start.dma, &raw->start, raw->start_size);
++	if (!wait_for_completion_timeout(&raw->cq_done,
++					 msecs_to_jiffies(CAMRAW_CQ_TIMEOUT_MS))) {
++		dev_warn(raw->dev,
++			 "the start request's lists did not both finish within %u ms: done bits seen 0x%x (0 main, 4 sub); going on\n",
++			 CAMRAW_CQ_TIMEOUT_MS, raw->cq_seen);
++		camraw_show_counters(raw, NULL, "start request");
++		camraw_show_all_hw(raw, NULL, "start request");
++	} else {
++		dev_info(raw->dev,
++			 "start request done; frame number register 0x%x (latched 0x%x), the lists write 0x%x; grab window 0x%08x/0x%08x\n",
++			 raw_rd(raw, CAMRAW_FRAME_SEQ_NUM),
++			 readl(raw->inner + CAMRAW_FRAME_SEQ_NUM),
++			 raw->start.frame_seq, raw_rd(raw, TG_SEN_GRAB_PXL),
++			 raw_rd(raw, TG_SEN_GRAB_LIN));
++	}
++
++	if (prestart)
++		camraw_prestart(raw);
++
++	camraw_check_source_format(raw);
++	ret = v4l2_subdev_enable_streams(raw->source, raw->source_pad, BIT_ULL(0));
++	if (ret) {
++		dev_err(raw->dev, "sensor interface did not start: %d\n", ret);
++		goto err_irq;
++	}
++	raw->source_on = true;
++
++	camraw_set_scq_period(raw);
++
++	/* stream on: RAW-A only */
++	camraw_pulse_db_load(raw);
++	WRITE_ONCE(raw->streaming, true);
++	raw->vf_ns = ktime_get_ns();
++	raw_wr(raw, TG_VF_CON, raw_rd(raw, TG_VF_CON) | TG_VFDATA_EN);
++
++	schedule_delayed_work(&raw->watchdog,
++			      msecs_to_jiffies(CAMRAW_WATCHDOG_MS));
++	return 0;
++
++err_irq:
++	camraw_irqs_off(raw);
++	camraw_hw_reset(raw);
++	if (raw->twin_on) {
++		camraw_hw_reset(b);
++		pm_runtime_put(b->dev);
++	}
++err_pm:
++	camraw_clocks_restore(raw);
++	raw->twin_on = false;
++	pm_runtime_put(raw->dev);
++	return ret;
++}
++
++static void camraw_stream_stop(struct mtk_camraw *raw)
++{
++	lockdep_assert_held(&raw->lock);
++
++	cancel_delayed_work_sync(&raw->watchdog);
++
++	raw_wr(raw, TG_VF_CON, raw_rd(raw, TG_VF_CON) & ~TG_VFDATA_EN);
++	camraw_pulse_db_load(raw);
++	WRITE_ONCE(raw->streaming, false);
++	/* let the frame that is under way end */
++	msleep(50);
++
++	if (raw->source_on)
++		v4l2_subdev_disable_streams(raw->source, raw->source_pad,
++					    BIT_ULL(0));
++	raw->source_on = false;
++
++	camraw_show_counters(raw, NULL, "stop");
++	camraw_show_all_hw(raw, NULL, "stop");
++	camraw_snaps_show(raw, NULL);
++	camraw_irqs_off(raw);
++	camraw_hw_reset(raw);
++	if (raw->twin_on) {
++		camraw_hw_reset(raw->twin);
++		pm_runtime_put(raw->twin->dev);
++	}
++	raw->twin_on = false;
++	camraw_clocks_restore(raw);
++	pm_runtime_put(raw->dev);
++}
++
++/* ------------------------------------------------------------------ */
++/* Video node                                                          */
++
++static void camraw_return_bufs(struct mtk_camraw *raw,
++			       enum vb2_buffer_state state)
++{
++	struct mtk_camraw_buffer *buf, *tmp;
++	unsigned long flags;
++	LIST_HEAD(list);
++
++	spin_lock_irqsave(&raw->buf_lock, flags);
++	list_splice_init(&raw->bufs, &list);
++	spin_unlock_irqrestore(&raw->buf_lock, flags);
++	list_for_each_entry_safe(buf, tmp, &list, list) {
++		list_del(&buf->list);
++		vb2_buffer_done(&buf->vb.vb2_buf, state);
++	}
++}
++
++static int camraw_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
++			      unsigned int *num_planes, unsigned int sizes[],
++			      struct device *alloc_devs[])
++{
++	struct mtk_camraw *raw = vb2_get_drv_priv(q);
++
++	if (!raw->sizeimage)
++		return -ENODATA;
++	if (*num_planes)
++		return sizes[0] < raw->sizeimage ? -EINVAL : 0;
++	*num_planes = 1;
++	sizes[0] = raw->sizeimage;
++	return 0;
++}
++
++static int camraw_buf_prepare(struct vb2_buffer *vb)
++{
++	struct mtk_camraw *raw = vb2_get_drv_priv(vb->vb2_queue);
++
++	return vb2_plane_size(vb, 0) < raw->sizeimage ? -EINVAL : 0;
++}
++
++static void camraw_buf_queue(struct vb2_buffer *vb)
++{
++	struct mtk_camraw *raw = vb2_get_drv_priv(vb->vb2_queue);
++	struct mtk_camraw_buffer *buf =
++		container_of(to_vb2_v4l2_buffer(vb), struct mtk_camraw_buffer, vb);
++	unsigned long flags;
++
++	spin_lock_irqsave(&raw->buf_lock, flags);
++	list_add_tail(&buf->list, &raw->bufs);
++	spin_unlock_irqrestore(&raw->buf_lock, flags);
++}
++
++static int camraw_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct mtk_camraw *raw = vb2_get_drv_priv(q);
++	int ret;
++
++	mutex_lock(&raw->lock);
++	ret = camraw_stream_start(raw);
++	mutex_unlock(&raw->lock);
++	if (ret)
++		camraw_return_bufs(raw, VB2_BUF_STATE_QUEUED);
++	return ret;
++}
++
++static void camraw_stop_streaming(struct vb2_queue *q)
++{
++	struct mtk_camraw *raw = vb2_get_drv_priv(q);
++
++	mutex_lock(&raw->lock);
++	camraw_stream_stop(raw);
++	mutex_unlock(&raw->lock);
++	camraw_return_bufs(raw, VB2_BUF_STATE_ERROR);
++}
++
++static const struct vb2_ops camraw_vb2_ops = {
++	.queue_setup = camraw_queue_setup,
++	.buf_prepare = camraw_buf_prepare,
++	.buf_queue = camraw_buf_queue,
++	.start_streaming = camraw_start_streaming,
++	.stop_streaming = camraw_stop_streaming,
++};
++
++static int camraw_querycap(struct file *file, void *priv,
++			   struct v4l2_capability *cap)
++{
++	strscpy(cap->driver, CAMRAW_DRV_NAME, sizeof(cap->driver));
++	strscpy(cap->card, "MT6878 RAW replay", sizeof(cap->card));
++	return 0;
++}
++
++static int camraw_enum_fmt(struct file *file, void *priv,
++			   struct v4l2_fmtdesc *f)
++{
++	struct mtk_camraw *raw = video_drvdata(file);
++
++	if (f->index)
++		return -EINVAL;
++	f->pixelformat = raw->pixfmt ? raw->pixfmt : V4L2_PIX_FMT_NV21;
++	return 0;
++}
++
++/* the format is the captured one, whatever is asked for */
++static int camraw_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
++{
++	struct mtk_camraw *raw = video_drvdata(file);
++	struct v4l2_pix_format *pix = &f->fmt.pix;
++
++	memset(pix, 0, sizeof(*pix));
++	pix->pixelformat = raw->pixfmt ? raw->pixfmt : V4L2_PIX_FMT_NV21;
++	pix->width = raw->width;
++	pix->height = raw->height;
++	pix->bytesperline = raw->stride;
++	pix->sizeimage = raw->sizeimage;
++	pix->field = V4L2_FIELD_NONE;
++	pix->colorspace = V4L2_COLORSPACE_SRGB;
++	return 0;
++}
++
++static int camraw_enum_input(struct file *file, void *priv,
++			     struct v4l2_input *inp)
++{
++	if (inp->index)
++		return -EINVAL;
++	inp->type = V4L2_INPUT_TYPE_CAMERA;
++	strscpy(inp->name, "RAW-A", sizeof(inp->name));
++	return 0;
++}
++
++static int camraw_g_input(struct file *file, void *priv, unsigned int *i)
++{
++	*i = 0;
++	return 0;
++}
++
++static int camraw_s_input(struct file *file, void *priv, unsigned int i)
++{
++	return i ? -EINVAL : 0;
++}
++
++static const struct v4l2_ioctl_ops camraw_ioctl_ops = {
++	.vidioc_querycap = camraw_querycap,
++	.vidioc_enum_fmt_vid_cap = camraw_enum_fmt,
++	.vidioc_g_fmt_vid_cap = camraw_g_fmt,
++	.vidioc_s_fmt_vid_cap = camraw_g_fmt,
++	.vidioc_try_fmt_vid_cap = camraw_g_fmt,
++	.vidioc_enum_input = camraw_enum_input,
++	.vidioc_g_input = camraw_g_input,
++	.vidioc_s_input = camraw_s_input,
++	.vidioc_reqbufs = vb2_ioctl_reqbufs,
++	.vidioc_create_bufs = vb2_ioctl_create_bufs,
++	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
++	.vidioc_querybuf = vb2_ioctl_querybuf,
++	.vidioc_qbuf = vb2_ioctl_qbuf,
++	.vidioc_dqbuf = vb2_ioctl_dqbuf,
++	.vidioc_expbuf = vb2_ioctl_expbuf,
++	.vidioc_streamon = vb2_ioctl_streamon,
++	.vidioc_streamoff = vb2_ioctl_streamoff,
++};
++
++/* the requests are loaded when the node is first opened */
++static int camraw_open(struct file *file)
++{
++	struct mtk_camraw *raw = video_drvdata(file);
++	int ret;
++
++	ret = v4l2_fh_open(file);
++	if (ret)
++		return ret;
++
++	mutex_lock(&raw->lock);
++	if (!raw->loaded)
++		camraw_load(raw);	/* reported; the node opens without it */
++	mutex_unlock(&raw->lock);
++	return 0;
++}
++
++static const struct v4l2_file_operations camraw_fops = {
++	.owner = THIS_MODULE,
++	.open = camraw_open,
++	.release = vb2_fop_release,
++	.unlocked_ioctl = video_ioctl2,
++	.mmap = vb2_fop_mmap,
++	.poll = vb2_fop_poll,
++};
++
++/* ------------------------------------------------------------------ */
++/* debugfs                                                             */
++
++static void camraw_show_request(struct seq_file *m, const char *what,
++				const struct camraw_replay *rp)
++{
++	unsigned int i;
++
++	seq_printf(m, "%s request: \"%s\", request %u, %s; main 0x%x + 0x%x (%u writes), sub 0x%x + 0x%x (%u writes); values RAW-A %u RMS-A %u YUV-A %u RAW-B %u RMS-B %u YUV-B %u; %u address words\n",
++		   what, rp->name, rp->sequence,
++		   rp->onetime ? "one-time block" :
++		   camraw_replay_has_picture(rp) ? "steady" : "start-up",
++		   rp->list_off[0], rp->list_size[0], rp->num_desc[0],
++		   rp->list_off[1], rp->list_size[1], rp->num_desc[1],
++		   rp->values[0], rp->values[1], rp->values[2], rp->values[3],
++		   rp->values[4], rp->values[5], rp->num_relocs);
++	seq_printf(m, "  columns RAW-A %u-%u RAW-B %u-%u, writer enables RAW 0x%x/0x%x YUV 0x%x/0x%x, frame number 0x%x\n",
++		   rp->split[0] & 0xffff, rp->split[0] >> 16,
++		   rp->split[1] & 0xffff, rp->split[1] >> 16,
++		   rp->mod5[CAMRAW_BLK_RAW_A], rp->mod5[CAMRAW_BLK_RAW_B],
++		   rp->mod5[CAMRAW_BLK_YUV_A], rp->mod5[CAMRAW_BLK_YUV_B],
++		   rp->frame_seq);
++	if (rp->blocker)
++		seq_printf(m, "  objection: %s\n", rp->blocker);
++	for (i = 0; i < rp->num_bufs; i++) {
++		const struct camraw_capbuf *b = &rp->bufs[i];
++
++		seq_printf(m, "  buffer %u: kind %u id %u plane %u, captured 0x%llx size 0x%x, %u address word(s) (%u side A)",
++			   i, b->kind, b->id, b->plane, b->iova, b->size, b->hits,
++			   b->hits_a);
++		if (b->cpu)
++			seq_printf(m, ", now %pad", &b->dma);
++		seq_putc(m, '\n');
++	}
++}
++
++static int camraw_status_show(struct seq_file *m, void *unused)
++{
++	struct mtk_camraw *raw = m->private;
++
++	mutex_lock(&raw->lock);
++	seq_printf(m, "requests: %s; start_fw \"%s\", frame_fw \"%s\"\n",
++		   raw->loaded ? "loaded" : "not loaded", start_fw, frame_fw);
++	if (!raw->loaded)
++		goto out;
++	camraw_show_request(m, "start", &raw->start);
++	camraw_show_request(m, "per-frame", &raw->frame);
++	seq_printf(m, "pair: %s\n", raw->pair_problem ? raw->pair_problem :
++		   "consistent for replay");
++	seq_printf(m, "slots: start %pad, per-frame %pad and %pad; picture planes set 0 %pad/%pad, set 1 %pad/%pad\n",
++		   &raw->slot_start.dma, &raw->slot_frame[0].dma,
++		   &raw->slot_frame[1].dma, &raw->pic_dma[0][0],
++		   &raw->pic_dma[0][1], &raw->pic_dma[1][0], &raw->pic_dma[1][1]);
++	seq_printf(m, "video node: %p4cc %ux%u pitch %u, %u bytes\n",
++		   &raw->pixfmt, raw->width, raw->height, raw->stride,
++		   raw->sizeimage);
++	seq_printf(m, "second RAW engine: %s\n", raw->twin ?
++		   dev_name(raw->twin->dev) : "none on this board");
++	seq_printf(m, "stream: %s, %s, reapply %u, stats_off %d, extra_off %d, prestart %d, err_mask %u, cam_mhz %u, apply_delay_us %u\n",
++		   raw->streaming ? "running" : "stopped",
++		   twin ? "twin" : "side A only", reapply, stats_off, extra_off,
++		   prestart, err_mask, cam_mhz, apply_delay_us);
++	camraw_show_counters(raw, m, NULL);
++	camraw_snaps_show(raw, m);
++	if (raw->streaming)
++		camraw_show_all_hw(raw, m, NULL);
++out:
++	mutex_unlock(&raw->lock);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(camraw_status);
++
++/* any write loads the requests again, e.g. after the files were replaced */
++static ssize_t camraw_load_write(struct file *file, const char __user *ubuf,
++				 size_t count, loff_t *ppos)
++{
++	struct mtk_camraw *raw = file->private_data;
++	int ret;
++
++	mutex_lock(&raw->vlock);
++	if (vb2_is_busy(&raw->vq)) {
++		ret = -EBUSY;
++	} else {
++		mutex_lock(&raw->lock);
++		ret = camraw_load(raw);
++		mutex_unlock(&raw->lock);
++	}
++	mutex_unlock(&raw->vlock);
++	return ret ? ret : count;
++}
++
++static const struct file_operations camraw_load_fops = {
++	.owner = THIS_MODULE,
++	.open = simple_open,
++	.write = camraw_load_write,
++	.llseek = noop_llseek,
++};
++
++/* ------------------------------------------------------------------ */
++/* Probe                                                               */
++
++static int camyuv_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mtk_camyuv *yuv;
++	unsigned int i;
++	int ret;
++
++	yuv = devm_kzalloc(dev, sizeof(*yuv), GFP_KERNEL);
++	if (!yuv)
++		return -ENOMEM;
++	yuv->dev = dev;
++
++	yuv->base = devm_platform_ioremap_resource_byname(pdev, "base");
++	if (IS_ERR(yuv->base))
++		return PTR_ERR(yuv->base);
++	yuv->irq = platform_get_irq(pdev, 0);
++	if (yuv->irq < 0)
++		return yuv->irq;
++	for (i = 0; i < CAMYUV_NUM_CLKS; i++)
++		yuv->clks[i].id = camyuv_clk_names[i];
++	ret = devm_clk_bulk_get(dev, CAMYUV_NUM_CLKS, yuv->clks);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get clocks\n");
++
++	if (!device_iommu_mapped(dev))
++		return dev_err_probe(dev, -ENODEV,
++				     "not behind the MM IOMMU: the writers need their larb ports in \"iommus\"\n");
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(34));
++	if (ret)
++		return ret;
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++	platform_set_drvdata(pdev, yuv);
++	return 0;
++}
++
++static int camyuv_runtime_suspend(struct device *dev)
++{
++	struct mtk_camyuv *yuv = dev_get_drvdata(dev);
++
++	clk_bulk_disable_unprepare(CAMYUV_NUM_CLKS, yuv->clks);
++	return 0;
++}
++
++static int camyuv_runtime_resume(struct device *dev)
++{
++	struct mtk_camyuv *yuv = dev_get_drvdata(dev);
++
++	return clk_bulk_prepare_enable(CAMYUV_NUM_CLKS, yuv->clks);
++}
++
++static const struct dev_pm_ops camyuv_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
++	RUNTIME_PM_OPS(camyuv_runtime_suspend, camyuv_runtime_resume, NULL)
++};
++
++static const struct of_device_id camyuv_of_match[] = {
++	{ .compatible = "mediatek,mt6878-cam-yuv" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, camyuv_of_match);
++
++static struct platform_driver camyuv_driver = {
++	.probe = camyuv_probe,
++	.driver = {
++		.name = CAMYUV_DRV_NAME,
++		.of_match_table = camyuv_of_match,
++		.pm = pm_ptr(&camyuv_pm_ops),
++	},
++};
++
++/*
++ * The device a phandle names, once its driver has bound (drvdata set). A
++ * managed link keeps it bound while this one is; with @pm_link it is also
++ * powered whenever this one is.
++ */
++static void *camraw_get_linked(struct device *dev, const char *prop,
++			       bool pm_link, struct device **linked)
++{
++	struct platform_device *pdev;
++	struct device_node *np;
++	u32 flags = DL_FLAG_AUTOREMOVE_CONSUMER;
++	void *data;
++
++	np = of_parse_phandle(dev->of_node, prop, 0);
++	if (!np)
++		return ERR_PTR(-ENOENT);
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev)
++		return ERR_PTR(-EPROBE_DEFER);
++	data = platform_get_drvdata(pdev);
++	if (!data) {
++		put_device(&pdev->dev);
++		return ERR_PTR(-EPROBE_DEFER);
++	}
++	if (pm_link)
++		flags |= DL_FLAG_PM_RUNTIME;
++	if (!device_link_add(dev, &pdev->dev, flags)) {
++		put_device(&pdev->dev);
++		return ERR_PTR(-ENODEV);
++	}
++	*linked = &pdev->dev;
++	put_device(&pdev->dev);
++	return data;
++}
++
++/* every engine of the frame must translate the same addresses */
++static int camraw_check_domain(struct mtk_camraw *raw, struct device *other)
++{
++	if (iommu_get_domain_for_dev(other) == iommu_get_domain_for_dev(raw->dev))
++		return 0;
++	return dev_err_probe(raw->dev, -EINVAL,
++			     "%s is in another IOMMU domain: one buffer address would not do for both\n",
++			     dev_name(other));
++}
++
++static int camraw_video_register(struct mtk_camraw *raw)
++{
++	struct video_device *vdev = &raw->vdev;
++	struct vb2_queue *q = &raw->vq;
++	int ret;
++
++	ret = v4l2_device_register(raw->dev, &raw->v4l2_dev);
++	if (ret)
++		return ret;
++
++	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++	q->io_modes = VB2_MMAP;
++	q->drv_priv = raw;
++	q->buf_struct_size = sizeof(struct mtk_camraw_buffer);
++	q->ops = &camraw_vb2_ops;
++	q->mem_ops = &vb2_vmalloc_memops;
++	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC |
++			     V4L2_BUF_FLAG_TSTAMP_SRC_SOE;
++	q->lock = &raw->vlock;
++	q->dev = raw->dev;
++	ret = vb2_queue_init(q);
++	if (ret)
++		goto err_v4l2;
++
++	strscpy(vdev->name, "mtk-camraw-a", sizeof(vdev->name));
++	vdev->fops = &camraw_fops;
++	vdev->ioctl_ops = &camraw_ioctl_ops;
++	vdev->release = video_device_release_empty;
++	vdev->lock = &raw->vlock;
++	vdev->v4l2_dev = &raw->v4l2_dev;
++	vdev->queue = q;
++	vdev->vfl_dir = VFL_DIR_RX;
++	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
++	video_set_drvdata(vdev, raw);
++	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
++	if (ret)
++		goto err_v4l2;
++	return 0;
++
++err_v4l2:
++	v4l2_device_unregister(&raw->v4l2_dev);
++	return ret;
++}
++
++/* RAW-A: interrupts, the second engine, the video node */
++static int camraw_probe_master(struct mtk_camraw *raw)
++{
++	struct device *dev = raw->dev;
++	struct device *linked;
++	int ret;
++
++	raw->twin = camraw_get_linked(dev, "mediatek,twin", false, &linked);
++	if (IS_ERR(raw->twin)) {
++		ret = PTR_ERR(raw->twin);
++		raw->twin = NULL;
++		if (ret != -ENOENT)
++			return dev_err_probe(dev, ret, "second RAW engine\n");
++	}
++	ret = camraw_check_domain(raw, raw->yuv->dev);
++	if (!ret && raw->twin)
++		ret = camraw_check_domain(raw, raw->twin->dev);
++	if (!ret && raw->twin)
++		ret = camraw_check_domain(raw, raw->twin->yuv->dev);
++	if (ret)
++		return ret;
++
++	spin_lock_init(&raw->irq_lock);
++	spin_lock_init(&raw->buf_lock);
++	INIT_LIST_HEAD(&raw->bufs);
++	init_completion(&raw->cq_done);
++	INIT_DELAYED_WORK(&raw->watchdog, camraw_watchdog);
++	ret = devm_mutex_init(dev, &raw->lock);
++	if (ret)
++		return ret;
++	ret = devm_mutex_init(dev, &raw->vlock);
++	if (ret)
++		return ret;
++
++	/* enabled for a stream only */
++	raw->irq = platform_get_irq(to_platform_device(dev), 0);
++	if (raw->irq < 0)
++		return raw->irq;
++	ret = devm_request_threaded_irq(dev, raw->irq, camraw_raw_irq,
++					camraw_raw_thread, IRQF_NO_AUTOEN,
++					"mtk-camraw-a", raw);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to request the RAW IRQ\n");
++	ret = devm_request_threaded_irq(dev, raw->yuv->irq, camraw_yuv_irq,
++					camraw_yuv_thread, IRQF_NO_AUTOEN,
++					"mtk-camyuv-a", raw);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to request the YUV IRQ\n");
++
++	raw->debugfs = debugfs_create_dir("mtk-camraw-a", NULL);
++	debugfs_create_file("status", 0400, raw->debugfs, raw, &camraw_status_fops);
++	debugfs_create_file("load", 0200, raw->debugfs, raw, &camraw_load_fops);
++
++	ret = camraw_video_register(raw);
++	if (ret) {
++		debugfs_remove_recursive(raw->debugfs);
++		return ret;
++	}
++	dev_info(dev, "video node %s, requests \"%s\" + \"%s\", second RAW engine %s\n",
++		 video_device_node_name(&raw->vdev), start_fw, frame_fw,
++		 raw->twin ? dev_name(raw->twin->dev) : "none");
++	return 0;
++}
++
++static int camraw_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device *linked;
++	struct mtk_camraw *raw;
++	unsigned int i;
++	int ret;
++
++	raw = devm_kzalloc(dev, sizeof(*raw), GFP_KERNEL);
++	if (!raw)
++		return -ENOMEM;
++	raw->dev = dev;
++	of_property_read_u32(dev->of_node, "mediatek,raw-id", &raw->raw_id);
++	if (raw->raw_id > 1)
++		return dev_err_probe(dev, -EINVAL, "mediatek,raw-id %u\n",
++				     raw->raw_id);
++
++	/* the YUV engine, its clocks and its larb are on whenever RAW is */
++	raw->yuv = camraw_get_linked(dev, "mediatek,yuv", true, &linked);
++	if (IS_ERR(raw->yuv))
++		return dev_err_probe(dev, PTR_ERR(raw->yuv), "YUV engine\n");
++
++	raw->base = devm_platform_ioremap_resource_byname(pdev, "base");
++	if (IS_ERR(raw->base))
++		return PTR_ERR(raw->base);
++	raw->inner = devm_platform_ioremap_resource_byname(pdev, "inner");
++	if (IS_ERR(raw->inner))
++		return PTR_ERR(raw->inner);
++	raw->camsys = syscon_regmap_lookup_by_phandle(dev->of_node,
++						      "mediatek,camsys");
++	if (IS_ERR(raw->camsys))
++		return dev_err_probe(dev, PTR_ERR(raw->camsys),
++				     "no camsys main syscon\n");
++
++	raw->num_clks = devm_clk_bulk_get_all(dev, &raw->clks);
++	if (raw->num_clks < 0)
++		return dev_err_probe(dev, raw->num_clks, "failed to get clocks\n");
++	for (i = 0; i < raw->num_clks; i++)
++		if (raw->clks[i].id && !strcmp(raw->clks[i].id, "cam-sel"))
++			raw->cam_sel = raw->clks[i].clk;
++
++	/* the command queue is fetched through the larb, like everything else */
++	if (!device_iommu_mapped(dev))
++		return dev_err_probe(dev, -ENODEV,
++				     "not behind the MM IOMMU: the command queue and the statistics need their larb ports in \"iommus\"\n");
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(34));
++	if (ret)
++		return ret;
++
++	ret = devm_pm_runtime_enable(dev);
++	if (ret)
++		return ret;
++
++	if (raw->raw_id) {
++		/* RAW-B: powered, reset and initialised by RAW-A */
++		platform_set_drvdata(pdev, raw);
++		dev_info(dev, "RAW-%c, second engine of a two-engine frame\n",
++			 raw_name(raw));
++		return 0;
++	}
++	platform_set_drvdata(pdev, raw);
++	ret = camraw_probe_master(raw);
++	if (ret)
++		platform_set_drvdata(pdev, NULL);
++	return ret;
++}
++
++static void camraw_remove(struct platform_device *pdev)
++{
++	struct mtk_camraw *raw = platform_get_drvdata(pdev);
++
++	if (raw->raw_id)
++		return;
++	vb2_video_unregister_device(&raw->vdev);
++	v4l2_device_unregister(&raw->v4l2_dev);
++	debugfs_remove_recursive(raw->debugfs);
++	raw->debugfs_bufs = NULL;
++	mutex_lock(&raw->lock);
++	camraw_unload(raw);
++	mutex_unlock(&raw->lock);
++}
++
++static int camraw_runtime_suspend(struct device *dev)
++{
++	struct mtk_camraw *raw = dev_get_drvdata(dev);
++
++	clk_bulk_disable_unprepare(raw->num_clks, raw->clks);
++	return 0;
++}
++
++static int camraw_runtime_resume(struct device *dev)
++{
++	struct mtk_camraw *raw = dev_get_drvdata(dev);
++
++	return clk_bulk_prepare_enable(raw->num_clks, raw->clks);
++}
++
++/* system sleep is refused while a stream runs */
++static int camraw_suspend(struct device *dev)
++{
++	struct mtk_camraw *raw = dev_get_drvdata(dev);
++
++	if (!raw->raw_id && READ_ONCE(raw->streaming))
++		return -EBUSY;
++	return pm_runtime_force_suspend(dev);
++}
++
++static const struct dev_pm_ops camraw_pm_ops = {
++	SYSTEM_SLEEP_PM_OPS(camraw_suspend, pm_runtime_force_resume)
++	RUNTIME_PM_OPS(camraw_runtime_suspend, camraw_runtime_resume, NULL)
++};
++
++static const struct of_device_id camraw_of_match[] = {
++	{ .compatible = "mediatek,mt6878-cam-raw" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, camraw_of_match);
++
++static struct platform_driver camraw_driver = {
++	.probe = camraw_probe,
++	.remove = camraw_remove,
++	.driver = {
++		.name = CAMRAW_DRV_NAME,
++		.of_match_table = camraw_of_match,
++		.pm = pm_ptr(&camraw_pm_ops),
++	},
++};
++
++static struct platform_driver * const camraw_drivers[] = {
++	&camyuv_driver,
++	&camraw_driver,
++};
++
++static int __init camraw_init(void)
++{
++	return platform_register_drivers(camraw_drivers,
++					 ARRAY_SIZE(camraw_drivers));
++}
++module_init(camraw_init);
++
++static void __exit camraw_exit(void)
++{
++	platform_unregister_drivers(camraw_drivers, ARRAY_SIZE(camraw_drivers));
++}
++module_exit(camraw_exit);
++
++MODULE_DESCRIPTION("MediaTek MT6878 RAW/YUV engine, replay of a captured command queue");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-regs.h b/drivers/media/platform/mediatek/camraw/mtk-camraw-regs.h
+new file mode 100644
+index 000000000000..ae5f88efa74e
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-regs.h
+@@ -0,0 +1,175 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * MediaTek MT6878 RAW / YUV engine registers, as far as the kernel side of
++ * a replayed frame needs them. Offsets are relative to the RAW engine base
++ * unless the name starts with YUV_. The inner (latched) copy of an engine
++ * is CAMRAW_INNER above its base.
++ *
++ * Copyright (c) 2026 serlk
++ */
++
++#ifndef _MTK_CAMRAW_REGS_H
++#define _MTK_CAMRAW_REGS_H
++
++#include <linux/bits.h>
++
++#define CAMRAW_WIN_SIZE			0x8000
++#define CAMRAW_INNER			0x8000
++
++/* bus addresses the command queue descriptors carry */
++#define CAMRAW_RAW_A_BASE		0x1a030000
++#define CAMRAW_RMS_A_BASE		0x1a040000
++#define CAMRAW_YUV_A_BASE		0x1a050000
++#define CAMRAW_RAW_B_BASE		0x1a070000
++#define CAMRAW_RMS_B_BASE		0x1a080000
++#define CAMRAW_YUV_B_BASE		0x1a090000
++#define CAMRAW_ENGINE_SPAN		0x10000		/* base + inner */
++
++#define CAMCTL_MOD5_EN			0x010
++#define  CAMCTL_MOD5_IMGO_R1		BIT(0)
++#define  CAMCTL_MOD5_UFEO_R1		BIT(1)
++#define  CAMCTL_MOD5_PDO_R1		BIT(2)
++#define  CAMCTL_MOD5_FLKO_R1		BIT(3)
++#define  CAMCTL_MOD5_TSFSO_R1		BIT(4)
++#define  CAMCTL_MOD5_AAO_R1		BIT(5)
++#define  CAMCTL_MOD5_AAHO_R1		BIT(6)
++#define  CAMCTL_MOD5_AFO_R1		BIT(7)
++#define  CAMCTL_MOD5_LTMSO_R1		BIT(8)
++#define  CAMCTL_MOD5_LTMSHO_R1		BIT(9)
++#define  CAMCTL_MOD5_FHO_R1		BIT(10)
++/* the statistics writers that can be switched off for a picture */
++#define  CAMCTL_MOD5_STATS		GENMASK(9, 3)
++#define CAMCTL_MOD6_EN			0x014
++#define  CAMCTL_MOD6_CQI_ALL		GENMASK(11, 8)
++#define CAMCTL_MISC			0x060
++#define  CAMCTL_MISC_DB_EN		BIT(4)
++#define CAMCTL_START			0x0b0
++#define  CAMCTL_CQ_THR0_START		BIT(0)
++#define CAMCTL_SW_CTL			0x0c4
++#define  CAMCTL_SW_RST_TRIG		BIT(0)
++#define  CAMCTL_SW_RST_ST		BIT(1)
++#define  CAMCTL_HW_RST			BIT(2)
++#define CAMCTL_SW_PASS1_DONE		0x0c8
++#define CAMCTL_DC_STAG_CTL		0x0dc	/* frame done tolerance, counter ticks */
++#define CAMCTL_SW_SUB_CTL		0x0cc
++
++/* interrupt groups 1..9: enable, status (read to clear), status mirror */
++#define CAMCTL_INT_EN(n)		(0x100 + ((n) - 1) * 0x10)
++#define CAMCTL_INT_STATUS(n)		(0x104 + ((n) - 1) * 0x10)
++#define CAMCTL_INT_STATUSX(n)		(0x108 + ((n) - 1) * 0x10)
++#define CAMRAW_NUM_INT			9
++
++/* group 1 */
++#define  CAMCTL_INT_TG_OVRUN		BIT(6)
++#define  CAMCTL_INT_TG_GRABERR		BIT(7)
++#define  CAMCTL_INT_TG_SOF		BIT(8)
++#define  CAMCTL_INT_TG_SOF_DROP		BIT(10)
++#define  CAMCTL_INT_CQ_DB_LOAD_ERR	BIT(13)
++#define  CAMCTL_INT_CQ_START_DLY	GENMASK(15, 14)
++#define  CAMCTL_INT_CQ_MAIN_ERR		GENMASK(17, 16)
++#define  CAMCTL_INT_CQ_TRIG_DLY		BIT(18)
++#define  CAMCTL_INT_CQ_SUB_ERR		GENMASK(20, 19)
++#define  CAMCTL_INT_PASS1_DONE		BIT(21)
++#define  CAMCTL_INT_RAW_PASS1_DONE	BIT(22)
++#define  CAMCTL_INT_DMA_ERR		BIT(25)
++#define  CAMCTL_INT_ERRORS		(CAMCTL_INT_TG_OVRUN | \
++					 CAMCTL_INT_TG_GRABERR | \
++					 CAMCTL_INT_TG_SOF_DROP | \
++					 CAMCTL_INT_CQ_START_DLY | \
++					 CAMCTL_INT_CQ_MAIN_ERR | \
++					 CAMCTL_INT_CQ_TRIG_DLY | \
++					 CAMCTL_INT_CQ_SUB_ERR | \
++					 CAMCTL_INT_DMA_ERR)
++/* group 6 */
++#define  CAMCTL_INT6_CQ_THR0_DONE	BIT(0)
++#define  CAMCTL_INT6_CQ_THRSUB_DONE	BIT(4)
++#define  CAMCTL_INT6_CQ_BOTH		(CAMCTL_INT6_CQ_THR0_DONE | \
++					 CAMCTL_INT6_CQ_THRSUB_DONE)
++/* YUV engine, group 2 */
++#define  YUV_INT2_YUVO_R1_DONE		BIT(9)
++
++#define CAMCTL_MOD5_DCM_DIS		0x310
++#define CAMCTL_MOD6_DCM_DIS		0x314
++
++#define CAMCQ_CQ_EN			0x400
++#define  CAMCQ_CQ_EN_INIT		0x16	/* default 0x14 + drop frame */
++#define CAMCQ_SCQ_START_PERIOD		0x408
++#define CAMCQ_CQ_THR0_CTL		0x410
++#define  CAMCQ_THR_CTL_INIT		0x11	/* enable, mode 1 */
++#define CAMCQ_CQ_THR0_BASEADDR		0x414
++#define CAMCQ_CQ_THR0_BASEADDR_MSB	0x418
++#define CAMCQ_CQ_THR0_DESC_SIZE		0x41c
++#define CAMCQ_CQ_SUB_THR0_CTL		0x440
++#define CAMCQ_CQ_SUB_THR0_BASEADDR	0x44c
++#define CAMCQ_CQ_SUB_THR0_BASEADDR_MSB	0x450
++#define CAMCQ_CQ_SUB_THR0_DESC_SIZE	0x458
++
++#define TG_SEN_MODE			0x700
++#define TG_VF_CON			0x704
++#define  TG_VFDATA_EN			BIT(0)
++#define TG_SEN_GRAB_PXL			0x708
++#define TG_SEN_GRAB_LIN			0x70c
++#define TG_PATH_CFG			0x710
++#define  TG_DB_LOAD_DIS			BIT(8)
++#define TG_FRMSIZE_ST			0x738
++#define TG_INTER_ST			0x73c
++#define TG_TIME_STAMP_CNT		0x77c
++/* columns of the frame this RAW engine takes: start b15:0, end b31:16 */
++#define CAMRAW_SPLIT_COLS		0x7c4
++
++#define CAMRAW_LTM_RESET		0x2350
++#define CAMRAW_FRAME_SEQ_NUM		0x2c40
++
++/* DMA ports: FIFO words at +0x20..+0x30, error status at +0x34 */
++#define CAMRAW_DMA_CON0			0x20
++#define CAMRAW_DMA_ERR_STAT		0x34
++#define CAMRAW_DMA_ADDR_WORDS		0x20	/* address, size, stride: below CON0 */
++#define CAMRAW_LOW_LATENCY		0x4090
++#define CAMRAW_CQI_R1			0x4100
++#define CAMRAW_CQI_R2			0x4170
++#define CAMRAW_CQI_R3			0x41e0
++#define CAMRAW_CQI_R4			0x4250
++/*
++ * Ports whose error reporting the kernel masks. These are the port bases:
++ * the lists write the address words there (AAO and AAHO read back as
++ * addresses), the error status word is at +CAMRAW_DMA_ERR_STAT.
++ */
++#define CAMRAW_UFEO_R1			0x48c0
++#define CAMRAW_FLKO_R1			0x4900
++#define CAMRAW_PDO_R1			0x4940
++#define CAMRAW_AAO_R1			0x4980
++#define CAMRAW_AAHO_R1			0x49c0
++#define  CAMRAW_ERR_STAT_MASKED		0xfffe0000
++
++#define YUV_CAMCTL2_MOD5_EN		0x010
++#define  YUV_MOD5_TCYSO_R1		BIT(0)
++#define  YUV_MOD5_DRZS4NO_R3		BIT(2)
++#define  YUV_MOD5_RZH1N2TO_R2		BIT(6)
++#define  YUV_MOD5_YUVO_R1		BIT(9)
++#define  YUV_MOD5_YUVBO_R1		BIT(10)
++#define  YUV_MOD5_YUVO_R2		BIT(13)
++#define  YUV_MOD5_YUVBO_R2		BIT(14)
++#define  YUV_MOD5_STATS			YUV_MOD5_TCYSO_R1
++#define  YUV_MOD5_EXTRA			(YUV_MOD5_DRZS4NO_R3 | YUV_MOD5_RZH1N2TO_R2 | \
++					 YUV_MOD5_YUVO_R2 | YUV_MOD5_YUVBO_R2)
++#define YUV_CAMCTL2_FMT3_SEL		0x078
++#define YUV_LOW_LATENCY0		0x4090
++#define YUV_LOW_LATENCY1		0x4098
++#define YUV_LOW_LATENCY2		0x40a0
++#define YUV_YUVO_R1			0x4200	/* first plane */
++#define YUV_YUVBO_R1			0x42b0	/* second plane */
++#define YUV_YUVCO_R1			0x4360
++#define YUV_YUVDO_R1			0x4410
++
++/* camsys main block (syscon) */
++#define CAM_MAIN_HALT1			0x0c4
++#define CAM_MAIN_HALT2			0x0c8
++#define CAM_MAIN_HALT3			0x0cc
++#define CAM_MAIN_HALT4			0x0d0
++#define CAM_MAIN_HALT5			0x0d4
++#define CAM_MAIN_HALT6			0x0d8
++#define CAM_MAIN_HALT7			0x0dc	/* HALT7/8: the pair of side B */
++#define CAM_MAIN_HALT8			0x0e0
++#define CAM_MAIN_HALT13			0x0f4
++
++#endif /* _MTK_CAMRAW_REGS_H */
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.c b/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.c
+new file mode 100644
+index 000000000000..b009ce8ef959
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.c
+@@ -0,0 +1,669 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * MediaTek MT6878 RAW engine: replay of a captured command queue.
++ *
++ * A request dump is one file, all offsets from its start, little-endian:
++ *
++ *   0    description, 64 bytes
++ *   80   u32 sequence
++ *   84   u32 header size, u32 payload offset, u32 payload size
++ *   104  command queue slot: u32 offset, u32 size, u64 address,
++ *        u32 main list offset, u32 main list size,
++ *        u32 sub list offset, u32 sub list size (list offsets in the slot)
++ *   136  settings buffer of the request: u32 offset, u32 size, u64 address
++ *   208  frame parameters: u32 offset, u32 size
++ *   216  configuration parameters: u32 offset, u32 size
++ *
++ * A list is a sequence of 12 byte descriptors, a control word and the
++ * 64-bit address of the values: register address bits 15..0 in bits 15..0
++ * and bits 20..16 in bits 31..27 (window 0x1a000000), number of values
++ * minus one in bits 24..16, operation in bits 26..25 (0 write, 3 end). The
++ * values of a descriptor lie in the slot or in the settings buffer. The
++ * list sizes count the end descriptor.
++ *
++ * The lists of RAW-A program six blocks: RAW, RMS and YUV of side A and of
++ * side B, the two halves of a frame split between two RAW engines.
++ *
++ * The frame parameters (packed, 0x16883 bytes) name the buffers: sixteen
++ * image outputs of 0x81a bytes at 0xe593 (u8 pipe, u8 id, u32 format, u16
++ * width, u16 height, u16 pitch[4], then per plane u64 address, u32 fd, u32
++ * size), four statistics outputs of 18 bytes at 0x16733 (u8 pipe, u8 id,
++ * u64 address, u32 fd, u32 size). The configuration parameters give the
++ * input: format at 1, pixel id at 5, pixel mode in front of RAW at 8, crop
++ * (four u16) at 0xa, engines mask (u16) at 0x208.
++ *
++ * A buffer address is written as two consecutive registers of a DMA port,
++ * low 32 bits then the upper bits. Every such pair must lie inside one of
++ * the buffers of the request: slot, settings, an image plane or a
++ * statistics buffer. The slot itself is one of them: the frame header
++ * writer stores into its last 64 bytes.
++ *
++ * The first request of a stream carries a one-time block (timing
++ * generator, grab window, time stamp counter, interrupt enables); it is
++ * recognised by the grab window. A steady request has the picture output.
++ *
++ * Copyright (c) 2026 serlk
++ */
++
++#include <linux/bits.h>
++#include <linux/device.h>
++#include <linux/errno.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++
++#include "mtk-camraw-regs.h"
++#include "mtk-camraw-replay.h"
++
++#define DUMP_SEQUENCE		80
++#define DUMP_SLOT		104
++#define DUMP_SLOT_IOVA		112
++#define DUMP_MAIN		120
++#define DUMP_SUB		128
++#define DUMP_SETTINGS		136
++#define DUMP_SETTINGS_IOVA	144
++#define DUMP_FRAME_PARAM	208
++#define DUMP_CONFIG_PARAM	216
++#define DUMP_MIN_HEADER		228
++
++#define FP_SIZE			0x16883
++#define FP_IMG			0xe593
++#define FP_IMG_NUM		16
++#define FP_IMG_SIZE		0x81a
++#define FP_IMG_PLANES		18
++#define FP_IMG_NUM_PLANES	4
++#define FP_META_OUT		0x16733
++#define FP_META_OUT_NUM		4
++#define FP_META_SIZE		18
++
++#define CP_MIN_SIZE		0x20a
++
++/* an address-like pair below this is a count next to a small number */
++#define CAMRAW_MIN_IOVA		0x100000
++
++static const u32 camraw_block_base[CAMRAW_NUM_BLOCKS] = {
++	CAMRAW_RAW_A_BASE, CAMRAW_RMS_A_BASE, CAMRAW_YUV_A_BASE,
++	CAMRAW_RAW_B_BASE, CAMRAW_RMS_B_BASE, CAMRAW_YUV_B_BASE,
++};
++
++static const char * const camraw_block_names[CAMRAW_NUM_BLOCKS] = {
++	"RAW-A", "RMS-A", "YUV-A", "RAW-B", "RMS-B", "YUV-B",
++};
++
++static const char * const camraw_kind_names[] = {
++	"queue slot", "settings", "image", "statistics",
++};
++
++static int camraw_block(u32 reg)
++{
++	unsigned int i;
++
++	for (i = 0; i < CAMRAW_NUM_BLOCKS; i++)
++		if (reg >= camraw_block_base[i] &&
++		    reg < camraw_block_base[i] + CAMRAW_ENGINE_SPAN)
++			return i;
++	return -1;
++}
++
++static bool camraw_get_section(const u8 *data, size_t len, unsigned int hdr_off,
++			       const u8 **p, u32 *size)
++{
++	u32 off = get_unaligned_le32(data + hdr_off);
++
++	*size = get_unaligned_le32(data + hdr_off + 4);
++	*p = data + off;
++	return *size && (u64)off + *size <= len;
++}
++
++static u32 camraw_desc_reg(u32 ctrl)
++{
++	return CAMRAW_CQ_REG_PREFIX | ((ctrl >> 27) & 0x1f) << 16 |
++	       (ctrl & 0xffff);
++}
++
++static bool camraw_is_dma_reg(u32 reg)
++{
++	/* the DMA ports lie in the upper half of an engine window */
++	return (reg & (CAMRAW_WIN_SIZE - 1)) >= 0x4000;
++}
++
++static struct camraw_capbuf *camraw_add_buf(struct camraw_replay *rp, u64 iova,
++					    u32 size, u8 kind, u8 id, u8 plane)
++{
++	struct camraw_capbuf *b;
++
++	if (rp->num_bufs == CAMRAW_MAX_BUFS)
++		return NULL;
++	b = &rp->bufs[rp->num_bufs++];
++	b->iova = iova;
++	b->size = size;
++	b->kind = kind;
++	b->id = id;
++	b->plane = plane;
++	return b;
++}
++
++static int camraw_parse_params(struct camraw_replay *rp, const u8 *fp,
++			       u32 fp_size, const u8 *cp, u32 cp_size)
++{
++	unsigned int i, p;
++
++	if (fp_size != FP_SIZE) {
++		dev_err(rp->dev,
++			"replay: %s: frame parameters of 0x%x bytes, the known layout has 0x%x\n",
++			rp->name, fp_size, FP_SIZE);
++		return -EINVAL;
++	}
++	if (cp_size < CP_MIN_SIZE) {
++		dev_err(rp->dev, "replay: %s: configuration parameters of 0x%x bytes\n",
++			rp->name, cp_size);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < FP_IMG_NUM; i++) {
++		const u8 *e = fp + FP_IMG + i * FP_IMG_SIZE;
++
++		for (p = 0; p < FP_IMG_NUM_PLANES; p++) {
++			u64 iova = get_unaligned_le64(e + FP_IMG_PLANES + 16 * p);
++			u32 size = get_unaligned_le32(e + FP_IMG_PLANES + 16 * p + 12);
++
++			if (!iova || !size)
++				continue;
++			if (!camraw_add_buf(rp, iova, size, CAMRAW_BUF_IMAGE,
++					    e[1], p))
++				return -E2BIG;
++			if (e[1] == CAMRAW_OUT_PICTURE &&
++			    p < CAMRAW_PICTURE_PLANES)
++				rp->out_plane[p] = rp->num_bufs - 1;
++		}
++		if (e[1] == CAMRAW_OUT_PICTURE && rp->out_plane[0] >= 0) {
++			rp->fmt_id = get_unaligned_le32(e + 2);
++			rp->width = get_unaligned_le16(e + 6);
++			rp->height = get_unaligned_le16(e + 8);
++			rp->stride = get_unaligned_le16(e + 10);
++		}
++	}
++	for (i = 0; i < FP_META_OUT_NUM; i++) {
++		const u8 *e = fp + FP_META_OUT + i * FP_META_SIZE;
++		u64 iova = get_unaligned_le64(e + 2);
++		u32 size = get_unaligned_le32(e + 14);
++
++		if (iova && size &&
++		    !camraw_add_buf(rp, iova, size, CAMRAW_BUF_STATS, e[1], 0))
++			return -E2BIG;
++	}
++
++	rp->in_fmt = cp[1];
++	rp->pixel_id = cp[5];
++	rp->pixel_mode = cp[8];
++	rp->in_width = get_unaligned_le16(cp + 0xe);
++	rp->in_height = get_unaligned_le16(cp + 0x10);
++	rp->dev_mask = get_unaligned_le16(cp + 0x208);
++	return 0;
++}
++
++static int camraw_find_buf(const struct camraw_replay *rp, u64 addr)
++{
++	unsigned int i;
++
++	for (i = 0; i < rp->num_bufs; i++)
++		if (addr >= rp->bufs[i].iova &&
++		    addr < rp->bufs[i].iova + rp->bufs[i].size)
++			return i;
++	return -1;
++}
++
++static void camraw_note_write(struct camraw_replay *rp, int blk, u32 reg,
++			      u32 val, u32 off, bool in_slot)
++{
++	u32 rel = reg - camraw_block_base[blk];
++
++	if (rel == CAMCTL_MOD5_EN && blk != CAMRAW_BLK_RMS_A &&
++	    blk != CAMRAW_BLK_RMS_B) {
++		rp->mod5_off[blk] = in_slot ? off : CAMRAW_NO_OFFSET;
++		rp->mod5[blk] = val;
++	}
++	if ((blk == CAMRAW_BLK_RAW_A || blk == CAMRAW_BLK_RAW_B) &&
++	    rel == CAMRAW_SPLIT_COLS) {
++		rp->split[blk == CAMRAW_BLK_RAW_B] = val;
++		rp->has_split[blk == CAMRAW_BLK_RAW_B] = true;
++	}
++	if (blk != CAMRAW_BLK_RAW_A)
++		return;
++
++	switch (rel) {
++	case TG_SEN_GRAB_PXL:
++		rp->grab_pxl = val;
++		rp->onetime = true;
++		break;
++	case TG_SEN_GRAB_LIN:
++		rp->grab_lin = val;
++		break;
++	case TG_TIME_STAMP_CNT:
++		rp->time_stamp_cnt = val;
++		break;
++	case CAMCTL_INT_EN(1):
++		rp->int_en = val;
++		break;
++	case CAMRAW_FRAME_SEQ_NUM:
++		rp->frame_seq = val;
++		rp->has_frame_seq = true;
++		rp->frame_seq_off = in_slot ? off : CAMRAW_NO_OFFSET;
++		break;
++	}
++}
++
++/* the values of one write descriptor: address words and registers of interest */
++static int camraw_walk_values(struct camraw_replay *rp, int blk, u32 reg,
++			      const u8 *vals, u32 count, u32 voff, bool in_slot)
++{
++	u32 upper = upper_32_bits(rp->slot_iova);
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		u32 val = get_unaligned_le32(vals + 4 * i);
++		struct camraw_reloc *r;
++		u64 addr;
++		int buf;
++
++		camraw_note_write(rp, blk, reg + 4 * i, val, voff + 4 * i,
++				  in_slot);
++		/* low word of an address, the upper bits follow? */
++		if (i + 1 >= count || !val || !camraw_is_dma_reg(reg + 4 * i) ||
++		    get_unaligned_le32(vals + 4 * i + 4) != upper)
++			continue;
++		addr = (u64)upper << 32 | val;
++		buf = camraw_find_buf(rp, addr);
++		if (buf < 0) {
++			if (val < CAMRAW_MIN_IOVA)
++				continue;
++			if (!rp->loose_addr++)
++				dev_err(rp->dev,
++					"replay: %s: address 0x%llx at register 0x%08x is in no buffer of the request\n",
++					rp->name, addr, reg + 4 * i);
++			i++;
++			continue;
++		}
++		if (!in_slot) {
++			/* only values inside the slot are patched */
++			if (!rp->settings_addr++)
++				dev_err(rp->dev,
++					"replay: %s: the address word of register 0x%08x lies in the settings buffer\n",
++					rp->name, reg + 4 * i);
++			i++;
++			continue;
++		}
++		if (rp->num_relocs == CAMRAW_MAX_RELOCS) {
++			dev_err(rp->dev, "replay: %s: more than %u address words\n",
++				rp->name, CAMRAW_MAX_RELOCS);
++			return -E2BIG;
++		}
++		r = &rp->relocs[rp->num_relocs++];
++		r->reg = reg + 4 * i;
++		r->off = voff + 4 * i;
++		r->msb_off = r->off + 4;
++		r->addend = addr - rp->bufs[buf].iova;
++		r->buf = buf;
++		if (!rp->bufs[buf].hits++)
++			rp->bufs[buf].first_reg = r->reg;
++		if (!CAMRAW_BLK_IS_B(blk))
++			rp->bufs[buf].hits_a++;
++		i++;
++	}
++	return 0;
++}
++
++/* decode both lists: count, note the registers of interest, find addresses */
++static int camraw_walk(struct camraw_replay *rp)
++{
++	unsigned int list;
++	int ret;
++
++	for (list = 0; list < CAMRAW_NUM_LISTS; list++) {
++		u32 pos = rp->list_off[list];
++		u32 end = pos + rp->list_size[list];
++		bool has_end = false;
++
++		for (; pos + CAMRAW_CQ_DESC_SIZE <= end; pos += CAMRAW_CQ_DESC_SIZE) {
++			u32 ctrl = get_unaligned_le32(rp->slot + pos);
++			u64 ptr = get_unaligned_le64(rp->slot + pos + 4);
++			u32 op = (ctrl >> 25) & 3;
++			u32 count = ((ctrl >> 16) & 0x1ff) + 1;
++			u32 reg = camraw_desc_reg(ctrl);
++			int blk = camraw_block(reg);
++			const u8 *vals;
++			bool in_slot = false;
++			u32 voff = 0;
++
++			if (op == CAMRAW_CQ_OP_END) {
++				has_end = true;
++				break;
++			}
++			rp->num_desc[list]++;
++			if (ptr >= rp->slot_iova &&
++			    ptr + 4ULL * count <= rp->slot_iova + rp->slot_size) {
++				in_slot = true;
++				voff = ptr - rp->slot_iova;
++				vals = rp->slot + voff;
++			} else if (ptr >= rp->settings_iova &&
++				   ptr + 4ULL * count <=
++				   rp->settings_iova + rp->settings_size) {
++				voff = ptr - rp->settings_iova;
++				vals = rp->settings + voff;
++				rp->values_settings += count;
++			} else {
++				vals = NULL;
++			}
++			if (op != CAMRAW_CQ_OP_WRITE || !vals || blk < 0 ||
++			    camraw_block(reg + 4 * (count - 1)) != blk) {
++				if (!rp->bad_desc++)
++					dev_err(rp->dev,
++						"replay: %s: list %u descriptor at 0x%x: operation %u, register 0x%08x, %u values at 0x%llx: not a write of slot or settings values into one of the six blocks\n",
++						rp->name, list, pos, op, reg, count,
++						ptr);
++				continue;
++			}
++			rp->values[blk] += count;
++			if (CAMRAW_BLK_IS_B(blk))
++				rp->twin = true;
++			ret = camraw_walk_values(rp, blk, reg, vals, count, voff,
++						 in_slot);
++			if (ret)
++				return ret;
++		}
++		if (!has_end) {
++			dev_err(rp->dev, "replay: %s: list %u has no end\n",
++				rp->name, list);
++			rp->bad_desc++;
++		}
++	}
++	return 0;
++}
++
++static const char *camraw_kind(const struct camraw_replay *rp)
++{
++	if (rp->onetime)
++		return "start request with the one-time block";
++	if (camraw_replay_has_picture(rp))
++		return "steady request";
++	return "start-up request without the one-time block";
++}
++
++static void camraw_report(struct camraw_replay *rp)
++{
++	unsigned int i;
++
++	dev_info(rp->dev,
++		 "replay: %s: request %u, %s; slot 0x%x bytes at 0x%llx, main 0x%x+0x%x %u writes, sub 0x%x+0x%x %u writes, settings 0x%x bytes at 0x%llx (%u list values)\n",
++		 rp->name, rp->sequence, camraw_kind(rp),
++		 rp->slot_size, rp->slot_iova,
++		 rp->list_off[0], rp->list_size[0], rp->num_desc[0],
++		 rp->list_off[1], rp->list_size[1], rp->num_desc[1],
++		 rp->settings_size, rp->settings_iova, rp->values_settings);
++	dev_info(rp->dev,
++		 "replay: %s: values to RAW-A %u RMS-A %u YUV-A %u RAW-B %u RMS-B %u YUV-B %u; %u bad descriptors, %u addresses in no buffer, %u in the settings\n",
++		 rp->name, rp->values[0], rp->values[1], rp->values[2],
++		 rp->values[3], rp->values[4], rp->values[5], rp->bad_desc,
++		 rp->loose_addr, rp->settings_addr);
++	dev_info(rp->dev,
++		 "replay: %s: input %ux%u format %u pixel id %u pixel mode %u engines 0x%x; columns RAW-A %u-%u RAW-B %u-%u; writer enables RAW 0x%x/0x%x YUV 0x%x/0x%x\n",
++		 rp->name, rp->in_width, rp->in_height, rp->in_fmt,
++		 rp->pixel_id, rp->pixel_mode, rp->dev_mask,
++		 rp->split[0] & 0xffff, rp->split[0] >> 16,
++		 rp->split[1] & 0xffff, rp->split[1] >> 16,
++		 rp->mod5[CAMRAW_BLK_RAW_A], rp->mod5[CAMRAW_BLK_RAW_B],
++		 rp->mod5[CAMRAW_BLK_YUV_A], rp->mod5[CAMRAW_BLK_YUV_B]);
++	if (rp->onetime)
++		dev_info(rp->dev,
++			 "replay: %s: one-time block: grab window pixels %u-%u lines %u-%u, time stamp counter %u, RAW interrupt enable 0x%08x\n",
++			 rp->name, rp->grab_pxl & 0xffff, rp->grab_pxl >> 16,
++			 rp->grab_lin & 0xffff, rp->grab_lin >> 16,
++			 rp->time_stamp_cnt, rp->int_en);
++	if (camraw_replay_has_picture(rp))
++		dev_info(rp->dev,
++			 "replay: %s: picture %ux%u pitch %u format id %u, planes in buffers %d and %d\n",
++			 rp->name, rp->width, rp->height, rp->stride, rp->fmt_id,
++			 rp->out_plane[0], rp->out_plane[1]);
++	for (i = 0; i < rp->num_bufs; i++) {
++		const struct camraw_capbuf *b = &rp->bufs[i];
++
++		dev_info(rp->dev,
++			 "replay: %s: buffer %u: %s id %u plane %u, 0x%llx size 0x%x, %u address word(s), %u on side A\n",
++			 rp->name, i, camraw_kind_names[b->kind], b->id,
++			 b->plane, b->iova, b->size, b->hits, b->hits_a);
++	}
++	for (i = 0; i < rp->num_relocs; i++) {
++		const struct camraw_reloc *r = &rp->relocs[i];
++		int blk = camraw_block(r->reg);
++
++		dev_dbg(rp->dev, "replay: %s: address %s +0x%04x -> buffer %u + 0x%x\n",
++			rp->name, camraw_block_names[blk],
++			r->reg - camraw_block_base[blk], r->buf, r->addend);
++	}
++	if (rp->blocker)
++		dev_warn(rp->dev, "replay: %s: not to be run: %s\n", rp->name,
++			 rp->blocker);
++}
++
++void camraw_replay_free(struct camraw_replay *rp)
++{
++	kvfree(rp->settings);
++	kvfree(rp->slot);
++	memset(rp, 0, sizeof(*rp));
++}
++
++int camraw_replay_parse(struct camraw_replay *rp, struct device *dev,
++			const char *name, const u8 *data, size_t len)
++{
++	const u8 *slot, *settings, *fp, *cp;
++	struct camraw_capbuf *b;
++	u32 fp_size, cp_size;
++	unsigned int i;
++	int ret;
++
++	memset(rp, 0, sizeof(*rp));
++	rp->dev = dev;
++	rp->name = name;
++	rp->frame_seq_off = CAMRAW_NO_OFFSET;
++	for (i = 0; i < CAMRAW_PICTURE_PLANES; i++)
++		rp->out_plane[i] = -1;
++	for (i = 0; i < CAMRAW_NUM_BLOCKS; i++)
++		rp->mod5_off[i] = CAMRAW_NO_OFFSET;
++
++	if (len < DUMP_MIN_HEADER) {
++		dev_err(dev, "replay: %s: %zu bytes, shorter than the header\n",
++			name, len);
++		return -EINVAL;
++	}
++	if (!camraw_get_section(data, len, DUMP_SLOT, &slot, &rp->slot_size) ||
++	    !camraw_get_section(data, len, DUMP_SETTINGS, &settings,
++				&rp->settings_size) ||
++	    !camraw_get_section(data, len, DUMP_FRAME_PARAM, &fp, &fp_size) ||
++	    !camraw_get_section(data, len, DUMP_CONFIG_PARAM, &cp, &cp_size)) {
++		dev_err(dev, "replay: %s: a section of the dump is empty or outside the file\n",
++			name);
++		return -EINVAL;
++	}
++	rp->sequence = get_unaligned_le32(data + DUMP_SEQUENCE);
++	rp->slot_iova = get_unaligned_le64(data + DUMP_SLOT_IOVA);
++	rp->settings_iova = get_unaligned_le64(data + DUMP_SETTINGS_IOVA);
++	rp->list_off[0] = get_unaligned_le32(data + DUMP_MAIN);
++	rp->list_size[0] = get_unaligned_le32(data + DUMP_MAIN + 4);
++	rp->list_off[1] = get_unaligned_le32(data + DUMP_SUB);
++	rp->list_size[1] = get_unaligned_le32(data + DUMP_SUB + 4);
++	for (i = 0; i < CAMRAW_NUM_LISTS; i++) {
++		if ((u64)rp->list_off[i] + rp->list_size[i] > rp->slot_size ||
++		    rp->list_size[i] % CAMRAW_CQ_DESC_SIZE) {
++			dev_err(dev, "replay: %s: list %u (0x%x + 0x%x) outside the slot or not whole descriptors\n",
++				name, i, rp->list_off[i], rp->list_size[i]);
++			return -EINVAL;
++		}
++	}
++
++	rp->slot = kvmemdup(slot, rp->slot_size, GFP_KERNEL);
++	rp->settings = kvmemdup(settings, rp->settings_size, GFP_KERNEL);
++	if (!rp->slot || !rp->settings) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	/* buffers 0 and 1: the slot and the settings, with their content */
++	b = camraw_add_buf(rp, rp->slot_iova, rp->slot_size, CAMRAW_BUF_SLOT,
++			   0, 0);
++	b->content = rp->slot;
++	b = camraw_add_buf(rp, rp->settings_iova, rp->settings_size,
++			   CAMRAW_BUF_SETTINGS, 0, 0);
++	b->content = rp->settings;
++	ret = camraw_parse_params(rp, fp, fp_size, cp, cp_size);
++	if (ret)
++		goto err;
++	ret = camraw_walk(rp);
++	if (ret)
++		goto err;
++
++	if (!rp->list_size[0] || !rp->list_size[1])
++		rp->blocker = "an empty list hangs the command queue";
++	else if (rp->bad_desc)
++		rp->blocker = "a descriptor is not in the known format";
++	else if (rp->loose_addr)
++		rp->blocker = "an address of the lists is in no buffer of the request: its port would use the captured address";
++	else if (rp->settings_addr)
++		rp->blocker = "an address of the lists lies in the settings buffer, where it is not patched";
++	else if (!rp->values[CAMRAW_BLK_RAW_A])
++		rp->blocker = "the lists write nothing to RAW-A";
++
++	camraw_report(rp);
++	return 0;
++
++err:
++	camraw_replay_free(rp);
++	return ret;
++}
++
++/*
++ * Can @start be applied before the stream starts and @frame for every
++ * frame after it? Each is applied whole; registers of the two are never
++ * combined. Returns NULL or the reason.
++ */
++const char *camraw_replay_pair_check(const struct camraw_replay *start,
++				     const struct camraw_replay *frame)
++{
++	if (start->blocker || frame->blocker)
++		return "one of the two requests has an objection of its own";
++	if (!start->onetime)
++		return "the start request has no one-time block (grab window, time stamp counter, interrupt enables)";
++	if (frame->onetime)
++		return "the per-frame request carries the one-time block";
++	if (!camraw_replay_has_picture(frame))
++		return "the per-frame request has no picture output";
++	if (start->in_fmt != frame->in_fmt ||
++	    start->pixel_id != frame->pixel_id ||
++	    start->pixel_mode != frame->pixel_mode ||
++	    start->in_width != frame->in_width ||
++	    start->in_height != frame->in_height ||
++	    start->dev_mask != frame->dev_mask)
++		return "the two requests are for different sensor input or engines";
++	if (start->twin != frame->twin)
++		return "one request is for two RAW engines, the other for one";
++	return NULL;
++}
++
++/* copy the descriptors of one list, close it; returns its size with the end */
++static u32 camraw_emit_list(const struct camraw_replay *rp, u8 *dst,
++			    unsigned int list, u64 slot_base, u64 settings_base,
++			    bool a_only)
++{
++	u32 pos = rp->list_off[list];
++	u32 end = pos + rp->list_size[list];
++	u32 out = pos;
++
++	for (; pos + CAMRAW_CQ_DESC_SIZE <= end; pos += CAMRAW_CQ_DESC_SIZE) {
++		u32 ctrl = get_unaligned_le32(rp->slot + pos);
++		u64 ptr = get_unaligned_le64(rp->slot + pos + 4);
++
++		if (((ctrl >> 25) & 3) == CAMRAW_CQ_OP_END)
++			break;
++		if (a_only && CAMRAW_BLK_IS_B(camraw_block(camraw_desc_reg(ctrl))))
++			continue;
++		if (ptr >= rp->slot_iova && ptr < rp->slot_iova + rp->slot_size)
++			ptr = ptr - rp->slot_iova + slot_base;
++		else
++			ptr = ptr - rp->settings_iova + settings_base;
++		put_unaligned_le32(ctrl, dst + out);
++		put_unaligned_le64(ptr, dst + out + 4);
++		out += CAMRAW_CQ_DESC_SIZE;
++	}
++	put_unaligned_le32(CAMRAW_CQ_END_CTRL, dst + out);
++	put_unaligned_le64(0, dst + out + 4);
++	out += CAMRAW_CQ_DESC_SIZE;
++	/* what is left of the captured list is not part of it any more */
++	if (out < end)
++		memset(dst + out, 0, end - out);
++	return out - rp->list_off[list];
++}
++
++/*
++ * Write the slot for the address @slot_base into @dst (slot_size bytes):
++ * value pointers moved with the slot and with the settings buffer, every
++ * address pointing into the replacement buffers, the picture planes into
++ * @picture[] if given. @emit_size gets the sizes of the two lists to
++ * program. Every buffer an address word points into must have a
++ * replacement (cpu set); the slot is @dst itself.
++ */
++int camraw_replay_emit(const struct camraw_replay *rp, u8 *dst, u64 slot_base,
++		       unsigned int flags, const dma_addr_t *picture,
++		       u32 emit_size[CAMRAW_NUM_LISTS])
++{
++	const struct camraw_capbuf *settings = &rp->bufs[CAMRAW_BUFIDX_SETTINGS];
++	bool a_only = flags & CAMRAW_EMIT_A_ONLY;
++	unsigned int i, p;
++
++	if (rp->bad_desc || !settings->cpu)
++		return -EINVAL;
++
++	memcpy(dst, rp->slot, rp->slot_size);
++	for (i = 0; i < CAMRAW_NUM_LISTS; i++)
++		emit_size[i] = camraw_emit_list(rp, dst, i, slot_base,
++						settings->dma, a_only);
++
++	for (i = 0; i < rp->num_relocs; i++) {
++		const struct camraw_reloc *r = &rp->relocs[i];
++		const struct camraw_capbuf *b = &rp->bufs[r->buf];
++		u64 addr;
++
++		if (a_only && CAMRAW_BLK_IS_B(camraw_block(r->reg)))
++			continue;
++		if (r->buf == CAMRAW_BUFIDX_SLOT)
++			addr = slot_base;
++		else if (b->cpu)
++			addr = b->dma;
++		else
++			return -ENOBUFS;
++		for (p = 0; picture && p < CAMRAW_PICTURE_PLANES; p++)
++			if (r->buf == rp->out_plane[p])
++				addr = picture[p];
++		addr += r->addend;
++		put_unaligned_le32(lower_32_bits(addr), dst + r->off);
++		put_unaligned_le32(upper_32_bits(addr), dst + r->msb_off);
++	}
++
++	for (i = 0; i < CAMRAW_NUM_BLOCKS; i++) {
++		u32 clear = 0, val;
++
++		if (rp->mod5_off[i] == CAMRAW_NO_OFFSET)
++			continue;
++		if (i == CAMRAW_BLK_RAW_A || i == CAMRAW_BLK_RAW_B) {
++			if (flags & CAMRAW_EMIT_STATS_OFF)
++				clear = CAMCTL_MOD5_STATS;
++		} else {
++			if (flags & CAMRAW_EMIT_STATS_OFF)
++				clear |= YUV_MOD5_STATS;
++			if (flags & CAMRAW_EMIT_EXTRA_OFF)
++				clear |= YUV_MOD5_EXTRA;
++		}
++		val = get_unaligned_le32(dst + rp->mod5_off[i]);
++		put_unaligned_le32(val & ~clear, dst + rp->mod5_off[i]);
++	}
++	return 0;
++}
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.h b/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.h
+new file mode 100644
+index 000000000000..eb19ded5b28d
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.h
+@@ -0,0 +1,200 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * MediaTek MT6878 RAW engine: replay of a captured command queue.
++ *
++ * Pure data code. It reads one request dump (header, the 64 KiB command
++ * queue slot, the per-request settings buffer, frame and configuration
++ * parameters), decodes both descriptor lists and finds the words that
++ * carry buffer addresses, so that a copy of the slot can be placed at
++ * another address with other buffers. It never touches hardware.
++ *
++ * Copyright (c) 2026 serlk
++ */
++
++#ifndef _MTK_CAMRAW_REPLAY_H
++#define _MTK_CAMRAW_REPLAY_H
++
++#include <linux/bits.h>
++#include <linux/types.h>
++
++struct device;
++
++#define CAMRAW_MAX_BUFS			24
++#define CAMRAW_MAX_RELOCS		64
++#define CAMRAW_NO_OFFSET		0xffffffff
++
++#define CAMRAW_CQ_DESC_SIZE		12
++#define CAMRAW_CQ_OP_WRITE		0
++#define CAMRAW_CQ_OP_END		3
++#define CAMRAW_CQ_END_CTRL		0x06000000
++#define CAMRAW_CQ_REG_PREFIX		0x1a000000
++
++enum camraw_list {
++	CAMRAW_LIST_MAIN,
++	CAMRAW_LIST_SUB,
++	CAMRAW_NUM_LISTS,
++};
++
++/* the register blocks the lists of a two-engine frame address */
++enum camraw_block {
++	CAMRAW_BLK_RAW_A,
++	CAMRAW_BLK_RMS_A,
++	CAMRAW_BLK_YUV_A,
++	CAMRAW_BLK_RAW_B,
++	CAMRAW_BLK_RMS_B,
++	CAMRAW_BLK_YUV_B,
++	CAMRAW_NUM_BLOCKS,
++};
++
++#define CAMRAW_BLK_IS_B(b)		((b) >= CAMRAW_BLK_RAW_B)
++
++enum camraw_buf_kind {
++	CAMRAW_BUF_SLOT,	/* the command queue slot itself */
++	CAMRAW_BUF_SETTINGS,	/* per-request settings: list values, shading table */
++	CAMRAW_BUF_IMAGE,
++	CAMRAW_BUF_STATS,
++};
++
++/* the slot and the settings buffer are always the first two buffers */
++#define CAMRAW_BUFIDX_SLOT		0
++#define CAMRAW_BUFIDX_SETTINGS		1
++
++/* the picture: image output 6 of the frame parameters, two planes */
++#define CAMRAW_OUT_PICTURE		6
++#define CAMRAW_PICTURE_PLANES		2
++/* its format identifier for two planes, V before U (NV21) */
++#define CAMRAW_FMT_YVU420_2P		24
++
++/* emit flags */
++#define CAMRAW_EMIT_A_ONLY		BIT(0)	/* leave out the side B descriptors */
++#define CAMRAW_EMIT_STATS_OFF		BIT(1)	/* statistics writers disabled */
++#define CAMRAW_EMIT_EXTRA_OFF		BIT(2)	/* outputs other than the picture disabled */
++
++/**
++ * struct camraw_capbuf - a buffer the captured request used
++ * @iova: its address in the capture
++ * @size: its size in bytes
++ * @kind: what it is
++ * @id: output or statistics identifier of the frame parameters
++ * @plane: plane number of an image
++ * @content: its captured content (slot and settings), or NULL
++ * @hits: number of address words that point into it
++ * @hits_a: those written to side A registers
++ * @first_reg: register of the first address word
++ * @cpu: replacement buffer (set by the user of the parser)
++ * @dma: its address for the engines
++ * @dma_dev: the device it was allocated for
++ */
++struct camraw_capbuf {
++	u64 iova;
++	u32 size;
++	u8 kind;
++	u8 id;
++	u8 plane;
++	const u8 *content;
++	unsigned int hits;
++	unsigned int hits_a;
++	u32 first_reg;
++
++	void *cpu;
++	dma_addr_t dma;
++	struct device *dma_dev;
++};
++
++/**
++ * struct camraw_reloc - an address of the lists: two consecutive registers
++ * @reg: register of the low 32 bits; the upper bits go to @reg + 4
++ * @off: offset in the slot of the low word
++ * @msb_off: offset in the slot of the upper word
++ * @addend: distance of the address from the start of the buffer
++ * @buf: index of the buffer
++ */
++struct camraw_reloc {
++	u32 reg;
++	u32 off;
++	u32 msb_off;
++	u32 addend;
++	u8 buf;
++};
++
++/**
++ * struct camraw_replay - one request dump, decoded
++ */
++struct camraw_replay {
++	struct device *dev;
++	const char *name;
++
++	u8 *slot;
++	u32 slot_size;
++	u64 slot_iova;
++	u8 *settings;
++	u32 settings_size;
++	u64 settings_iova;
++	u32 list_off[CAMRAW_NUM_LISTS];
++	u32 list_size[CAMRAW_NUM_LISTS];
++	u32 sequence;
++
++	struct camraw_capbuf bufs[CAMRAW_MAX_BUFS];
++	unsigned int num_bufs;
++	struct camraw_reloc relocs[CAMRAW_MAX_RELOCS];
++	unsigned int num_relocs;
++
++	/* what the decoding showed */
++	unsigned int num_desc[CAMRAW_NUM_LISTS];
++	unsigned int values[CAMRAW_NUM_BLOCKS];
++	unsigned int values_settings;
++	unsigned int bad_desc;
++	unsigned int loose_addr;
++	unsigned int settings_addr;
++	bool twin;
++
++	/* the one-time block of the first request of a stream */
++	bool onetime;
++	u32 grab_pxl;
++	u32 grab_lin;
++	u32 time_stamp_cnt;
++	u32 int_en;
++
++	/* values of interest, and where the writer enables lie in the slot */
++	bool has_frame_seq;
++	u32 frame_seq;
++	u32 frame_seq_off;
++	bool has_split[2];
++	u32 split[2];
++	u32 mod5_off[CAMRAW_NUM_BLOCKS];
++	u32 mod5[CAMRAW_NUM_BLOCKS];
++
++	/* configuration parameters */
++	u8 in_fmt;
++	u8 pixel_id;
++	u8 pixel_mode;
++	u16 in_width;
++	u16 in_height;
++	u16 dev_mask;
++
++	/* the picture: output 6 of the frame parameters, -1 if there is none */
++	int out_plane[CAMRAW_PICTURE_PLANES];
++	u32 width;
++	u32 height;
++	u32 stride;
++	u32 fmt_id;
++
++	/* why the request must not be run, NULL if nothing is known */
++	const char *blocker;
++};
++
++static inline bool camraw_replay_has_picture(const struct camraw_replay *rp)
++{
++	return rp->out_plane[0] >= 0 && rp->out_plane[1] >= 0;
++}
++
++int camraw_replay_parse(struct camraw_replay *rp, struct device *dev,
++			const char *name, const u8 *data, size_t len);
++void camraw_replay_free(struct camraw_replay *rp);
++const char *camraw_replay_pair_check(const struct camraw_replay *start,
++				     const struct camraw_replay *frame);
++int camraw_replay_emit(const struct camraw_replay *rp, u8 *dst, u64 slot_base,
++		       unsigned int flags, const dma_addr_t *picture,
++		       u32 emit_size[CAMRAW_NUM_LISTS]);
++
++#endif /* _MTK_CAMRAW_REPLAY_H */
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw.h b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+new file mode 100644
+index 000000000000..62e45624be93
+--- /dev/null
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+@@ -0,0 +1,201 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * MediaTek MT6878 RAW / YUV engine pair driven by a replayed command queue.
++ *
++ * Copyright (c) 2026 serlk
++ */
++
++#ifndef _MTK_CAMRAW_H
++#define _MTK_CAMRAW_H
++
++#include <linux/clk.h>
++#include <linux/completion.h>
++#include <linux/list.h>
++#include <linux/mutex.h>
++#include <linux/spinlock.h>
++#include <linux/types.h>
++#include <linux/workqueue.h>
++
++#include <media/v4l2-device.h>
++#include <media/videobuf2-v4l2.h>
++
++#include "mtk-camraw-regs.h"
++#include "mtk-camraw-replay.h"
++
++#define CAMRAW_DRV_NAME			"mtk-camraw-mt6878"
++#define CAMYUV_DRV_NAME			"mtk-camyuv-mt6878"
++
++#define CAMYUV_NUM_CLKS			3
++/* two copies of the per-frame request, each with its own picture planes */
++#define CAMRAW_NUM_SETS			2
++#define CAMRAW_SOF_LOG			16
++/* register snapshot of one engine pair: ranges, then the port error words */
++#define CAMRAW_SNAP_WORDS		200
++#define CAMRAW_SNAP_PORTS		40
++
++/* interrupt lines of side A */
++enum {
++	CAMRAW_IRQ_RAW,
++	CAMRAW_IRQ_YUV,
++	CAMRAW_NUM_IRQS,
++};
++
++/**
++ * struct mtk_camyuv - the YUV engine: the writers of the processed picture
++ * @dev: device
++ * @base: registers
++ * @irq: interrupt line
++ * @clks: gates of the engine
++ */
++struct mtk_camyuv {
++	struct device *dev;
++	void __iomem *base;
++	int irq;
++	struct clk_bulk_data clks[CAMYUV_NUM_CLKS];
++};
++
++struct mtk_camraw_buffer {
++	struct vb2_v4l2_buffer vb;
++	struct list_head list;
++};
++
++/**
++ * struct mtk_camraw_irq - what one interrupt line has reported
++ * @pend: status bits per group since the thread last looked
++ * @count: interrupts taken
++ * @empty: interrupts with no status bit in any group
++ * @reread_set: second reads of a status word that still showed a bit of
++ *		the first (read to clear does not hold)
++ * @reread_clear: second reads that showed none
++ * @burst: interrupts within the current jiffy
++ * @burst_jiffies: that jiffy
++ * @w1c_tried: the status was written back once to stop a burst
++ * @storm: the line was switched off because it would not go quiet
++ * @enabled: the line is enabled
++ */
++struct mtk_camraw_irq {
++	u32 pend[CAMRAW_NUM_INT + 1];
++	unsigned int count;
++	unsigned int empty;
++	unsigned int reread_set;
++	unsigned int reread_clear;
++	unsigned int burst;
++	unsigned long burst_jiffies;
++	bool w1c_tried;
++	bool storm;
++	bool enabled;
++};
++
++/* a DMA buffer of the driver */
++struct mtk_camraw_dma {
++	void *cpu;
++	dma_addr_t dma;
++	size_t size;
++};
++
++/* what the first start-of-frame interrupts saw */
++struct mtk_camraw_snap {
++	bool taken;
++	u32 t_us;
++	u32 val[CAMRAW_SNAP_WORDS];
++	u32 port[CAMRAW_SNAP_PORTS];
++	u32 port_reg[CAMRAW_SNAP_PORTS];
++	unsigned int num_ports;
++};
++
++struct mtk_camraw_sof {
++	u32 t_us;		/* time since viewfinder on */
++	u32 applied;		/* number of per-frame requests applied before */
++	u32 seq;		/* frame number register */
++	u32 seq_inner;		/* its latched copy */
++	u32 frmsize;		/* frame size the timing generator measured */
++};
++
++/**
++ * struct mtk_camraw - a RAW engine; RAW-A also has the video node
++ * @twin: RAW-B, the second engine of a two-engine frame (RAW-A only)
++ * @raw_id: 0 for RAW-A, 1 for RAW-B
++ * @lock: serializes loading, starting and stopping
++ * @irq_lock: interrupt bookkeeping
++ * @buf_lock: the list of queued buffers
++ */
++struct mtk_camraw {
++	struct device *dev;
++	struct mtk_camyuv *yuv;
++	struct mtk_camraw *twin;
++	u32 raw_id;
++	void __iomem *base;
++	void __iomem *inner;
++	struct regmap *camsys;
++	int irq;
++	struct clk_bulk_data *clks;
++	int num_clks;
++	struct clk *cam_sel;
++	unsigned long cam_rate_saved;
++
++	struct v4l2_device v4l2_dev;
++	struct video_device vdev;
++	struct vb2_queue vq;
++	struct mutex vlock;
++	struct mutex lock;
++	spinlock_t buf_lock;
++	struct list_head bufs;
++
++	/* the two loaded requests: the start request and the per-frame one */
++	struct camraw_replay start;
++	struct camraw_replay frame;
++	bool loaded;
++	const char *pair_problem;
++	struct mtk_camraw_dma slot_start;
++	struct mtk_camraw_dma slot_frame[CAMRAW_NUM_SETS];
++	/* picture planes of set 1; set 0 are the frame request's own buffers */
++	struct mtk_camraw_dma pic1[CAMRAW_PICTURE_PLANES];
++	dma_addr_t pic_dma[CAMRAW_NUM_SETS][CAMRAW_PICTURE_PLANES];
++	void *pic_cpu[CAMRAW_NUM_SETS][CAMRAW_PICTURE_PLANES];
++	u32 pic_size[CAMRAW_PICTURE_PLANES];
++	u32 start_size[CAMRAW_NUM_LISTS];
++	u32 frame_size[CAMRAW_NUM_LISTS];
++	u32 pixfmt;
++	u32 width;
++	u32 height;
++	u32 stride;
++	u32 sizeimage;
++
++	/* the running stream */
++	struct v4l2_subdev *source;
++	unsigned int source_pad;
++	bool source_on;
++	bool streaming;
++	bool twin_on;
++	unsigned int emit_flags;
++	unsigned int sequence;
++	unsigned int n_frame_applied;
++	struct completion cq_done;
++	struct delayed_work watchdog;
++	struct mtk_camraw_sof sof_log[CAMRAW_SOF_LOG];
++	unsigned int n_sof_log;
++	u64 vf_ns;
++	u32 err_us;
++	/* snapshots at the first start of frame and the first error, A and B */
++	struct mtk_camraw_snap snap[2][2];
++
++	spinlock_t irq_lock;
++	struct mtk_camraw_irq irqs[CAMRAW_NUM_IRQS];
++	u32 cq_seen;
++	u64 sof_ns;
++	unsigned int n_sof;
++	unsigned int n_cq_main;
++	unsigned int n_cq_sub;
++	unsigned int n_pass1;
++	unsigned int n_yuvo;
++	unsigned int n_frames;
++	unsigned int n_no_buffer;
++	unsigned int n_applied;
++	u32 err_bits;
++	unsigned int n_err;
++
++	struct dentry *debugfs;
++	struct dentry *debugfs_bufs;
++};
++
++#endif /* _MTK_CAMRAW_H */
+-- 
+2.56.1
+
