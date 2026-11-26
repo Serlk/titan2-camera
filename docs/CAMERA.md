@@ -135,16 +135,20 @@ itself once such an encoder exists and its "hardware encoding" setting is on.
 
 ## 6. Hardware ISP
 
-The SoC's RAW/YUV image processing engines are not used by this user space. The kernel series
-has an experimental driver (`camraw`, board `-raw`) that replays a command queue captured from the
+Without request dumps the SoC's RAW/YUV image processing engines are not used by this user space.
+The kernel series has an experimental driver (`camraw`, board `-raw`) that replays a command queue captured from the
 phone's original camera software on both RAW engines. It **delivers frames**: on a lit scene a
 correct colour 1450x1088 picture comes out of the hardware ISP. You can reproduce this with your
 own capture: `scripts/camraw-capture.sh` on the original Android, `scripts/camraw-dump-info.py` on
 the PC, `scripts/camera-raw-replay-test.sh` on the phone (README.md, "Hardware ISP replay"). The
 limits: everything the ISP does to the picture (black level, white balance, colour, sharpening) is
-frozen in the captured request; there is no 3A, no auto exposure (exposure and gain by hand through
-the sensor controls) and no libcamera integration, and nothing else in this repository depends on
-it. The dumps contain the tuning output of the phone's camera software from your own device: never
+frozen in the captured request; there is no 3A of its own, and nothing else in this repository
+depends on it. With the dumps installed, libcamera patches 0027/0028 (pipeline handler and IPA
+`mtkcamraw`) offer the main camera through the hardware ISP instead of the software ISP: auto
+exposure on the sensor's exposure, gain and frame length from a luma histogram of the output
+picture, 60 of 60 frames at about 28 fps on the phone, GNOME Snapshot works through PipeWire
+(README.md, "Through libcamera"). Without the dumps the handler does not claim the camera and the
+simple pipeline keeps it. The dumps contain the tuning output of the phone's camera software from your own device: never
 publish or share them.
 
 ## 7. Tests on the phone
@@ -210,4 +214,5 @@ frames only as too few frames for the duration.
   denoise values.
 - Hi-847 lens infinity position (placeholder in `configuration.yaml`); IMX766 lens sweep.
 - The one-minute recording acceptance; recording with the hardware H.264 encoder (kernel).
-- The hardware ISP: 3A and auto exposure, requests built instead of replayed, libcamera integration.
+- The hardware ISP: own 3A (white balance, colour, statistics), requests built instead of replayed,
+  other sizes, the other two cameras.

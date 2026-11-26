@@ -1,0 +1,834 @@
+From 42659146ca31cf23ceb0d72c1d2ca5949f20590e Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 16:18:25 +0300
+Subject: [PATCH 27/28] pipeline: mtkcamraw: Add the MediaTek MT6878 hardware
+ ISP replay pipeline
+
+The mtk-camraw-mt6878 kernel driver runs the RAW/YUV engines of the
+MT6878 image signal processor with the command queue of captured
+requests and delivers the processed picture (NV21, one fixed size) on a
+video node in a media device of its own. The sensor and the sensor
+interface that feed it are in the media device of the CAMSV engine of
+the same CSI port; the node names that sensor interface entity as its
+input, and its crop bounds give the sensor frame the captured requests
+need.
+
+The handler takes both media devices, sets the sensor and the sensor
+interface to that mode, streams the video node (the driver starts the
+sensor interface and the sensor), and drives the sensor's exposure, gain
+and vertical blanking through DelayedControls, timed by the node's frame
+start events. Exposure is decided by the mtkcamraw IPA from a luma
+histogram the handler takes from every picture.
+
+The camera is offered only when the driver has its captured requests
+loaded (the node reports a picture format); otherwise both media devices
+are released and the simple pipeline handler keeps the sensor with its
+software ISP. Listed before simple, the hardware path wins when it is
+available; LIBCAMERA_PIPELINES_MATCH_LIST=simple selects the software
+ISP for that sensor.
+
+The picture is offered with the line pitch as its width (1472 x 1088
+for a 1450 x 1088 picture, the driver fills the padding columns black):
+consumers that ignore the stride (seen through PipeWire) sheared it.
+pipelines: mtkcamraw: full_pitch: false in the configuration file offers
+the picture width with the stride instead.
+
+Neither the sensor nor the replayed lists can flip or rotate, so the
+configuration reports the sensor's mounting orientation and applications
+rotate. The IPA is started from the exposure and gain the sensor holds and
+returns its start values (inside its limits), which go to the sensor,
+blanking first, before it streams; a frame the driver returns with an
+error gets no statistics.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/libcamera/ipa/meson.build             |   1 +
+ include/libcamera/ipa/mtkcamraw.mojom         |  53 ++
+ meson.build                                   |   1 +
+ meson_options.txt                             |   1 +
+ src/libcamera/pipeline/mtkcamraw/meson.build  |   5 +
+ .../pipeline/mtkcamraw/mtkcamraw.cpp          | 663 ++++++++++++++++++
+ 6 files changed, 724 insertions(+)
+ create mode 100644 include/libcamera/ipa/mtkcamraw.mojom
+ create mode 100644 src/libcamera/pipeline/mtkcamraw/meson.build
+ create mode 100644 src/libcamera/pipeline/mtkcamraw/mtkcamraw.cpp
+
+diff --git a/include/libcamera/ipa/meson.build b/include/libcamera/ipa/meson.build
+index 3ee3ada..dfe3f45 100644
+--- a/include/libcamera/ipa/meson.build
++++ b/include/libcamera/ipa/meson.build
+@@ -65,6 +65,7 @@ libcamera_ipa_headers += custom_target('core_ipa_serializer_h',
+ pipeline_ipa_mojom_mapping = {
+     'ipu3': 'ipu3.mojom',
+     'mali-c55': 'mali-c55.mojom',
++    'mtkcamraw': 'mtkcamraw.mojom',
+     'rkisp1': 'rkisp1.mojom',
+     'rpi/pisp': 'raspberrypi.mojom',
+     'rpi/vc4': 'raspberrypi.mojom',
+diff --git a/include/libcamera/ipa/mtkcamraw.mojom b/include/libcamera/ipa/mtkcamraw.mojom
+new file mode 100644
+index 0000000..3571b43
+--- /dev/null
++++ b/include/libcamera/ipa/mtkcamraw.mojom
+@@ -0,0 +1,53 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++
++/*
++ * \todo Document the interface and remove the related EXCLUDE_PATTERNS entry.
++ */
++
++module ipa.mtkcamraw;
++
++import "include/libcamera/ipa/core.mojom";
++
++/*
++ * start() returns a struct: the proxy generator passes no other outputs
++ * of start() next to a return value.
++ */
++struct StartResult {
++	int32 ret;
++	libcamera.ControlList controls;
++};
++
++struct IPAConfigInfo {
++	libcamera.IPACameraSensorInfo sensorInfo;
++	libcamera.ControlInfoMap sensorControls;
++};
++
++interface IPAMtkCamrawInterface {
++	init(libcamera.IPASettings settings, IPAConfigInfo configInfo)
++		=> (int32 ret, libcamera.ControlInfoMap ipaControls);
++	configure(IPAConfigInfo configInfo)
++		=> (int32 ret, libcamera.ControlInfoMap ipaControls);
++
++	/*
++	 * sensorControls: the exposure and gain the sensor holds now;
++	 * startControls: what to write to the sensor before it streams.
++	 */
++	start(libcamera.ControlList sensorControls) => (StartResult result);
++	stop();
++
++	[async] queueRequest(uint32 frame, libcamera.ControlList controls);
++
++	/*
++	 * Statistics of one output frame, computed by the pipeline handler
++	 * from the processed picture: a histogram of the luma plane on the
++	 * output's own (encoded) scale. sensorControls are the sensor
++	 * controls in effect for that frame.
++	 */
++	[async] processStats(uint32 frame, array<uint32> yHistogram,
++			     libcamera.ControlList sensorControls);
++};
++
++interface IPAMtkCamrawEventInterface {
++	setSensorControls(libcamera.ControlList sensorControls);
++	metadataReady(uint32 frame, libcamera.ControlList metadata);
++};
+diff --git a/meson.build b/meson.build
+index 9cd7346..ede3fd6 100644
+--- a/meson.build
++++ b/meson.build
+@@ -218,6 +218,7 @@ pipelines_support = {
+     'imx8-isi':     arch_arm,
+     'ipu3':         arch_x86,
+     'mali-c55':     arch_arm,
++    'mtkcamraw':    arch_arm,
+     'rkisp1':       arch_arm,
+     'rpi/pisp':     arch_arm,
+     'rpi/vc4':      arch_arm,
+diff --git a/meson_options.txt b/meson_options.txt
+index 20baacc..6ec3dea 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -81,6 +81,7 @@ option('pipelines',
+             'imx8-isi',
+             'ipu3',
+             'mali-c55',
++            'mtkcamraw',
+             'rkisp1',
+             'rpi/pisp',
+             'rpi/vc4',
+diff --git a/src/libcamera/pipeline/mtkcamraw/meson.build b/src/libcamera/pipeline/mtkcamraw/meson.build
+new file mode 100644
+index 0000000..ce549e1
+--- /dev/null
++++ b/src/libcamera/pipeline/mtkcamraw/meson.build
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: CC0-1.0
++
++libcamera_internal_sources += files([
++    'mtkcamraw.cpp',
++])
+diff --git a/src/libcamera/pipeline/mtkcamraw/mtkcamraw.cpp b/src/libcamera/pipeline/mtkcamraw/mtkcamraw.cpp
+new file mode 100644
+index 0000000..189b608
+--- /dev/null
++++ b/src/libcamera/pipeline/mtkcamraw/mtkcamraw.cpp
+@@ -0,0 +1,663 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, serlk
++ *
++ * Pipeline handler for the MediaTek MT6878 RAW/YUV engines driven by a
++ * replayed command queue (kernel driver mtk-camraw-mt6878).
++ *
++ * The driver delivers the processed picture of one fixed sensor mode as
++ * NV21, with the ISP settings of a captured request. It has a media device
++ * of its own with one video node; the sensor and the sensor interface that
++ * feed it belong to the media device of the CAMSV engine of the same CSI
++ * port, found by the name the video node gives its input. The camera is
++ * offered only when the driver has loaded its captured requests (the node
++ * reports a picture format); without them the CAMSV media device stays
++ * free for the simple pipeline handler and its software ISP.
++ *
++ * Exposure is controlled by the mtkcamraw IPA from a luma histogram of the
++ * delivered pictures.
++ */
++
++#include <algorithm>
++#include <fcntl.h>
++#include <map>
++#include <memory>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <vector>
++
++#include <linux/media-bus-format.h>
++#include <linux/videodev2.h>
++
++#include <libcamera/base/log.h>
++#include <libcamera/base/unique_fd.h>
++#include <libcamera/base/utils.h>
++
++#include <libcamera/camera.h>
++#include <libcamera/control_ids.h>
++#include <libcamera/formats.h>
++#include <libcamera/framebuffer.h>
++#include <libcamera/geometry.h>
++#include <libcamera/property_ids.h>
++#include <libcamera/request.h>
++#include <libcamera/stream.h>
++
++#include <libcamera/ipa/ipa_interface.h>
++#include <libcamera/ipa/ipa_module_info.h>
++#include <libcamera/ipa/mtkcamraw_ipa_interface.h>
++#include <libcamera/ipa/mtkcamraw_ipa_proxy.h>
++
++#include "libcamera/internal/camera.h"
++#include "libcamera/internal/camera_manager.h"
++#include "libcamera/internal/global_configuration.h"
++#include "libcamera/internal/camera_sensor.h"
++#include "libcamera/internal/camera_sensor_properties.h"
++#include "libcamera/internal/delayed_controls.h"
++#include "libcamera/internal/device_enumerator.h"
++#include "libcamera/internal/framebuffer.h"
++#include "libcamera/internal/mapped_framebuffer.h"
++#include "libcamera/internal/media_device.h"
++#include "libcamera/internal/pipeline_handler.h"
++#include "libcamera/internal/request.h"
++#include "libcamera/internal/v4l2_subdevice.h"
++#include "libcamera/internal/v4l2_videodevice.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(MtkCamraw)
++
++namespace {
++
++/* the reason for not claiming a camera is logged once per process */
++bool told = false;
++
++/* media_device_info.driver holds 15 characters */
++constexpr const char *kRawDriver = "mtk-camraw";
++constexpr const char *kRawEntity = "mtk-camraw-a";
++constexpr const char *kCamsvDriver = "mtk-camsv";
++constexpr unsigned int kBufferCount = 4;
++/* luma histogram: bins, and the sampling step in pixels and lines */
++constexpr unsigned int kHistBins = 256;
++constexpr unsigned int kHistStep = 8;
++
++/* the name of the node's one input: the sensor interface entity */
++std::string inputName(const std::string &node)
++{
++	UniqueFD fd(::open(node.c_str(), O_RDWR | O_CLOEXEC));
++	struct v4l2_input input = {};
++
++	if (!fd.isValid())
++		return {};
++	input.index = 0;
++	if (::ioctl(fd.get(), VIDIOC_ENUMINPUT, &input) < 0)
++		return {};
++	return std::string(reinterpret_cast<const char *>(input.name),
++			   strnlen(reinterpret_cast<const char *>(input.name),
++				   sizeof(input.name)));
++}
++
++} /* namespace */
++
++class MtkCamrawCameraData : public Camera::Private
++{
++public:
++	MtkCamrawCameraData(PipelineHandler *pipe)
++		: Camera::Private(pipe)
++	{
++	}
++
++	int init(MediaDevice *rawMedia, MediaDevice *camsvMedia,
++		 const std::string &seninfName);
++	int loadIPA();
++
++	void bufferReady(FrameBuffer *buffer);
++	void setSensorControls(const ControlList &sensorControls);
++	void metadataReady(uint32_t frame, const ControlList &metadata);
++	std::vector<uint32_t> histogram(FrameBuffer *buffer);
++
++	std::unique_ptr<V4L2VideoDevice> video_;
++	std::unique_ptr<V4L2Subdevice> seninf_;
++	std::unique_ptr<CameraSensor> sensor_;
++	std::unique_ptr<DelayedControls> delayedCtrls_;
++	std::unique_ptr<ipa::mtkcamraw::IPAProxyMtkCamraw> ipa_;
++	bool frameStartEvents_ = false;
++
++	Stream stream_;
++	V4L2DeviceFormat format_;
++	Size inputSize_;
++	/*
++	 * The size offered to applications. By default the width is the
++	 * line pitch (full_pitch): some consumers ignore the stride and
++	 * would shear the picture; the pitch columns right of the picture
++	 * are filled black by the driver.
++	 */
++	Size outputSize_;
++
++	std::map<uint32_t, Request *> pending_;
++	std::map<const FrameBuffer *, std::unique_ptr<MappedFrameBuffer>> mapped_;
++};
++
++class MtkCamrawCameraConfiguration : public CameraConfiguration
++{
++public:
++	MtkCamrawCameraConfiguration(MtkCamrawCameraData *data)
++		: data_(data)
++	{
++	}
++
++	Status validate() override;
++
++private:
++	MtkCamrawCameraData *data_;
++};
++
++class PipelineHandlerMtkCamraw : public PipelineHandler
++{
++public:
++	PipelineHandlerMtkCamraw(CameraManager *manager)
++		: PipelineHandler(manager)
++	{
++	}
++
++	std::unique_ptr<CameraConfiguration>
++	generateConfiguration(Camera *camera, Span<const StreamRole> roles) override;
++	int configure(Camera *camera, CameraConfiguration *config) override;
++
++	int exportFrameBuffers(Camera *camera, Stream *stream,
++			       std::vector<std::unique_ptr<FrameBuffer>> *buffers) override;
++
++	int start(Camera *camera, const ControlList *controls) override;
++	void stopDevice(Camera *camera) override;
++
++	int queueRequestDevice(Camera *camera, Request *request) override;
++
++	bool match(DeviceEnumerator *enumerator) override;
++
++private:
++	MtkCamrawCameraData *cameraData(Camera *camera)
++	{
++		return static_cast<MtkCamrawCameraData *>(camera->_d());
++	}
++};
++
++/* -----------------------------------------------------------------------------
++ * Camera data
++ */
++
++int MtkCamrawCameraData::init(MediaDevice *rawMedia, MediaDevice *camsvMedia,
++			      const std::string &seninfName)
++{
++	video_ = V4L2VideoDevice::fromEntityName(rawMedia, kRawEntity);
++	if (video_->open())
++		return -ENODEV;
++
++	/* the driver reports a picture only with its captured requests loaded */
++	if (video_->getFormat(&format_) || !format_.size.width ||
++	    !format_.planes[0].size) {
++		LOG(MtkCamraw, Info)
++			<< "Not claiming a camera: no captured requests loaded (" << video_->deviceNode()
++			<< " reports no picture format); the hardware ISP camera is not offered";
++		return -ENODATA;
++	}
++
++	MediaEntity *seninf = camsvMedia->getEntityByName(seninfName);
++	if (!seninf)
++		return -ENODEV;
++	seninf_ = std::make_unique<V4L2Subdevice>(seninf);
++	if (seninf_->open())
++		return -ENODEV;
++
++	/* the sensor is what feeds the sensor interface's sink */
++	MediaEntity *sensor = nullptr;
++	for (const MediaPad *pad : seninf->pads()) {
++		if (!(pad->flags() & MEDIA_PAD_FL_SINK))
++			continue;
++		for (const MediaLink *link : pad->links()) {
++			MediaEntity *e = link->source()->entity();
++			if (e->function() == MEDIA_ENT_F_CAM_SENSOR)
++				sensor = e;
++		}
++	}
++	if (!sensor) {
++		LOG(MtkCamraw, Error) << "No sensor in front of " << seninfName;
++		return -ENODEV;
++	}
++	sensor_ = CameraSensorFactoryBase::create(sensor);
++	if (!sensor_)
++		return -ENODEV;
++
++	bool fullPitch = pipe()->cameraManager()->_d()->configuration()
++				 .option<bool>({ "pipelines", "mtkcamraw", "full_pitch" })
++				 .value_or(true);
++	outputSize_ = format_.size;
++	if (fullPitch)
++		outputSize_.width = format_.planes[0].bpl;
++
++	/* the sensor input the captured requests were made for */
++	Rectangle bounds;
++	if (!video_->getSelection(V4L2_SEL_TGT_CROP_BOUNDS, &bounds))
++		inputSize_ = bounds.size();
++	else
++		inputSize_ = sensor_->resolution();
++
++	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
++	std::unordered_map<uint32_t, DelayedControls::ControlParams> params = {
++		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
++		{ V4L2_CID_EXPOSURE, { delays.exposureDelay, false } },
++		{ V4L2_CID_VBLANK, { delays.vblankDelay, true } },
++	};
++	delayedCtrls_ = std::make_unique<DelayedControls>(sensor_->device(), params);
++	frameStartEvents_ = video_->supportsFrameStartEvent();
++
++	video_->bufferReady.connect(this, &MtkCamrawCameraData::bufferReady);
++
++	properties_ = sensor_->properties();
++	return 0;
++}
++
++int MtkCamrawCameraData::loadIPA()
++{
++	ipa_ = pipe()->createIPA<ipa::mtkcamraw::IPAProxyMtkCamraw>(1, 1);
++	if (!ipa_) {
++		LOG(MtkCamraw, Error) << "No mtkcamraw IPA module";
++		return -ENOENT;
++	}
++
++	ipa_->setSensorControls.connect(this, &MtkCamrawCameraData::setSensorControls);
++	ipa_->metadataReady.connect(this, &MtkCamrawCameraData::metadataReady);
++
++	std::string conf = ipa_->configurationFile(sensor_->model() + ".yaml",
++						   "uncalibrated.yaml");
++
++	ipa::mtkcamraw::IPAConfigInfo info;
++	int ret = sensor_->sensorInfo(&info.sensorInfo);
++	if (ret)
++		return ret;
++	info.sensorControls = sensor_->controls();
++
++	ControlInfoMap ipaControls;
++	ret = ipa_->init(IPASettings{ conf, sensor_->model() }, info, &ipaControls);
++	if (ret) {
++		LOG(MtkCamraw, Error) << "IPA initialisation failed: " << ret;
++		return ret;
++	}
++	controlInfo_ = ipaControls;
++	return 0;
++}
++
++/* luma histogram of the picture, every kHistStep-th pixel of every kHistStep-th line */
++std::vector<uint32_t> MtkCamrawCameraData::histogram(FrameBuffer *buffer)
++{
++	std::vector<uint32_t> hist(kHistBins, 0);
++
++	auto it = mapped_.find(buffer);
++	if (it == mapped_.end()) {
++		auto map = std::make_unique<MappedFrameBuffer>(buffer,
++							       MappedFrameBuffer::MapFlag::Read);
++		if (!map->isValid())
++			return {};
++		it = mapped_.emplace(buffer, std::move(map)).first;
++	}
++
++	Span<uint8_t> y = it->second->planes()[0];
++	const unsigned int stride = format_.planes[0].bpl;
++	const unsigned int width = format_.size.width;
++	const unsigned int height = format_.size.height;
++
++	if (y.size() < static_cast<size_t>(stride) * height)
++		return {};
++	for (unsigned int line = kHistStep / 2; line < height; line += kHistStep) {
++		const uint8_t *p = y.data() + static_cast<size_t>(line) * stride;
++		for (unsigned int x = kHistStep / 2; x < width; x += kHistStep)
++			hist[p[x] * kHistBins / 256]++;
++	}
++	return hist;
++}
++
++void MtkCamrawCameraData::bufferReady(FrameBuffer *buffer)
++{
++	PipelineHandlerMtkCamraw *pipe = static_cast<PipelineHandlerMtkCamraw *>(this->pipe());
++	Request *request = buffer->request();
++
++	if (buffer->metadata().status == FrameMetadata::FrameCancelled) {
++		pipe->completeBuffer(request, buffer);
++		pipe->completeRequest(request);
++		return;
++	}
++
++	/* a frame the driver lost (returned with an error): no statistics */
++	if (buffer->metadata().status != FrameMetadata::FrameSuccess) {
++		pipe->completeBuffer(request, buffer);
++		pipe->completeRequest(request);
++		return;
++	}
++
++	uint32_t sequence = buffer->metadata().sequence;
++	request->_d()->metadata().set(controls::SensorTimestamp,
++				      buffer->metadata().timestamp);
++
++	std::vector<uint32_t> hist = histogram(buffer);
++	ControlList sensorControls = delayedCtrls_->get(sequence);
++
++	pipe->completeBuffer(request, buffer);
++	pending_[request->sequence()] = request;
++	ipa_->processStats(request->sequence(), hist, sensorControls);
++}
++
++void MtkCamrawCameraData::metadataReady(uint32_t frame, const ControlList &metadata)
++{
++	auto it = pending_.find(frame);
++	if (it == pending_.end())
++		return;
++
++	Request *request = it->second;
++	pending_.erase(it);
++	request->_d()->metadata().merge(metadata);
++	pipe()->completeRequest(request);
++}
++
++void MtkCamrawCameraData::setSensorControls(const ControlList &sensorControls)
++{
++	delayedCtrls_->push(sensorControls);
++	if (!frameStartEvents_) {
++		ControlList ctrls(sensorControls);
++		sensor_->setControls(&ctrls);
++	}
++}
++
++/* -----------------------------------------------------------------------------
++ * Configuration
++ */
++
++CameraConfiguration::Status MtkCamrawCameraConfiguration::validate()
++{
++	Status status = Valid;
++
++	if (config_.empty())
++		return Invalid;
++
++	/*
++	 * Neither the sensor nor the replayed lists can flip or rotate (a
++	 * flip would change the Bayer order the lists were made for): the
++	 * pictures come in the sensor's mounting orientation, and the
++	 * application rotates them by what is reported here.
++	 */
++	Orientation native = data_->sensor_->mountingOrientation();
++	if (orientation != native) {
++		orientation = native;
++		status = Adjusted;
++	}
++
++	if (config_.size() > 1) {
++		config_.resize(1);
++		status = Adjusted;
++	}
++
++	/* one picture of the captured format and size, whatever is asked */
++	StreamConfiguration &cfg = config_[0];
++	const V4L2DeviceFormat &format = data_->format_;
++	PixelFormat pixelFormat = format.fourcc.toPixelFormat();
++
++	if (cfg.pixelFormat != pixelFormat || cfg.size != data_->outputSize_) {
++		LOG(MtkCamraw, Debug)
++			<< "Adjusting to " << pixelFormat << " " << data_->outputSize_;
++		cfg.pixelFormat = pixelFormat;
++		cfg.size = data_->outputSize_;
++		status = Adjusted;
++	}
++
++	cfg.stride = format.planes[0].bpl;
++	cfg.frameSize = format.planes[0].size;
++	if (cfg.bufferCount < 2)
++		cfg.bufferCount = kBufferCount;
++
++	return status;
++}
++
++std::unique_ptr<CameraConfiguration>
++PipelineHandlerMtkCamraw::generateConfiguration(Camera *camera,
++						Span<const StreamRole> roles)
++{
++	MtkCamrawCameraData *data = cameraData(camera);
++	auto config = std::make_unique<MtkCamrawCameraConfiguration>(data);
++
++	if (roles.empty())
++		return config;
++
++	for (StreamRole role : roles) {
++		if (role == StreamRole::Raw) {
++			LOG(MtkCamraw, Error) << "No raw stream";
++			return nullptr;
++		}
++	}
++
++	const V4L2DeviceFormat &format = data->format_;
++	std::map<PixelFormat, std::vector<SizeRange>> formats = {
++		{ format.fourcc.toPixelFormat(), { SizeRange(data->outputSize_) } },
++	};
++	StreamConfiguration cfg{ StreamFormats{ formats } };
++	cfg.pixelFormat = format.fourcc.toPixelFormat();
++	cfg.size = data->outputSize_;
++	cfg.bufferCount = kBufferCount;
++	config->addConfiguration(cfg);
++
++	config->validate();
++	return config;
++}
++
++int PipelineHandlerMtkCamraw::configure(Camera *camera, CameraConfiguration *c)
++{
++	MtkCamrawCameraData *data = cameraData(camera);
++	StreamConfiguration &cfg = c->at(0);
++	int ret;
++
++	/* the sensor mode of the captured requests, on the sensor interface too */
++	V4L2SubdeviceFormat sensorFormat = data->sensor_->getFormat(data->sensor_->mbusCodes(),
++								    data->inputSize_);
++	if (sensorFormat.size != data->inputSize_) {
++		LOG(MtkCamraw, Error)
++			<< "The sensor has no " << data->inputSize_
++			<< " mode, the captured requests need it";
++		return -EINVAL;
++	}
++	ret = data->sensor_->setFormat(&sensorFormat);
++	if (ret)
++		return ret;
++	ret = data->seninf_->setFormat(0, &sensorFormat);
++	if (ret)
++		return ret;
++
++	V4L2DeviceFormat format = data->format_;
++	ret = data->video_->setFormat(&format);
++	if (ret)
++		return ret;
++	data->format_ = format;
++
++	cfg.setStream(&data->stream_);
++
++	ipa::mtkcamraw::IPAConfigInfo info;
++	ret = data->sensor_->sensorInfo(&info.sensorInfo);
++	if (ret)
++		return ret;
++	info.sensorControls = data->sensor_->controls();
++
++	ControlInfoMap ipaControls;
++	ret = data->ipa_->configure(info, &ipaControls);
++	if (ret)
++		return ret;
++	data->controlInfo_ = ipaControls;
++	return 0;
++}
++
++int PipelineHandlerMtkCamraw::exportFrameBuffers(Camera *camera, Stream *stream,
++						 std::vector<std::unique_ptr<FrameBuffer>> *buffers)
++{
++	MtkCamrawCameraData *data = cameraData(camera);
++
++	return data->video_->exportBuffers(stream->configuration().bufferCount, buffers);
++}
++
++int PipelineHandlerMtkCamraw::start(Camera *camera, [[maybe_unused]] const ControlList *controls)
++{
++	MtkCamrawCameraData *data = cameraData(camera);
++	int ret;
++
++	ret = data->video_->importBuffers(data->stream_.configuration().bufferCount);
++	if (ret < 0)
++		return ret;
++
++	/*
++	 * AE starts from what the sensor holds (e.g. the last session's
++	 * values), brought inside AE's limits; those go to the sensor before
++	 * it streams. Blanking first: it sets the exposure range.
++	 */
++	{
++		const uint32_t ids[] = { V4L2_CID_EXPOSURE, V4L2_CID_ANALOGUE_GAIN };
++		ipa::mtkcamraw::StartResult result;
++
++		data->ipa_->start(data->sensor_->getControls(ids), &result);
++		ret = result.ret;
++		if (ret)
++			goto err_release;
++		ControlList &startControls = result.controls;
++		if (startControls.contains(V4L2_CID_VBLANK)) {
++			ControlList vblank(data->sensor_->controls());
++			vblank.set(V4L2_CID_VBLANK, startControls.get(V4L2_CID_VBLANK));
++			data->sensor_->setControls(&vblank);
++		}
++		data->sensor_->setControls(&startControls);
++	}
++
++	data->delayedCtrls_->reset();
++	if (data->frameStartEvents_) {
++		ret = data->video_->setFrameStartEnabled(true);
++		if (ret)
++			data->frameStartEvents_ = false;
++		else
++			data->video_->frameStart.connect(data->delayedCtrls_.get(),
++							 &DelayedControls::applyControls);
++	}
++
++	/* the driver starts the sensor interface and the sensor itself */
++	ret = data->video_->streamOn();
++	if (ret)
++		goto err_ipa;
++	return 0;
++
++err_ipa:
++	data->ipa_->stop();
++err_release:
++	if (data->frameStartEvents_) {
++		data->video_->setFrameStartEnabled(false);
++		data->video_->frameStart.disconnect(data->delayedCtrls_.get());
++	}
++	data->video_->releaseBuffers();
++	return ret;
++}
++
++void PipelineHandlerMtkCamraw::stopDevice(Camera *camera)
++{
++	MtkCamrawCameraData *data = cameraData(camera);
++
++	data->video_->streamOff();
++	data->ipa_->stop();
++	if (data->frameStartEvents_) {
++		data->video_->setFrameStartEnabled(false);
++		data->video_->frameStart.disconnect(data->delayedCtrls_.get());
++	}
++
++	/* requests whose statistics were still with the IPA */
++	for (auto &[frame, request] : data->pending_)
++		completeRequest(request);
++	data->pending_.clear();
++	data->mapped_.clear();
++	data->video_->releaseBuffers();
++}
++
++int PipelineHandlerMtkCamraw::queueRequestDevice(Camera *camera, Request *request)
++{
++	MtkCamrawCameraData *data = cameraData(camera);
++	FrameBuffer *buffer = request->findBuffer(&data->stream_);
++
++	if (!buffer)
++		return -ENOENT;
++
++	data->ipa_->queueRequest(request->sequence(), request->controls());
++	return data->video_->queueBuffer(buffer);
++}
++
++/* -----------------------------------------------------------------------------
++ * Match
++ */
++
++bool PipelineHandlerMtkCamraw::match(DeviceEnumerator *enumerator)
++{
++	DeviceMatch rawMatch(kRawDriver);
++	rawMatch.add(kRawEntity);
++
++	std::shared_ptr<MediaDevice> rawMedia = acquireMediaDevice(enumerator, rawMatch);
++	if (!rawMedia) {
++		/* said once, and not after a camera was made (match() is called again) */
++		if (!told)
++			LOG(MtkCamraw, Info)
++				<< "No free media device of driver \"" << kRawDriver
++				<< "\" with \"" << kRawEntity
++				<< "\" (module not loaded, not the -raw board, or already in use)";
++		told = true;
++		return false;
++	}
++
++	MediaEntity *node = rawMedia->getEntityByName(kRawEntity);
++	std::string seninfName = inputName(node->deviceNode());
++	if (seninfName.empty()) {
++		LOG(MtkCamraw, Info)
++			<< "Not claiming a camera: " << node->deviceNode()
++			<< " names no input (sensor interface)";
++		return false;
++	}
++
++	DeviceMatch camsvMatch(kCamsvDriver);
++	camsvMatch.add(seninfName);
++	std::shared_ptr<MediaDevice> camsvMedia = acquireMediaDevice(enumerator, camsvMatch);
++	if (!camsvMedia) {
++		LOG(MtkCamraw, Info)
++			<< "Not claiming a camera: no free \"" << kCamsvDriver
++			<< "\" media device with \"" << seninfName << "\"";
++		return false;
++	}
++
++	auto data = std::make_unique<MtkCamrawCameraData>(this);
++	int ret = data->init(rawMedia.get(), camsvMedia.get(), seninfName);
++	if (ret) {
++		if (ret != -ENODATA)
++			LOG(MtkCamraw, Info)
++				<< "Not claiming a camera: the sensor or the sensor interface behind "
++				<< seninfName << " could not be set up (" << ret << ")";
++		return false;
++	}
++	ret = data->loadIPA();
++	if (ret) {
++		LOG(MtkCamraw, Info)
++			<< "Not claiming a camera: the mtkcamraw IPA did not load (" << ret << ")";
++		return false;
++	}
++
++	LOG(MtkCamraw, Info)
++		<< "Hardware ISP camera: " << data->sensor_->model() << " -> "
++		<< seninfName << " -> " << kRawEntity << ", "
++		<< data->format_.fourcc << " " << data->format_.size << " (pitch "
++		<< data->format_.planes[0].bpl << ", offered as " << data->outputSize_
++		<< "), mounting orientation " << data->sensor_->mountingOrientation();
++
++	std::set<Stream *> streams{ &data->stream_ };
++	const std::string &id = data->sensor_->id();
++	std::shared_ptr<Camera> camera = Camera::create(std::move(data), id, streams);
++	registerCamera(std::move(camera));
++	told = true;
++	return true;
++}
++
++REGISTER_PIPELINE_HANDLER(PipelineHandlerMtkCamraw, "mtkcamraw")
++
++} /* namespace libcamera */
+-- 
+2.56.1
+

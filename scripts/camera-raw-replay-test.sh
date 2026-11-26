@@ -14,12 +14,18 @@
 #   camera-raw-replay-test.sh status      # debugfs status (with registers while a stream runs)
 #   camera-raw-replay-test.sh runlist [TAG]  # five fixed variants (below) -> $MDIR; without TAG it
 #                                            # runs all of it detached (nohup) and returns at once
+#   camera-raw-replay-test.sh libcamera [dark|bright|fallback]
+#                                            # the hardware ISP camera through libcamera (cam):
+#                                            # listing, 60 frames with metadata, AE convergence; fallback:
+#                                            # without the dumps the software ISP camera must come back
 #
-# Variables: TWIN=0 (side A only, left part of the picture; default) | 1 (both RAW engines);
+# Variables: TWIN=1 (both RAW engines; default) | 0 (side A only: overruns, for experiments);
 #   module parameters, empty = leave as is: REAPPLY (0|1|2), STATS_OFF (0|1), EXTRA_OFF (0|1),
 #   PRESTART (0|1), ERR_MASK (0|1|2), CAM_MHZ (0|312), APPLY_DELAY_US (0..30000),
 #   DB_ORDER (0|1), FRAME_DONE (0|1);
-#   EXPOSURE, AGAIN: sensor controls (empty = as is); OUT (/tmp/camraw.nv21); MDIR (/root/camraw-runs).
+#   EXPOSURE, AGAIN, VBLANK: sensor controls (empty = as is; VBLANK=300 keeps the frame done ahead
+#   of the next start of frame); CTRL_WRITES=1 writes exposure/gain all through a V4L2 run;
+#   QOS_US (module parameter qos_us: CPU wake-up latency limit while streaming, -1 none); OUT (/tmp/camraw.nv21); MDIR (/root/camraw-runs).
 # The sensor mode is that of the captured requests: 4096x3072 RAW10 (our IMX766 30 frames/s mode).
 # The camera domains are on only while streaming: the driver reads its registers itself (status,
 # dmesg); never use devmem on camera addresses.
@@ -41,12 +47,12 @@ load() {
 	[ -d /sys/module/mtk_camraw_mt6878 ] || run modprobe mtk-camraw-mt6878 || die "no module mtk-camraw-mt6878"
 	grep -q " /sys/kernel/debug debugfs" /proc/mounts || mount -t debugfs debugfs /sys/kernel/debug
 	[ -d "$DBGFS" ] || die "no $DBGFS: the driver did not bind (board -raw? dmesg | grep camraw)"
-	for p in twin:${TWIN:-0} reapply:${REAPPLY:-} stats_off:${STATS_OFF:-} extra_off:${EXTRA_OFF:-} \
+	for p in twin:${TWIN:-1} reapply:${REAPPLY:-} stats_off:${STATS_OFF:-} extra_off:${EXTRA_OFF:-} \
 	    prestart:${PRESTART:-} err_mask:${ERR_MASK:-} cam_mhz:${CAM_MHZ:-} apply_delay_us:${APPLY_DELAY_US:-} \
-	    db_order:${DB_ORDER:-} frame_done:${FRAME_DONE:-}; do
+	    db_order:${DB_ORDER:-} frame_done:${FRAME_DONE:-} qos_us:${QOS_US:-}; do
 		[ -n "${p#*:}" ] && run sh -c "echo ${p#*:} > $PARAMS/${p%%:*}"
 	done
-	say "module parameters: $(for f in twin reapply stats_off extra_off prestart err_mask cam_mhz apply_delay_us db_order frame_done start_fw frame_fw; do printf '%s=%s ' $f "$(cat $PARAMS/$f 2>/dev/null)"; done)"
+	say "module parameters: $(for f in twin reapply stats_off extra_off prestart err_mask cam_mhz db_order frame_done qos_us start_fw frame_fw; do printf '%s=%s ' $f "$(cat $PARAMS/$f 2>/dev/null)"; done)"
 }
 
 find_nodes() {
@@ -76,6 +82,7 @@ set_formats() {
 	SNODE=$(media-ctl -d "$MEDIA" -e "$SENSOR")
 	[ -n "${EXPOSURE:-}" ] && run v4l2-ctl -d "$SNODE" --set-ctrl "exposure=$EXPOSURE"
 	[ -n "${AGAIN:-}" ] && run v4l2-ctl -d "$SNODE" --set-ctrl "analogue_gain=$AGAIN"
+	[ -n "${VBLANK:-}" ] && run v4l2-ctl -d "$SNODE" --set-ctrl "vertical_blanking=$VBLANK"
 	say "sensor timing and exposure"
 	v4l2-ctl -d "$SNODE" --list-ctrls 2>/dev/null |
 		grep -E "pixel_rate|link_frequency|horizontal_blanking|vertical_blanking|exposure|analogue_gain"
@@ -108,7 +115,7 @@ verdict() {
 	[ "${d:-0}" -ge 1 ]; check "frames delivered: ${d:-0}" $?
 	# a probe line must exist (a delivered frame) and say what is expected
 	probe() {	# $1 plane, $2 left|right, $3 written|untouched
-		p=$(echo "$L" | grep "first frame: plane $1 .* $2 ")
+		p=$(echo "$L" | grep "first frame: plane $1 $2:")
 		[ -n "$p" ] || return 1
 		if [ "$3" = written ]; then echo "$p" | grep -qv "NOT WRITTEN"; else echo "$p" | grep -q "NOT WRITTEN"; fi
 	}
@@ -119,12 +126,27 @@ verdict() {
 	else
 		probe 0 right untouched; check "picture plane 0, right part untouched (side A only, expected)" $?
 	fi
-	echo "$L" | grep -qE "error interrupt|LINE SWITCHED OFF"; [ $? != 0 ]; check "no error interrupt, no interrupt storm" $?
+	echo "$L" | grep -qE "error interrupt 0x|stop: error interrupts [1-9]|LINE SWITCHED OFF"; [ $? != 0 ]; check "no error interrupt, no interrupt storm" $?
 	# fault reports of the M4U driver in this run only (not the APU's register readbacks)
 	echo "$L" | grep -iE "iommu.*fault|translation fault" | grep -qviE "apu|FAULT_ST1|FAULT_VA|INT_ID"; [ $? != 0 ]; check "no IOMMU fault" $?
 	echo "verdict: $ok passed, $bad failed"
 	say "start-of-frame log (latched frame number = applications j?), first error time, clocks"
 	echo "$L" | grep -E "stop: start of frame|stop: first error|clock rates|cam-sel|prestart|before viewfinder|rdy/req|underflow|TG measured" | head -n 24
+}
+
+# CPU idle state entries per CPU and state: "cpuN/stateM name usage"
+idle_snap() {
+	for d in /sys/devices/system/cpu/cpu[0-9]*/cpuidle/state[0-9]*; do
+		[ -r "$d/usage" ] || continue
+		echo "${d#/sys/devices/system/cpu/} $(cat "$d/name") $(cat "$d/usage") $(cat "$d/latency")"
+	done
+}
+
+# entries into each idle state during the stream (summed over CPUs), with its exit latency
+idle_delta() {
+	awk 'NR == FNR { u[$1] = $3; next } { d = $3 - u[$1]; split($1, p, "/");
+		n[$2] += d; l[$2] = $4 } END { for (s in n) if (n[s] > 0)
+		printf "   %-24s %8d entries, exit latency %d us\n", s, n[s], l[s] }' "$1" "$2"
 }
 
 # one stream of N frames with the current parameters; $1 tag (runlist: files in $MDIR)
@@ -134,8 +156,26 @@ stream() {
 	f=${f:-$OUT}
 	say "capturing $N frame(s) -> $f"
 	rm -f "$f"
+	# CTRL_WRITES=1: exposure and gain written all through the stream, as
+	# libcamera's AE does (two values alternating, ~30 writes/s)
+	CW=
+	if [ "${CTRL_WRITES:-0}" = 1 ] && [ -n "${SNODE:-}" ]; then
+		( t=0; while :; do
+			v4l2-ctl -d "$SNODE" --set-ctrl "exposure=$(( ${EXPOSURE:-2800} - 4 * t ))" 2>/dev/null
+			v4l2-ctl -d "$SNODE" --set-ctrl "analogue_gain=$(( 1024 + 64 * t ))" 2>/dev/null
+			t=$(( 1 - t ))
+			sleep 0.03
+		done ) &
+		CW=$!
+		echo "sensor control writes running (pid $CW)"
+	fi
+	idle_snap > /tmp/camraw-idle0
 	timeout 15 v4l2-ctl -d "$VIDEO" --stream-mmap=3 --stream-count="$N" --stream-to="$f"
 	echo "v4l2-ctl: exit $?"
+	idle_snap > /tmp/camraw-idle1
+	say "CPU idle states entered during the stream (qos_us=$(cat $PARAMS/qos_us 2>/dev/null))"
+	idle_delta /tmp/camraw-idle0 /tmp/camraw-idle1
+	[ -n "$CW" ] && kill "$CW" 2>/dev/null
 	ls -l "$f" 2>&1
 	[ -n "${MDIR:-}" ] && dmesg | tail -n +"$((LOG0 + 1))" > "$MDIR/$1.log"
 }
@@ -173,6 +213,63 @@ run)
 	;;
 status)
 	cat "$DBGFS/status"
+	;;
+libcamera)
+	# Needs libcamera with patches 0027/0028 (pipeline mtkcamraw + its IPA) and cam.
+	SCENE=${2:-scene}
+	LDIR=${LDIR:-/root/camraw-libcamera}
+	mkdir -p "$LDIR"
+	load
+	export LIBCAMERA_LOG_LEVELS=${LIBCAMERA_LOG_LEVELS:-MtkCamraw:0,IPAMtkCamraw:1,Camera:1}
+	if [ "$SCENE" = fallback ]; then
+		say "fallback: the dumps moved away, the module reloaded: the software ISP camera must be listed"
+		mv "$FW_START" "$FW_START.off" && mv "$FW_FRAME" "$FW_FRAME.off" || die "dumps not found"
+		modprobe -r mtk-camraw-mt6878 && modprobe mtk-camraw-mt6878
+		cam -l 2>&1 | tee "$LDIR/fallback-list.txt"
+		mv "$FW_START.off" "$FW_START"; mv "$FW_FRAME.off" "$FW_FRAME"
+		modprobe -r mtk-camraw-mt6878 && modprobe mtk-camraw-mt6878
+		say "with the dumps back, and the match list forcing the software ISP"
+		LIBCAMERA_PIPELINES_MATCH_LIST=simple cam -l 2>&1 | tee -a "$LDIR/fallback-list.txt"
+		grep -q "no captured requests loaded" "$LDIR/fallback-list.txt" && echo "PASS  the hardware camera is not offered without the dumps" ||
+			echo "FAIL  no 'no captured requests loaded' line"
+		exit 0
+	fi
+	say "cameras"
+	cam -l 2>&1 | tee "$LDIR/$SCENE-list.txt"
+	# the camera the mtkcamraw handler added: its id from the log, its index from the list
+	CID=$(sed -n "s/.*Adding camera '\([^']*\)' for pipeline handler mtkcamraw.*/\1/p" "$LDIR/$SCENE-list.txt" | head -n 1)
+	ID=$(grep -F "($CID)" "$LDIR/$SCENE-list.txt" | grep -E "^ *[0-9]+:" | head -n 1 | cut -d: -f1 | tr -d ' ')
+	[ -n "$CID" ] && [ -n "$ID" ] || die "no mtkcamraw camera in the list (id \"$CID\", index \"$ID\")"
+	grep -q "Hardware ISP camera" "$LDIR/$SCENE-list.txt" || {
+		grep -E "MtkCamraw|Not claiming" "$LDIR/$SCENE-list.txt"
+		die "the mtkcamraw pipeline did not match (see $LDIR/$SCENE-list.txt)"
+	}
+	CAMIDX=${CAM:-$ID}
+	say "60 frames from camera $CAMIDX with metadata ($SCENE scene) -> $LDIR/$SCENE-*.nv21"
+	rm -f "$LDIR/$SCENE"-*.nv21
+	LOG0=$(dmesg | wc -l)
+	timeout 30 cam -c "$CAMIDX" --capture=60 --metadata --file="$LDIR/$SCENE-#.nv21" \
+		--stream role=viewfinder > "$LDIR/$SCENE-cam.txt" 2>&1
+	echo "cam: exit $?"
+	dmesg | tail -n +"$((LOG0 + 1))" > "$LDIR/$SCENE-dmesg.txt"
+	say "exposure and gain per frame (should settle within ~20 frames)"
+	grep -E "ExposureTime|AnalogueGain" "$LDIR/$SCENE-cam.txt" | paste - - | awk 'NR % 5 == 1' | head -n 14
+	n=$(ls "$LDIR/$SCENE"-*.nv21 2>/dev/null | wc -l)
+	echo "frames written: $n"
+	last=$(ls "$LDIR/$SCENE"-*.nv21 2>/dev/null | sort -V | tail -n 1)
+	if [ -n "$last" ]; then
+		# mean luma of 16 lines in the middle, the 1450 picture columns of the 1472 pitch
+		mean=$(dd if="$last" bs=1472 skip=536 count=16 2>/dev/null | od -An -tu1 -v -w1472 |
+			awk '{ for (i = 1; i <= 1450; i++) { s += $i; c++ } } END { if (c) printf "%d", s / c }')
+		echo "mean luma of the last frame (middle lines): $mean (AE aims at about 100..120 of 255)"
+		[ "${mean:-0}" -ge 70 ] && [ "${mean:-0}" -le 170 ] && echo "PASS  last frame exposed" || echo "FAIL  last frame mean $mean"
+	fi
+	grep -E "error interrupt 0x|stop: error interrupts [1-9]|LINE SWITCHED OFF|buffers lost [1-9]" "$LDIR/$SCENE-dmesg.txt" | head -n 5
+	grep -qE "error interrupt 0x|stop: error interrupts [1-9]" "$LDIR/$SCENE-dmesg.txt" && echo "FAIL  error interrupts (see $SCENE-dmesg.txt)" || echo "PASS  no error interrupt"
+	say "driver frame timing (start-of-frame interval spread = interrupt latency; per-error state)"
+	grep -E "stop: (lists started|per-frame lists started|error [0-9]+:)" "$LDIR/$SCENE-dmesg.txt" |
+		sed 's/^\[[^]]*\] [^ ]* [^ ]* //' | head -n 20
+	[ "$n" -ge 55 ] && echo "PASS  $n of 60 frames" || echo "FAIL  $n of 60 frames"
 	;;
 runlist)
 	# tag:twin,db_order,frame_done,stats_off,extra_off (all others at their defaults)

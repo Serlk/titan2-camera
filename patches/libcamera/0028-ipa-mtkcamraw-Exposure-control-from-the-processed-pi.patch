@@ -1,0 +1,960 @@
+From 2e242dadcafa74b7c237b0888a0803f8dfff0586 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 16:18:25 +0300
+Subject: [PATCH 28/28] ipa: mtkcamraw: Exposure control from the processed
+ picture
+
+The ISP settings of the replayed requests are frozen: their statistics
+format, colour gains and tone curve are not available, so the only
+controls are the sensor's. The IPA runs libipa's mean luminance AGC on a
+luma histogram of the output picture, which is on an encoded scale: the
+histogram is linearised with a power law (encodingGamma, 2.2 by
+default) first. The closed loop does not depend on that model being
+exact. Exposure time comes first up to one frame at 30 fps, then
+analogue gain; FrameDurationLimits can allow longer frames, for which
+the vertical blanking follows the exposure. No digital gain can be
+applied. The tuning file can ask for a minimum vertical blanking
+(minVblank, 300 lines for the IMX766): the replayed ISP reports a frame
+done ~0.5 ms after the last line, and with the shortest blanking that
+falls on the next start of frame. The tuning file also gives the
+sensor's exposure margin (48 lines), AE's own margin between exposure and
+frame end (frameMargin, 256 lines: with 48 the replayed ISP lost frames),
+the longest frame AE may use (maxFrameDuration, 66.7 ms: 15 fps in the
+dark; the blanking follows the exposure) and AE's analogue gain limit
+(16x of the IMX766's 64x), applied from the first frame.
+
+The AGC computes only on a frame that shows the exposure it last asked
+for (at most 4 frames of waiting): with the sensor's two-frame latency it
+otherwise corrected the same error twice and swung at start-up. The
+highlight constraint is an upper bound only: libipa's default lower bound
+halves the exposure at most per step while the output is clipped.
+
+Controls: AeEnable, ExposureTime, AnalogueGain (manual when AE is off),
+ExposureValue, FrameDurationLimits, AeConstraintMode, AeExposureMode.
+Metadata: ExposureTime, AnalogueGain, FrameDuration, AeEnable.
+
+mtkcamraw_agc_test runs the module against a simulated camera (scene
+radiances, sensor exposure x gain with clipping, power-law output) and
+checks that a dark, a normal and a bright scene settle at the target
+within 20 frames, with the sensor taking new controls two frames late
+and left at 64x by an earlier session, the exposure at least frameMargin
+lines inside the frame and the gain under the AE limit.
+
+Signed-off-by: serlk <22211586+Serlk@users.noreply.github.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ meson_options.txt                        |   2 +-
+ src/ipa/mtkcamraw/data/imx766.yaml       |  39 ++
+ src/ipa/mtkcamraw/data/meson.build       |   9 +
+ src/ipa/mtkcamraw/data/uncalibrated.yaml |  10 +
+ src/ipa/mtkcamraw/meson.build            |  25 ++
+ src/ipa/mtkcamraw/mtkcamraw.cpp          | 503 +++++++++++++++++++++++
+ test/ipa/meson.build                     |  12 +
+ test/ipa/mtkcamraw_agc_test.cpp          | 241 +++++++++++
+ 8 files changed, 840 insertions(+), 1 deletion(-)
+ create mode 100644 src/ipa/mtkcamraw/data/imx766.yaml
+ create mode 100644 src/ipa/mtkcamraw/data/meson.build
+ create mode 100644 src/ipa/mtkcamraw/data/uncalibrated.yaml
+ create mode 100644 src/ipa/mtkcamraw/meson.build
+ create mode 100644 src/ipa/mtkcamraw/mtkcamraw.cpp
+ create mode 100644 test/ipa/mtkcamraw_agc_test.cpp
+
+diff --git a/meson_options.txt b/meson_options.txt
+index 6ec3dea..28e340c 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -48,7 +48,7 @@ option('gstreamer',
+ 
+ option('ipas',
+         type : 'array',
+-        choices : ['ipu3', 'mali-c55', 'rkisp1', 'rpi/pisp', 'rpi/vc4', 'simple',
++        choices : ['ipu3', 'mali-c55', 'mtkcamraw', 'rkisp1', 'rpi/pisp', 'rpi/vc4', 'simple',
+                    'vimc'],
+         description : 'Select which IPA modules to build')
+ 
+diff --git a/src/ipa/mtkcamraw/data/imx766.yaml b/src/ipa/mtkcamraw/data/imx766.yaml
+new file mode 100644
+index 0000000..cb3c864
+--- /dev/null
++++ b/src/ipa/mtkcamraw/data/imx766.yaml
+@@ -0,0 +1,39 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++version: 1
++# Vertical blanking at least this (lines): the frame done of the replayed
++# ISP comes ~0.5 ms after the last line, 300 lines (3.1 ms) keep it ahead of
++# the next start of frame (28.3 fps instead of 30).
++minVblank: 300
++# Lines the sensor itself keeps between exposure and frame length.
++exposureMargin: 48
++# Lines AE keeps between exposure and frame length: with only the sensor's
++# 48 the replayed ISP lost frames (exposure 3324 of 3372 lines); 3144 of
++# 3372 ran clean. A longer exposure lengthens the frame instead.
++frameMargin: 256
++# Longest frame AE may use (us): 15 fps in the dark.
++maxFrameDuration: 66667
++# AE's analogue gain limit: the sensor goes to 64x, which is very noisy.
++maxAnalogueGain: 16.0
++algorithms:
++  - Agc:
++      encodingGamma: 2.2
++      # mean linear luminance target; 0.12 is about 97 of 255 on the output
++      relativeLuminanceTarget: [ 0, 0.12 ]
++      # Highlights: an upper bound only. libipa's default lower bound (top
++      # 2 % at least 0.5) halves the exposure at most per step while the
++      # output is clipped, which takes ~20 frames from an overexposed start.
++      AeConstraintMode:
++        ConstraintNormal:
++          upper:
++            qLo: 0.98
++            qHi: 1.0
++            yTarget: [ 0, 0.95 ]
++      AeExposureMode:
++        ExposureNormal:
++          # exposure time up to 30 ms at 1x, gain to 4x, then longer frames
++          # (down to 15 fps) at 4x, then gain to the limit
++          exposureTime: [ 100, 10000, 30000, 30000, 60000, 60000 ]
++          gain: [ 1.0, 1.0, 1.0, 4.0, 4.0, 16.0 ]
++...
+diff --git a/src/ipa/mtkcamraw/data/meson.build b/src/ipa/mtkcamraw/data/meson.build
+new file mode 100644
+index 0000000..352e670
+--- /dev/null
++++ b/src/ipa/mtkcamraw/data/meson.build
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: CC0-1.0
++
++conf_files = files([
++    'imx766.yaml',
++    'uncalibrated.yaml',
++])
++
++install_data(conf_files,
++             install_dir : ipa_data_dir / 'mtkcamraw')
+diff --git a/src/ipa/mtkcamraw/data/uncalibrated.yaml b/src/ipa/mtkcamraw/data/uncalibrated.yaml
+new file mode 100644
+index 0000000..5a76cc4
+--- /dev/null
++++ b/src/ipa/mtkcamraw/data/uncalibrated.yaml
+@@ -0,0 +1,10 @@
++# SPDX-License-Identifier: CC0-1.0
++%YAML 1.1
++---
++version: 1
++algorithms:
++  - Agc:
++      # the output picture is on an encoded scale; its luma is raised to
++      # this power to approximate linear light for the AGC
++      encodingGamma: 2.2
++...
+diff --git a/src/ipa/mtkcamraw/meson.build b/src/ipa/mtkcamraw/meson.build
+new file mode 100644
+index 0000000..ad256b1
+--- /dev/null
++++ b/src/ipa/mtkcamraw/meson.build
+@@ -0,0 +1,25 @@
++# SPDX-License-Identifier: CC0-1.0
++
++subdir('data')
++
++ipa_name = 'ipa_mtkcamraw'
++
++mod = shared_module(ipa_name,
++                    'mtkcamraw.cpp',
++                    name_prefix : '',
++                    include_directories : [ipa_includes, libipa_includes],
++                    dependencies : libcamera_private,
++                    link_with : libipa,
++                    install : true,
++                    install_dir : ipa_install_dir)
++
++if ipa_sign_module
++    custom_target(ipa_name + '.so.sign',
++                  input : mod,
++                  output : ipa_name + '.so.sign',
++                  command : [ipa_sign, ipa_priv_key, '@INPUT@', '@OUTPUT@'],
++                  install : false,
++                  build_by_default : true)
++endif
++
++ipa_names += ipa_name
+diff --git a/src/ipa/mtkcamraw/mtkcamraw.cpp b/src/ipa/mtkcamraw/mtkcamraw.cpp
+new file mode 100644
+index 0000000..993339e
+--- /dev/null
++++ b/src/ipa/mtkcamraw/mtkcamraw.cpp
+@@ -0,0 +1,503 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, serlk
++ *
++ * IPA for the MediaTek MT6878 RAW/YUV engines driven by a replayed command
++ * queue (mtkcamraw pipeline handler).
++ *
++ * The ISP settings of a frame are those of a captured request and cannot
++ * be changed: its own statistics, colour gains and tone curve are not
++ * available to us. What can be controlled is the sensor: exposure time,
++ * analogue gain and frame length. The AGC here runs on a luma histogram of
++ * the processed output picture, which the pipeline handler computes. The
++ * output is on an encoded (non-linear) scale; the histogram is brought back
++ * to an approximately linear scale with a power law (encodingGamma in the
++ * tuning file, 2.2 by default) before the mean luminance AGC of libipa
++ * sees it. The closed loop does not depend on that model being exact.
++ */
++
++#include <algorithm>
++#include <cmath>
++#include <map>
++#include <memory>
++#include <string.h>
++#include <vector>
++
++#include <linux/v4l2-controls.h>
++
++#include <libcamera/base/file.h>
++#include <libcamera/base/log.h>
++#include <libcamera/base/span.h>
++#include <libcamera/base/utils.h>
++
++#include <libcamera/control_ids.h>
++#include <libcamera/ipa/ipa_interface.h>
++#include <libcamera/ipa/ipa_module_info.h>
++#include <libcamera/ipa/mtkcamraw_ipa_interface.h>
++
++#include "libcamera/internal/yaml_parser.h"
++
++#include "libipa/agc_mean_luminance.h"
++#include "libipa/camera_sensor_helper.h"
++#include "libipa/histogram.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(IPAMtkCamraw)
++
++using namespace std::literals::chrono_literals;
++
++namespace ipa::mtkcamraw {
++
++/* bins of the linearised histogram */
++static constexpr unsigned int kLinearBins = 1024;
++static constexpr double kDefaultEncodingGamma = 2.2;
++
++class Agc : public AgcMeanLuminance
++{
++public:
++	void setEncodingGamma(double gamma) { gamma_ = gamma; }
++
++	/* the output's luma histogram (any bin count), linearised */
++	void setHistogram(Span<const uint32_t> encoded)
++	{
++		std::vector<uint32_t> linear(kLinearBins, 0);
++		const unsigned int n = encoded.size();
++
++		for (unsigned int i = 0; i < n; i++) {
++			double v = std::pow((i + 0.5) / n, gamma_);
++			unsigned int bin = std::min<unsigned int>(v * kLinearBins,
++								  kLinearBins - 1);
++			linear[bin] += encoded[i];
++		}
++		hist_ = Histogram(Span<const uint32_t>(linear));
++	}
++
++	const Histogram &histogram() const { return hist_; }
++
++private:
++	double estimateLuminance(const double gain) const override
++	{
++		Span<const uint64_t> cumulative = hist_.data();
++		const uint64_t total = hist_.total();
++		const size_t bins = hist_.bins();
++		double sum = 0.0;
++
++		if (!total)
++			return 0.0;
++		for (size_t i = 0; i < bins; i++) {
++			uint64_t count = cumulative[i + 1] - cumulative[i];
++			sum += std::min(1.0, (i + 0.5) / bins * gain) * count;
++		}
++		return sum / total;
++	}
++
++	double gamma_ = kDefaultEncodingGamma;
++	Histogram hist_;
++};
++
++class IPAMtkCamraw : public IPAMtkCamrawInterface
++{
++public:
++	int init(const IPASettings &settings, const IPAConfigInfo &configInfo,
++		 ControlInfoMap *ipaControls) override;
++	int configure(const IPAConfigInfo &configInfo,
++		      ControlInfoMap *ipaControls) override;
++
++	void start(const ControlList &sensorControls, StartResult *result) override;
++	void stop() override;
++
++	void queueRequest(const uint32_t frame, const ControlList &controls) override;
++	void processStats(const uint32_t frame, const std::vector<uint32_t> &yHistogram,
++			  const ControlList &sensorControls) override;
++
++private:
++	void updateLimits(const IPAConfigInfo &configInfo, ControlInfoMap *ipaControls);
++	void setControls();
++	ControlList sensorValues() const;
++	uint32_t maxExposureLines() const;
++
++	static constexpr double kSettledTolerance = 0.03;
++	static constexpr unsigned int kMaxWait = 4;
++	double requestedEv_ = 0.0;
++	unsigned int waited_ = 0;
++
++	std::unique_ptr<CameraSensorHelper> camHelper_;
++	Agc agc_;
++	ControlInfoMap sensorControls_;
++
++	utils::Duration lineDuration_;
++	Size outputSize_;
++	uint32_t lineLength_ = 0;
++	uint32_t exposureMargin_ = 0;
++	/* lines AE keeps between exposure and frame end (>= the sensor's margin) */
++	uint32_t frameMargin_ = 0;
++	int64_t tuningFrameMargin_ = -1;
++	int64_t tuningMaxFrameUs_ = 0;
++	int32_t minVblank_ = 0;
++	int32_t tuningMinVblank_ = 0;
++	int32_t tuningMargin_ = -1;
++	double tuningMaxGain_ = 0.0;
++	int32_t maxVblank_ = 0;
++	utils::Duration minFrameDuration_;
++	utils::Duration maxFrameDuration_;
++	double minGain_ = 1.0;
++	double maxGain_ = 1.0;
++	uint32_t minExposure_ = 1;
++
++	/* what is applied next */
++	bool autoEnabled_ = true;
++	uint32_t exposure_ = 0;		/* lines */
++	double gain_ = 1.0;
++	uint32_t manualExposure_ = 0;
++	double manualGain_ = 1.0;
++	int32_t constraintMode_ = 0;
++	int32_t exposureMode_ = 0;
++};
++
++int IPAMtkCamraw::init(const IPASettings &settings, const IPAConfigInfo &configInfo,
++		       ControlInfoMap *ipaControls)
++{
++	camHelper_ = CameraSensorHelperFactoryBase::create(settings.sensorModel);
++	if (!camHelper_) {
++		LOG(IPAMtkCamraw, Error)
++			<< "No camera sensor helper for " << settings.sensorModel;
++		return -ENODEV;
++	}
++
++	File file(settings.configurationFile);
++	if (!file.open(File::OpenModeFlag::ReadOnly)) {
++		int ret = file.error();
++		LOG(IPAMtkCamraw, Error)
++			<< "Failed to open configuration file "
++			<< settings.configurationFile << ": " << strerror(-ret);
++		return ret;
++	}
++
++	std::unique_ptr<ValueNode> data = YamlParser::parse(file);
++	if (!data)
++		return -EINVAL;
++
++	/* algorithms: [ { Agc: { ... } } ] as in the other IPAs */
++	static const ValueNode empty;
++	const ValueNode *agcData = &empty;
++	const ValueNode &algos = (*data)["algorithms"];
++	if (algos.isList()) {
++		for (const auto &algo : algos.asList()) {
++			if (algo.contains("Agc"))
++				agcData = &algo["Agc"];
++		}
++	}
++
++	agc_.setEncodingGamma((*agcData)["encodingGamma"].get<double>(kDefaultEncodingGamma));
++	/*
++	 * Frame length margin: the picture's frame done comes about 0.5 ms
++	 * after the last line; with the shortest blanking it lands on the
++	 * next start of frame and the engine starts dropping frames.
++	 */
++	tuningMinVblank_ = (*data)["minVblank"].get<int32_t>(0);
++	/* lines the sensor keeps between exposure and frame length */
++	tuningMargin_ = (*data)["exposureMargin"].get<int32_t>(-1);
++	/* AE's analogue gain limit (image quality), below the sensor's own */
++	tuningMaxGain_ = (*data)["maxAnalogueGain"].get<double>(0.0);
++	/*
++	 * The replayed ISP misbehaves (late frame done, CQ trigger delay,
++	 * lost frames) when the exposure comes close to the frame length:
++	 * AE keeps frameMargin lines free and lengthens the frame instead,
++	 * up to maxFrameDuration (us).
++	 */
++	tuningFrameMargin_ = (*data)["frameMargin"].get<int32_t>(-1);
++	tuningMaxFrameUs_ = (*data)["maxFrameDuration"].get<int32_t>(0);
++	int ret = agc_.parseTuningData(*agcData);
++	if (ret)
++		return ret;
++
++	constraintMode_ = agc_.constraintModes().begin()->first;
++	exposureMode_ = agc_.exposureModeHelpers().begin()->first;
++
++	updateLimits(configInfo, ipaControls);
++	return 0;
++}
++
++/* limits of the sensor mode and the controls the camera offers */
++void IPAMtkCamraw::updateLimits(const IPAConfigInfo &configInfo,
++				ControlInfoMap *ipaControls)
++{
++	const IPACameraSensorInfo &info = configInfo.sensorInfo;
++	const ControlInfoMap &sensorControls = configInfo.sensorControls;
++
++	sensorControls_ = sensorControls;
++	outputSize_ = info.outputSize;
++	lineLength_ = info.minLineLength;
++	lineDuration_ = info.minLineLength * 1.0s / info.pixelRate;
++
++	const ControlInfo &v4l2Exposure = sensorControls.find(V4L2_CID_EXPOSURE)->second;
++	const ControlInfo &v4l2Gain = sensorControls.find(V4L2_CID_ANALOGUE_GAIN)->second;
++	const ControlInfo &v4l2VBlank = sensorControls.find(V4L2_CID_VBLANK)->second;
++
++	minExposure_ = v4l2Exposure.min().get<int32_t>();
++	minVblank_ = std::clamp(tuningMinVblank_, v4l2VBlank.min().get<int32_t>(),
++				v4l2VBlank.max().get<int32_t>());
++	maxVblank_ = v4l2VBlank.max().get<int32_t>();
++	minGain_ = camHelper_->gain(v4l2Gain.min().get<int32_t>());
++	maxGain_ = camHelper_->gain(v4l2Gain.max().get<int32_t>());
++	if (tuningMaxGain_ >= minGain_)
++		maxGain_ = std::min(maxGain_, tuningMaxGain_);
++
++	/*
++	 * The exposure range the sensor reports is that of its current frame
++	 * length (default vertical blanking): the difference is the margin
++	 * the sensor keeps between exposure and frame length.
++	 */
++	/*
++	 * Without a tuned margin: the exposure range the sensor reports is
++	 * that of its current frame length, which is the default only on a
++	 * fresh sensor - a margin from it is a guess.
++	 */
++	if (tuningMargin_ >= 0) {
++		exposureMargin_ = tuningMargin_;
++	} else {
++		int32_t defFrameLength = outputSize_.height + v4l2VBlank.def().get<int32_t>();
++		int32_t maxExposureNow = v4l2Exposure.max().get<int32_t>();
++		exposureMargin_ = std::max(0, defFrameLength - maxExposureNow);
++	}
++
++	frameMargin_ = std::max<int64_t>(exposureMargin_, tuningFrameMargin_);
++
++	minFrameDuration_ = (outputSize_.height + minVblank_) * lineDuration_;
++	/*
++	 * Longest frame AE may use: the tuning file's (lower frame rate in the
++	 * dark), else the fastest frame rate of the mode; FrameDurationLimits
++	 * overrides it.
++	 */
++	utils::Duration longest = (outputSize_.height + maxVblank_) * lineDuration_;
++	maxFrameDuration_ = std::clamp<utils::Duration>(std::chrono::microseconds(tuningMaxFrameUs_),
++							minFrameDuration_, longest);
++
++	if (!exposure_) {
++		exposure_ = v4l2Exposure.def().get<int32_t>();
++		gain_ = std::max(minGain_, camHelper_->gain(v4l2Gain.def().get<int32_t>()));
++		manualExposure_ = exposure_;
++		manualGain_ = gain_;
++	}
++
++	ControlInfoMap::Map ctrls = agc_.controls();
++	double lineUs = lineDuration_.get<std::micro>();
++	int64_t minFrameUs = minFrameDuration_.get<std::micro>();
++	int64_t maxFrameUs = utils::Duration((outputSize_.height + maxVblank_) * lineDuration_).get<std::micro>();
++
++	ctrls[&controls::AeEnable] = ControlInfo(false, true, true);
++	ctrls[&controls::ExposureTime] =
++		ControlInfo(static_cast<int32_t>(minExposure_ * lineUs),
++			    static_cast<int32_t>((outputSize_.height + maxVblank_ -
++						  exposureMargin_) * lineUs),
++			    static_cast<int32_t>(exposure_ * lineUs));
++	ctrls[&controls::AnalogueGain] =
++		ControlInfo(static_cast<float>(minGain_), static_cast<float>(maxGain_),
++			    static_cast<float>(gain_));
++	ctrls[&controls::ExposureValue] = ControlInfo(-8.0f, 8.0f, 0.0f);
++	int64_t defMaxFrameUs = maxFrameDuration_.get<std::micro>();
++	ctrls[&controls::FrameDurationLimits] =
++		ControlInfo(minFrameUs, maxFrameUs,
++			    ControlValue(Span<const int64_t, 2>{ { minFrameUs, defMaxFrameUs } }));
++
++	*ipaControls = ControlInfoMap(std::move(ctrls), controls::controls);
++
++	LOG(IPAMtkCamraw, Debug)
++		<< "line " << lineDuration_ << ", exposure margin " << exposureMargin_
++		<< " lines, gain " << minGain_ << "-" << maxGain_
++		<< ", frame " << minFrameDuration_ << "-"
++		<< (outputSize_.height + maxVblank_) * lineDuration_;
++}
++
++int IPAMtkCamraw::configure(const IPAConfigInfo &configInfo,
++			    ControlInfoMap *ipaControls)
++{
++	updateLimits(configInfo, ipaControls);
++
++	agc_.configure(lineDuration_, camHelper_.get());
++	agc_.setLimits(minExposure_ * lineDuration_, maxExposureLines() * lineDuration_,
++		       minGain_, maxGain_, {});
++	agc_.resetFrameCount();
++	return 0;
++}
++
++void IPAMtkCamraw::start(const ControlList &sensorControls, StartResult *result)
++{
++	if (sensorControls.contains(V4L2_CID_EXPOSURE))
++		exposure_ = std::max<int32_t>(minExposure_,
++					      sensorControls.get(V4L2_CID_EXPOSURE).get<int32_t>());
++	if (sensorControls.contains(V4L2_CID_ANALOGUE_GAIN))
++		gain_ = std::clamp(camHelper_->gain(sensorControls.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>()),
++				   minGain_, maxGain_);
++	exposure_ = std::min(exposure_, maxExposureLines());
++	requestedEv_ = 0.0;
++	waited_ = 0;
++	/* inside the limits before the first frame (a previous session may have used 64x) */
++	result->controls = sensorValues();
++	result->ret = 0;
++}
++
++void IPAMtkCamraw::stop()
++{
++}
++
++void IPAMtkCamraw::queueRequest([[maybe_unused]] const uint32_t frame,
++				const ControlList &controls)
++{
++	const auto &aeEnable = controls.get(controls::AeEnable);
++	if (aeEnable && *aeEnable != autoEnabled_) {
++		autoEnabled_ = *aeEnable;
++		if (!autoEnabled_) {
++			manualExposure_ = exposure_;
++			manualGain_ = gain_;
++		}
++		LOG(IPAMtkCamraw, Debug) << "AGC " << (autoEnabled_ ? "on" : "off");
++	}
++
++	const auto &exposureTime = controls.get(controls::ExposureTime);
++	if (exposureTime)
++		manualExposure_ = std::max<uint32_t>(minExposure_,
++						     *exposureTime * 1.0us / lineDuration_);
++	const auto &analogueGain = controls.get(controls::AnalogueGain);
++	if (analogueGain)
++		manualGain_ = std::clamp<double>(*analogueGain, minGain_, maxGain_);
++
++	const auto &ev = controls.get(controls::ExposureValue);
++	if (ev)
++		agc_.setExposureCompensation(std::pow(2.0, *ev));
++
++	const auto &constraintMode = controls.get(controls::AeConstraintMode);
++	if (constraintMode)
++		constraintMode_ = *constraintMode;
++	const auto &exposureMode = controls.get(controls::AeExposureMode);
++	if (exposureMode)
++		exposureMode_ = *exposureMode;
++
++	const auto &frameDurations = controls.get(controls::FrameDurationLimits);
++	if (frameDurations) {
++		utils::Duration maxFrame = std::chrono::microseconds((*frameDurations)[1]);
++		utils::Duration longest = (outputSize_.height + maxVblank_) * lineDuration_;
++
++		maxFrameDuration_ = std::clamp(maxFrame, minFrameDuration_, longest);
++		agc_.setLimits(minExposure_ * lineDuration_,
++			       maxExposureLines() * lineDuration_,
++			       minGain_, maxGain_, {});
++	}
++
++	if (!autoEnabled_) {
++		exposure_ = manualExposure_;
++		gain_ = manualGain_;
++	}
++}
++
++void IPAMtkCamraw::processStats(const uint32_t frame,
++				const std::vector<uint32_t> &yHistogram,
++				const ControlList &sensorControls)
++{
++	ControlList metadata(controls::controls);
++
++	/* what the sensor ran for this frame */
++	uint32_t exposure = exposure_;
++	double gain = gain_;
++	int32_t vblank = minVblank_;
++	if (sensorControls.contains(V4L2_CID_EXPOSURE))
++		exposure = sensorControls.get(V4L2_CID_EXPOSURE).get<int32_t>();
++	if (sensorControls.contains(V4L2_CID_ANALOGUE_GAIN))
++		gain = camHelper_->gain(sensorControls.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>());
++	if (sensorControls.contains(V4L2_CID_VBLANK))
++		vblank = sensorControls.get(V4L2_CID_VBLANK).get<int32_t>();
++
++	utils::Duration exposureTime = exposure * lineDuration_;
++
++	/*
++	 * The sensor takes new values a few frames late: compute only on a
++	 * frame that shows the exposure last asked for (or after a few frames
++	 * of waiting), otherwise the AGC corrects the same error twice and
++	 * the exposure swings.
++	 */
++	double appliedEv = exposure * gain;
++	bool settled = requestedEv_ <= 0.0 ||
++		       std::abs(appliedEv / requestedEv_ - 1.0) < kSettledTolerance ||
++		       ++waited_ > kMaxWait;
++
++	if (autoEnabled_ && !yHistogram.empty() && settled) {
++		agc_.setHistogram(yHistogram);
++
++		utils::Duration newExposure;
++		double aGain, qGain, dGain;
++		/* aGain is quantised to the sensor steps, qGain the rest */
++		std::tie(newExposure, aGain, qGain, dGain) =
++			agc_.calculateNewEv(constraintMode_, exposureMode_,
++					    agc_.histogram(), exposureTime * gain);
++
++		/* no digital gain can be applied: the ISP settings are frozen */
++		exposure_ = std::min(std::max<uint32_t>(minExposure_, newExposure / lineDuration_),
++				     maxExposureLines());
++		gain_ = std::clamp(camHelper_->gain(camHelper_->gainCode(aGain)), minGain_, maxGain_);
++		requestedEv_ = exposure_ * gain_;
++		waited_ = 0;
++
++		LOG(IPAMtkCamraw, Debug)
++			<< "frame " << frame << ": " << exposureTime << " x " << gain
++			<< " -> " << exposure_ * lineDuration_ << " x " << gain_
++			<< (dGain > 1.01 ? " (would need digital gain)" : "");
++	}
++
++	setControls();
++
++	uint32_t frameLength = outputSize_.height + vblank;
++	metadata.set(controls::ExposureTime,
++		     static_cast<int32_t>(exposureTime.get<std::micro>()));
++	metadata.set(controls::AnalogueGain, static_cast<float>(gain));
++	metadata.set(controls::FrameDuration,
++		     static_cast<int64_t>(utils::Duration(frameLength * lineDuration_).get<std::micro>()));
++	metadata.set(controls::AeEnable, autoEnabled_);
++	metadataReady.emit(frame, metadata);
++}
++
++/* the longest exposure the allowed frame length leaves */
++uint32_t IPAMtkCamraw::maxExposureLines() const
++{
++	uint32_t frameLines = maxFrameDuration_ / lineDuration_;
++
++	return std::max<uint32_t>(minExposure_, frameLines - frameMargin_);
++}
++
++/* exposure, gain and the frame length that keeps frameMargin lines after the exposure */
++ControlList IPAMtkCamraw::sensorValues() const
++{
++	uint32_t exposure = std::min(exposure_, maxExposureLines());
++	int32_t vblank = std::max<int32_t>(minVblank_,
++					   exposure + frameMargin_ - outputSize_.height);
++	ControlList ctrls(sensorControls_);
++
++	ctrls.set(V4L2_CID_VBLANK, vblank);
++	ctrls.set(V4L2_CID_EXPOSURE, static_cast<int32_t>(exposure));
++	ctrls.set(V4L2_CID_ANALOGUE_GAIN,
++		  static_cast<int32_t>(camHelper_->gainCode(gain_)));
++	return ctrls;
++}
++
++void IPAMtkCamraw::setControls()
++{
++	setSensorControls.emit(sensorValues());
++}
++
++} /* namespace ipa::mtkcamraw */
++
++extern "C" {
++const struct IPAModuleInfo ipaModuleInfo = {
++	IPA_MODULE_API_VERSION,
++	1,
++	"mtkcamraw",
++	"mtkcamraw",
++};
++
++IPAInterface *ipaCreate()
++{
++	return new ipa::mtkcamraw::IPAMtkCamraw();
++}
++}
++
++} /* namespace libcamera */
+diff --git a/test/ipa/meson.build b/test/ipa/meson.build
+index ceed15b..8422df0 100644
+--- a/test/ipa/meson.build
++++ b/test/ipa/meson.build
+@@ -15,3 +15,15 @@ foreach test : ipa_test
+ 
+     test(test['name'], exe, suite : 'ipa')
+ endforeach
++
++if 'mtkcamraw' in enabled_ipa_names
++    exe = executable('mtkcamraw_agc_test', 'mtkcamraw_agc_test.cpp',
++                     dependencies : [libcamera_private],
++                     link_with : [test_libraries],
++                     include_directories : [test_includes_internal],
++                     cpp_args : '-DMTKCAMRAW_TUNING="' +
++                                (meson.project_source_root() /
++                                 'src/ipa/mtkcamraw/data/imx766.yaml') + '"')
++
++    test('mtkcamraw_agc_test', exe, suite : 'ipa')
++endif
+diff --git a/test/ipa/mtkcamraw_agc_test.cpp b/test/ipa/mtkcamraw_agc_test.cpp
+new file mode 100644
+index 0000000..1c988a9
+--- /dev/null
++++ b/test/ipa/mtkcamraw_agc_test.cpp
+@@ -0,0 +1,241 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (C) 2026, serlk
++ *
++ * The mtkcamraw IPA's exposure control against a simulated camera: a
++ * scene of fixed linear radiances, a sensor whose signal is radiance x
++ * exposure time x analogue gain (clipped), and an output encoded with a
++ * power law, as the processed pictures of the hardware ISP are. The AGC
++ * must bring a dark and a bright scene to its target within a few dozen
++ * frames, keep the controls inside the sensor's ranges, and stay there.
++ */
++
++#include <cmath>
++#include <iostream>
++#include <memory>
++#include <random>
++#include <vector>
++
++#include <linux/v4l2-controls.h>
++
++#include <libcamera/control_ids.h>
++#include <libcamera/controls.h>
++#include <libcamera/ipa/mtkcamraw_ipa_interface.h>
++
++#include "libcamera/internal/ipa_module.h"
++
++#include "test.h"
++
++using namespace std;
++using namespace libcamera;
++
++namespace {
++
++/* the IMX766 4096x3072 mode as the sensor driver reports it */
++constexpr unsigned int kWidth = 4096;
++constexpr unsigned int kHeight = 3072;
++constexpr unsigned int kLineLength = 15616;
++constexpr uint64_t kPixelRate = 1488000000;
++constexpr int32_t kExposureMin = 24, kExposureDef = 976;
++constexpr int32_t kVblankMin = 104, kVblankMax = 62460;
++constexpr int32_t kExposureMargin = 48;
++/* AE's own margin from the tuning file */
++constexpr int32_t kFrameMargin = 256;
++constexpr int32_t kGainMin = 0, kGainMax = 16128, kGainDef = 0;
++constexpr double kEncodingGamma = 2.2;
++
++double imx766Gain(int32_t code)
++{
++	return 16384.0 / (16384 - code);
++}
++
++const ControlId::DirectionFlags kInOut = ControlId::Direction::In | ControlId::Direction::Out;
++const ControlId exposureId(V4L2_CID_EXPOSURE, "Exposure", "v4l2", ControlTypeInteger32, kInOut);
++const ControlId gainId(V4L2_CID_ANALOGUE_GAIN, "Analogue Gain", "v4l2", ControlTypeInteger32, kInOut);
++const ControlId vblankId(V4L2_CID_VBLANK, "Vertical Blanking", "v4l2", ControlTypeInteger32, kInOut);
++const ControlId hblankId(V4L2_CID_HBLANK, "Horizontal Blanking", "v4l2", ControlTypeInteger32, kInOut);
++const ControlIdMap sensorIdMap = {
++	{ V4L2_CID_EXPOSURE, &exposureId },
++	{ V4L2_CID_ANALOGUE_GAIN, &gainId },
++	{ V4L2_CID_VBLANK, &vblankId },
++	{ V4L2_CID_HBLANK, &hblankId },
++};
++
++} /* namespace */
++
++class MtkCamrawAgcTest : public Test
++{
++protected:
++	int init() override
++	{
++		module_ = make_unique<IPAModule>("src/ipa/mtkcamraw/ipa_mtkcamraw.so");
++		if (!module_->isValid() || !module_->load()) {
++			cerr << "mtkcamraw IPA module not loadable" << endl;
++			return TestFail;
++		}
++
++		ControlInfoMap::Map ctrls;
++		ctrls.emplace(&exposureId, ControlInfo(kExposureMin,
++						       static_cast<int32_t>(kHeight + kVblankMin - kExposureMargin),
++						       kExposureDef));
++		ctrls.emplace(&gainId, ControlInfo(kGainMin, kGainMax, kGainDef));
++		ctrls.emplace(&vblankId, ControlInfo(kVblankMin, kVblankMax, kVblankMin));
++		ctrls.emplace(&hblankId, ControlInfo(11520, 11520, 11520));
++		config_.sensorControls = ControlInfoMap(std::move(ctrls), sensorIdMap);
++
++		IPACameraSensorInfo &info = config_.sensorInfo;
++		info.model = "imx766";
++		info.bitsPerPixel = 10;
++		info.activeAreaSize = { kWidth, kHeight };
++		info.analogCrop = { 0, 0, kWidth, kHeight };
++		info.outputSize = { kWidth, kHeight };
++		info.pixelRate = kPixelRate;
++		info.minLineLength = kLineLength;
++		info.maxLineLength = kLineLength;
++		info.minFrameLength = kHeight + kVblankMin;
++		info.maxFrameLength = kHeight + kVblankMax;
++
++		return TestPass;
++	}
++
++	/* encoded luma histogram of the scene at this exposure and gain */
++	vector<uint32_t> picture(double scene, int32_t exposure, int32_t gainCode,
++				 double *meanLinear)
++	{
++		vector<uint32_t> hist(256, 0);
++		double expo = exposure * double(kLineLength) / kPixelRate;
++		double sum = 0.0;
++
++		for (double r : radiance_) {
++			double lin = min(1.0, r * scene * expo * imx766Gain(gainCode));
++			unsigned int y = min(255.0, 255.0 * pow(lin, 1.0 / kEncodingGamma) + 0.5);
++			hist[y]++;
++			sum += lin;
++		}
++		*meanLinear = sum / radiance_.size();
++		return hist;
++	}
++
++	/*
++	 * Run the loop on one scene. The simulated sensor takes new controls
++	 * kDelay frames after they are pushed, like the IMX766 (exposure and
++	 * gain delay 2), and reports per frame what it ran, as DelayedControls
++	 * does. True when the picture settles near the target within
++	 * kSettleFrames and the controls stay in range and under the AE gain
++	 * limit.
++	 */
++	bool runScene(const char *name, double scene, double target)
++	{
++		static constexpr unsigned int kDelay = 2;
++		static constexpr unsigned int kFrames = 60;
++		static constexpr unsigned int kSettleFrames = 20;
++		static constexpr double kMaxAeGain = 16.0;
++
++		unique_ptr<ipa::mtkcamraw::IPAMtkCamrawInterface> ipa(
++			static_cast<ipa::mtkcamraw::IPAMtkCamrawInterface *>(module_->createInterface()));
++		ControlList sensor(config_.sensorControls);
++		vector<ControlList> pushed;
++		ControlInfoMap ipaControls;
++
++		/* a sensor left at 64x by an earlier session (the cap applies from frame 0) */
++		sensor.set(V4L2_CID_EXPOSURE, kExposureDef);
++		sensor.set(V4L2_CID_ANALOGUE_GAIN, kGainMax);
++		sensor.set(V4L2_CID_VBLANK, kVblankMin);
++
++		ipa->setSensorControls.connect(this, [&](const ControlList &c) {
++			pushed.push_back(c);
++		});
++
++		IPASettings settings{ MTKCAMRAW_TUNING, "imx766" };
++		ControlList startControls(config_.sensorControls);
++		startControls.set(V4L2_CID_EXPOSURE, sensor.get(V4L2_CID_EXPOSURE));
++		startControls.set(V4L2_CID_ANALOGUE_GAIN, sensor.get(V4L2_CID_ANALOGUE_GAIN));
++		ipa::mtkcamraw::StartResult first;
++		if (ipa->init(settings, config_, &ipaControls) ||
++		    ipa->configure(config_, &ipaControls)) {
++			cerr << name << ": IPA init/configure failed" << endl;
++			return false;
++		}
++		ipa->start(startControls, &first);
++		if (first.ret) {
++			cerr << name << ": IPA start failed" << endl;
++			return false;
++		}
++		/* the start values reach the sensor before it streams */
++		for (const auto &[id, value] : first.controls)
++			sensor.set(id, value);
++
++		vector<double> means;
++		bool ok = true;
++		size_t used = 0;
++		for (unsigned int frame = 0; frame < kFrames; frame++) {
++			/* what was pushed kDelay frames ago reaches the sensor now */
++			while (used < pushed.size() && used + kDelay <= frame) {
++				for (const auto &[id, value] : pushed[used])
++					sensor.set(id, value);
++				used++;
++			}
++
++			int32_t exposure = sensor.get(V4L2_CID_EXPOSURE).get<int32_t>();
++			int32_t gain = sensor.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
++			int32_t vblank = sensor.get(V4L2_CID_VBLANK).get<int32_t>();
++
++			if (exposure < kExposureMin ||
++			    exposure > static_cast<int32_t>(kHeight) + vblank - kFrameMargin ||
++			    gain < kGainMin || gain > kGainMax ||
++			    vblank < kVblankMin || vblank > kVblankMax ||
++			    imx766Gain(gain) > kMaxAeGain * 1.01) {
++				cerr << name << ": frame " << frame << ": control out of range: exposure "
++				     << exposure << " gain " << imx766Gain(gain) << " vblank " << vblank << endl;
++				ok = false;
++			}
++
++			double mean;
++			vector<uint32_t> hist = picture(scene, exposure, gain, &mean);
++			means.push_back(mean);
++			ipa->queueRequest(frame, ControlList(controls::controls));
++			ipa->processStats(frame, hist, ControlList(sensor));
++		}
++		ipa->stop();
++
++		/* the first frame from which the picture stays within 15 % of the target */
++		unsigned int settled = kFrames;
++		for (unsigned int f = kFrames; f-- > 0;) {
++			if (abs(means[f] / target - 1.0) > 0.15)
++				break;
++			settled = f;
++		}
++
++		int32_t exposure = sensor.get(V4L2_CID_EXPOSURE).get<int32_t>();
++		int32_t gain = sensor.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
++		cout << name << ": mean linear luminance " << means.back() << " (target ~" << target
++		     << "), settled at frame " << settled << ", exposure " << exposure
++		     << " lines, gain " << imx766Gain(gain) << endl;
++
++		return ok && settled <= kSettleFrames;
++	}
++
++	int run() override
++	{
++		/* a scene with a spread of radiances, mostly mid-tones */
++		mt19937 rng(1);
++		lognormal_distribution<double> dist(0.0, 0.8);
++		radiance_.resize(20000);
++		for (double &r : radiance_)
++			r = dist(rng);
++
++		/* 0.12: the relative luminance target of the tuning file */
++		bool ok = runScene("dark scene (long frames)", 0.15, 0.12);
++		ok &= runScene("bright scene", 300.0, 0.12);
++		ok &= runScene("normal scene", 8.0, 0.12);
++
++		return ok ? TestPass : TestFail;
++	}
++
++private:
++	unique_ptr<IPAModule> module_;
++	ipa::mtkcamraw::IPAConfigInfo config_;
++	vector<double> radiance_;
++};
++
++TEST_REGISTER(MtkCamrawAgcTest)
+-- 
+2.56.1
+

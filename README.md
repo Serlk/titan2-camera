@@ -39,6 +39,7 @@ front sensor probes, but streaming does not start.
 | path | what |
 |---|---|
 | `patches/libcamera/0001-0025` | libcamera 0.7.1 patches: MT6878 CAMSV in the simple pipeline, frame start from the video node, sensor helpers and properties for the three sensors, initial tuning files (CCMs, black level), manual focus and contrast autofocus with the module EEPROM lens map, AE/AWB/CPU-debayer fixes, GPU detail stage (denoise/sharpen), lens shading and tone-curve support in the software ISP, output buffers from the system dma-heap |
+| `patches/libcamera/0027-0028` | the `mtkcamraw` pipeline handler and IPA for the hardware ISP replay driver (main camera, exposure control from the processed picture); offered only when the replay driver has its request dumps, otherwise the main camera stays on the simple pipeline (number 0026 is not used) |
 | `docs/CAMERA.md` | design, image quality state, software ISP and recording measurements, test procedures, open items |
 | `libcamera/configuration.yaml` | `/etc/libcamera/configuration.yaml`: lens maps per sensor, software ISP mode (GPU) |
 | `libcamera/50-titan2-camera.conf` | WirePlumber: cameras only through libcamera (no raw CAMSV nodes), names and priorities |
@@ -151,8 +152,10 @@ is there:
 The kernel series has a driver for the SoC's RAW/YUV engines (`mtk-camraw-mt6878`, board
 `mt6878-unihertz-titan2-raw.dtb`) that replays a command queue captured from the phone's original
 camera software. It produces a correct colour picture through the hardware ISP, but everything the
-ISP does is frozen in the captured request: **no 3A, no auto exposure (exposure and gain by hand),
-no libcamera integration yet**. Ordinary applications do not use it.
+ISP does is frozen in the captured request (black level, white balance, colour, sharpening): **no
+3A of its own**. With libcamera patches 0027/0028 the main camera runs through it in libcamera
+(`cam`, GNOME Snapshot through PipeWire), with auto exposure on the sensor's exposure, gain and
+frame length; without the dumps nothing changes for ordinary applications.
 
 **The dumps are yours only.** They contain the tuning output of the phone's own camera software,
 captured from your own device. Never publish or share them, and do not put them in a git
@@ -210,6 +213,21 @@ gives a correct colour picture of the scene, 1450 columns wide (1472 is the line
 edge shows a narrow padding stripe). On a dark scene the frames come out nearly black: that is the
 exposure of the captured request, not a fault.
 
+### 4. Through libcamera
+
+With libcamera built from this repository (patches 0001-0025, 0027, 0028) and the dumps installed,
+the main camera is offered by the `mtkcamraw` pipeline handler instead of the simple one (the log
+line "no captured requests loaded" means the dumps are missing and the simple pipeline keeps the
+camera). `sh camera-raw-replay-test.sh libcamera` runs `cam` for 60 frames and checks the result.
+`LIBCAMERA_PIPELINES_MATCH_LIST=simple` selects the software ISP for that sensor again. On the
+phone: 60 of 60 frames at about 28 fps (the IPA keeps at least 300 lines of vertical blanking),
+auto exposure settles within a few frames on bright and dark scenes, GNOME Snapshot works. The
+picture is 1450 x 1088 and is offered with the line pitch as its width (1472, black padding
+columns), because PipeWire consumers ignore the stride. Colour and white balance are those of the
+captured request (a slightly cool cast); the kernel driver holds a CPU wake-up latency limit while
+it streams (module parameter `qos_us`, 100 us), since deep CPU idle delayed its interrupts and
+frames were lost.
+
 ## Status
 
 - All three cameras stream (sensor modes: see `scripts/camera-raw-test.sh`) and work in `cam`,
@@ -222,8 +240,9 @@ exposure of the captured request, not a fault.
 - Autofocus: contrast AF on the two rear cameras; lens maps from the module EEPROM, the
   Hi-847 infinity position in `configuration.yaml` is a placeholder.
 - Not done: lens shading tables, calibrated tone/noise settings, hardware H.264 encoding, the
-  hardware ISP (kernel work in development: the replay driver delivers frames with the settings frozen
-  in a captured request, no 3A or auto exposure, no libcamera integration; not used by this user space).
+  hardware ISP beyond the replay (the replay driver runs the main camera in libcamera with auto
+  exposure, but every ISP setting is frozen in a captured request and the dumps must come from
+  one's own phone).
 
 ## Related repositories
 
