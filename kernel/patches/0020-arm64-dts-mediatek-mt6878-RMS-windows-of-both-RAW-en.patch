@@ -1,0 +1,89 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:19:21 +0300
+Subject: [PATCH 20/21] arm64: dts: mediatek: mt6878: RMS windows of both RAW
+ engines
+
+The command queue writes the RMS block of each side, and the
+ready/request debug snapshot of the stream start is set up on RAW, YUV
+and RMS. RMS-A (0x1a040000) and RMS-B (0x1a080000) have no interrupt and
+no clocks; their windows become the optional third reg entry "rms" of
+the RAW node of the same side.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/mediatek,mt6878-cam-raw.yaml        |  4 ++++
+ arch/arm64/boot/dts/mediatek/mt6878.dtsi      | 21 +++++++++++--------
+ 2 files changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/media/mediatek,mt6878-cam-raw.yaml b/Documentation/devicetree/bindings/media/mediatek,mt6878-cam-raw.yaml
+index cb5a133a0f1b..e139f57dfd73 100644
+--- a/Documentation/devicetree/bindings/media/mediatek,mt6878-cam-raw.yaml
++++ b/Documentation/devicetree/bindings/media/mediatek,mt6878-cam-raw.yaml
+@@ -25,14 +25,18 @@ properties:
+     const: mediatek,mt6878-cam-raw
+ 
+   reg:
++    minItems: 2
+     items:
+       - description: registers
+       - description: latched copy of the registers
++      - description: the RMS block of the same side (written by the command queue)
+ 
+   reg-names:
++    minItems: 2
+     items:
+       - const: base
+       - const: inner
++      - const: rms
+ 
+   interrupts:
+     maxItems: 1
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878.dtsi b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
+index 9643c685c04a..b4d1543d8094 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
+@@ -1595,13 +1595,15 @@ seninf_port5: port@5 {
+ 		/*
+ 		 * RAW-A and YUV-A engines of the image signal processor, for
+ 		 * the driver that replays a captured command queue. The RMS-A
+-		 * block at 0x1a040000, which the command queue may write,
+-		 * shares the power domain and has no resources of its own.
++		 * block at 0x1a040000, which the command queue writes, shares
++		 * the power domain and has no interrupt or clocks of its own;
++		 * its window is the third reg entry of the RAW node.
+ 		 */
+ 		cam_raw_a: cam-raw@1a030000 {
+ 			compatible = "mediatek,mt6878-cam-raw";
+-			reg = <0x1a030000 0x8000>, <0x1a038000 0x8000>;
+-			reg-names = "base", "inner";
++			reg = <0x1a030000 0x8000>, <0x1a038000 0x8000>,
++			      <0x1a040000 0x8000>;
++			reg-names = "base", "inner", "rms";
+ 			interrupts = <GIC_SPI 136 IRQ_TYPE_LEVEL_HIGH 0>;
+ 			clocks = <&camsys_main CLK_CAM_MAIN_CAM>,
+ 				 <&camsys_main CLK_CAM_MAIN_CAMTG>,
+@@ -1657,14 +1659,15 @@ cam_yuv_a: cam-yuv@1a050000 {
+ 
+ 		/*
+ 		 * RAW-B and YUV-B: the second half of a frame split between two
+-		 * RAW engines. The command queue of RAW-A programs them (and
+-		 * the RMS-B block at 0x1a080000); they have no input of their
+-		 * own.
++		 * RAW engines. The command queue of RAW-A programs them and the
++		 * RMS-B block at 0x1a080000 (third reg entry of RAW-B); they
++		 * have no input of their own.
+ 		 */
+ 		cam_raw_b: cam-raw@1a070000 {
+ 			compatible = "mediatek,mt6878-cam-raw";
+-			reg = <0x1a070000 0x8000>, <0x1a078000 0x8000>;
+-			reg-names = "base", "inner";
++			reg = <0x1a070000 0x8000>, <0x1a078000 0x8000>,
++			      <0x1a080000 0x8000>;
++			reg-names = "base", "inner", "rms";
+ 			interrupts = <GIC_SPI 138 IRQ_TYPE_LEVEL_HIGH 0>;
+ 			clocks = <&camsys_main CLK_CAM_MAIN_CAM>,
+ 				 <&camsys_main CLK_CAM_MAIN_CAMTG>,
+-- 
+2.56.1
+

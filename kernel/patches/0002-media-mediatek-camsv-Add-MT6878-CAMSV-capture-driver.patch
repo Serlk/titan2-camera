@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 18:22:48 +0300
-Subject: [PATCH 02/19] media: mediatek: camsv: Add MT6878 CAMSV capture driver
+Subject: [PATCH 02/21] media: mediatek: camsv: Add MT6878 CAMSV capture driver
 
 A V4L2 capture driver for the CAMSV engine of MT6878. One engine, one tag
 (tag 2, the plain RAW image), one video node with a media sink pad; the

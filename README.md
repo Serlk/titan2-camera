@@ -157,7 +157,8 @@ is there:
 - Autofocus: contrast AF on the two rear cameras; lens maps from the module EEPROM, the
   Hi-847 infinity position in `configuration.yaml` is a placeholder.
 - Not done: lens shading tables, calibrated tone/noise settings, hardware H.264 encoding, the
-  hardware ISP (kernel work in development, no frame yet; not used by this user space).
+  hardware ISP (kernel work in development: the replay driver delivers frames with the settings frozen
+  in a captured request, no 3A or auto exposure, no libcamera integration; not used by this user space).
 
 ## Related repositories
 

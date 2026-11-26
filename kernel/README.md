@@ -13,11 +13,17 @@ Since 2026-11-26 it also carries work in progress that the published user space 
 
 - **RAW/YUV engines of the image signal processor** (`drivers/media/platform/mediatek/camraw`,
   board `mt6878-unihertz-titan2-raw.dtb`, EXPERIMENTAL): a driver that replays a captured command
-  queue on the RAW and YUV engines, fed by a second destination of the main camera's CSI port in
-  seninf. **It does not deliver a frame yet** (the first frame overruns the timing generator on its
-  first line). It needs two request dumps, `/lib/firmware/titan2/camraw-start.bin` and
-  `camraw-frame.bin`, captured on your own phone from its original camera software. No dump is
-  part of this repository, and the capture tools are not published yet.
+  queue on both RAW engines (the frame is split between RAW-A and RAW-B) and their YUV engines,
+  fed by a second destination of the main camera's CSI port in seninf. **It delivers frames**: on
+  a lit scene a correct colour 1450x1088 picture (NV21) through the hardware ISP. All processing
+  settings (black level, white balance, colour, sharpening, statistics) are the ones frozen in the
+  captured request: there is no 3A, no auto exposure (exposure and gain are set by hand through
+  the sensor's V4L2 controls), and no libcamera integration. The right edge of a frame shows the
+  line padding (pitch 1472). It needs two request dumps, `/lib/firmware/titan2/camraw-start.bin`
+  and `camraw-frame.bin`, captured on your own phone from its original camera software. No dump
+  is part of this repository and the capture tools are not published, so **without your own
+  dumps this driver is of no use yet**: the board and the module only load, and streaming fails
+  with a missing firmware file.
 - **VCP host driver** (`drivers/soc/mediatek/vcp`, boards `-vcp`, `-vcp-iommu`, EXPERIMENTAL): the
   video companion processor that runs the hardware video codec firmware; the start is not
   working reliably yet, and no video codec uses it.
@@ -29,7 +35,7 @@ The MJPEG streaming fixes of the JPEG encoder are not in this series yet (a late
 
 This directory:
 
-- `patches/`: the series as `git format-patch` files (19 patches):
+- `patches/`: the series as `git format-patch` files (21 patches):
   - `0001-media-dt-bindings-mediatek-Add-MT6878-CAMSV.patch`
   - `0002-media-mediatek-camsv-Add-MT6878-CAMSV-capture-driver.patch`
   - `0003-media-dt-bindings-mediatek-Add-MT6878-seninf.patch`
@@ -49,6 +55,8 @@ This directory:
   - `0017-clk-mediatek-mt6878-cam-Keep-the-camsys-providers-ac.patch`
   - `0018-soc-mediatek-vcp-Build-the-MT6878-VCP-host-driver-nu.patch`
   - `0019-arm64-dts-mediatek-mt6878-titan2-RAW-YUV-engines-raw.patch`
+  - `0020-arm64-dts-mediatek-mt6878-RMS-windows-of-both-RAW-en.patch`
+  - `0021-media-mediatek-camraw-Load-the-start-request-before-.patch`
 - `titan2-camera.config`: the kernel config fragment with these options.
 
 ## Building

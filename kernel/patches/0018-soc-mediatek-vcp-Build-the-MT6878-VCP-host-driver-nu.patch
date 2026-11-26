@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 04:02:43 +0300
-Subject: [PATCH 18/19] soc: mediatek: vcp: Build the MT6878 VCP host driver,
+Subject: [PATCH 18/21] soc: mediatek: vcp: Build the MT6878 VCP host driver,
  numbered starts, start diagnostics
 
 EXPERIMENTAL: whether the VCP firmware comes up on the phone is still

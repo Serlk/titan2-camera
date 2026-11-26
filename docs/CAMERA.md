@@ -135,8 +135,15 @@ itself once such an encoder exists and its "hardware encoding" setting is on.
 
 ## 6. Hardware ISP
 
-The SoC's RAW/YUV image processing engines are not used by this user space. Kernel work on them
-is in development and **does not deliver a frame yet**; nothing in this repository depends on it.
+The SoC's RAW/YUV image processing engines are not used by this user space. The kernel series
+has an experimental driver (`camraw`, board `-raw`) that replays a command queue captured from the
+phone's original camera software on both RAW engines. It **delivers frames**: on a lit scene a
+correct colour 1450x1088 picture comes out of the hardware ISP. Everything the ISP does to the
+picture (black level, white balance, colour, sharpening) is frozen in the captured request; there
+is no 3A, no auto exposure (exposure and gain by hand through the sensor controls) and no libcamera
+integration, and nothing in this repository depends on it. The request dumps it needs are captured
+on your own phone; neither the dumps nor the capture tools are published, so this is developer
+work only for now (see kernel/README.md).
 
 ## 7. Tests on the phone
 
@@ -201,4 +208,4 @@ frames only as too few frames for the duration.
   denoise values.
 - Hi-847 lens infinity position (placeholder in `configuration.yaml`); IMX766 lens sweep.
 - The one-minute recording acceptance; recording with the hardware H.264 encoder (kernel).
-- The hardware ISP (kernel, in development).
+- The hardware ISP: 3A and auto exposure, requests built instead of replayed, libcamera integration.
