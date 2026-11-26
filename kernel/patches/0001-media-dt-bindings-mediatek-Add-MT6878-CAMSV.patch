@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 18:22:43 +0300
-Subject: [PATCH 01/34] media: dt-bindings: mediatek: Add MT6878 CAMSV
+Subject: [PATCH 01/35] media: dt-bindings: mediatek: Add MT6878 CAMSV
 
 CAMSV is the "camera simple" capture engine of the MT6878 camera
 subsystem: it writes sensor interface (seninf) tags straight to memory

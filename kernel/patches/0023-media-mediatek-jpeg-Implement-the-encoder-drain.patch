@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 13:53:39 +0300
-Subject: [PATCH 23/34] media: mediatek: jpeg: Implement the encoder drain
+Subject: [PATCH 23/35] media: mediatek: jpeg: Implement the encoder drain
 
 V4L2_ENC_CMD_STOP is accepted through v4l2_m2m_ioctl_encoder_cmd(), but
 nothing ends the drain: no capture buffer is ever returned with

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 18:25:01 +0300
-Subject: [PATCH 34/34] media: mediatek: camraw: Hold a CPU wake-up latency
+Subject: [PATCH 34/35] media: mediatek: camraw: Hold a CPU wake-up latency
  limit while streaming
 
 The first V4L2 run on a kernel with the deep CPU idle states showed the

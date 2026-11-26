@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 15:12:11 +0300
-Subject: [PATCH 32/34] media: mediatek: camraw: Never hold the lists back,
+Subject: [PATCH 32/35] media: mediatek: camraw: Never hold the lists back,
  recover from dropped frames, black pitch padding
 
 Phone runs with apply_wait: the frame done comes a fixed ~32.7 ms after

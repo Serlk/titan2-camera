@@ -3,7 +3,8 @@
 # Copyright (C) 2026 serlk <22211586+Serlk@users.noreply.github.com>
 #
 # Camera, hardware ISP: first frames of the RAW/YUV engines by replaying captured command queues
-# (driver mtk-camraw-mt6878, board mt6878-unihertz-titan2-raw.dtb, docs/CAMERA.md "Hardware ISP").
+# (driver mtk-camraw-mt6878, board mt6878-unihertz-titan2-all.dtb or its alias -raw, docs/CAMERA.md
+# "Hardware ISP").
 # ON THE PHONE, as root, busybox sh. Needs v4l-utils and the two request dumps
 #   /lib/firmware/titan2/camraw-start.bin   request 1 of a stream (one-time block)
 #   /lib/firmware/titan2/camraw-frame.bin   a steady request of the same mode (picture output)
@@ -46,7 +47,7 @@ die() { echo "!! $*" >&2; exit 1; }
 load() {
 	[ -d /sys/module/mtk_camraw_mt6878 ] || run modprobe mtk-camraw-mt6878 || die "no module mtk-camraw-mt6878"
 	grep -q " /sys/kernel/debug debugfs" /proc/mounts || mount -t debugfs debugfs /sys/kernel/debug
-	[ -d "$DBGFS" ] || die "no $DBGFS: the driver did not bind (board -raw? dmesg | grep camraw)"
+	[ -d "$DBGFS" ] || die "no $DBGFS: the driver did not bind (board -all or -raw of a kernel with the camera series? dmesg | grep camraw)"
 	for p in twin:${TWIN:-1} reapply:${REAPPLY:-} stats_off:${STATS_OFF:-} extra_off:${EXTRA_OFF:-} \
 	    prestart:${PRESTART:-} err_mask:${ERR_MASK:-} cam_mhz:${CAM_MHZ:-} apply_delay_us:${APPLY_DELAY_US:-} \
 	    db_order:${DB_ORDER:-} frame_done:${FRAME_DONE:-} qos_us:${QOS_US:-}; do
@@ -314,5 +315,5 @@ runlist)
 	cat "$MDIR/summary.txt"
 	;;
 *)
-	sed -n '5,26p' "$0"; exit 1 ;;
+	sed -n '5,27p' "$0"; exit 1 ;;
 esac

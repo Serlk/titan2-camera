@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 13:48:30 +0300
-Subject: [PATCH 22/34] media: mediatek: jpeg: End every single-core encoder
+Subject: [PATCH 22/35] media: mediatek: jpeg: End every single-core encoder
  job, with its metadata
 
 The done path of the single-core encoder returns the capture buffer

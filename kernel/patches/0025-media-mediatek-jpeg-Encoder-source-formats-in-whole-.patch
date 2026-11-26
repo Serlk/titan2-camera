@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 13:52:02 +0300
-Subject: [PATCH 25/34] media: mediatek: jpeg: Encoder source formats in whole
+Subject: [PATCH 25/35] media: mediatek: jpeg: Encoder source formats in whole
  MCUs, crop to the asked size
 
 The h_align and v_align values of the encoder's source formats are log2

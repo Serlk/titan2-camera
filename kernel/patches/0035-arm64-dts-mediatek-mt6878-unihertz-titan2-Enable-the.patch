@@ -1,0 +1,257 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 21:00:22 +0300
+Subject: [PATCH 35/35] arm64: dts: mediatek: mt6878-unihertz-titan2: Enable
+ the ISP RAW path on -all
+
+Move the image signal processor path of the -raw test board into the
+camera description included by -all (mt6878-unihertz-titan2-cameras.dtsi):
+
+- larbs 16/17 (RAW-A/YUV-A) and 33/34 (RAW-B/YUV-B),
+- the RAW-A, YUV-A, RAW-B and YUV-B engines, RAW-B as the second engine
+  of RAW-A (mediatek,twin),
+- the second destination of CSI port 2 (IMX766): endpoint@1 of seninf
+  port@5 toward RAW-A, next to the camsv1 endpoint, which stays.
+
+The engines take their power domain and clocks by runtime PM only while
+the RAW video node streams; the YUV engines and the larbs follow through
+device links, so nothing of the path is on at idle.
+
+-raw is now the same as -all and stays for the boot scripts. The new
+-all DTB is byte-identical to the previous -raw DTB. The boards built on
+-all (-all-iommu, -all-ovl34, -charger-diag, -charger-test, -jpeg,
+-sleep, -sleep-disp, -sleep-disp-iommu, -vcp, -vcp-iommu) follow; the
+other boards are unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mediatek/mt6878-unihertz-titan2-all.dts   |  3 +-
+ .../mt6878-unihertz-titan2-cameras.dtsi       | 75 ++++++++++++++++++-
+ .../mediatek/mt6878-unihertz-titan2-raw.dts   | 67 ++---------------
+ 3 files changed, 80 insertions(+), 65 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts
+index 6da4fa48830a..501e50dc5ec6 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-all.dts
+@@ -4,7 +4,8 @@
+  * Same as -all-fb plus the -drm stage, plus the MT6375 charger with the
+  * Type-C port manager (PD sink 5 V / 9 V, host role with VBUS from the
+  * charger's OTG boost) and USB in OTG mode, plus the three cameras on their
+- * CAMSV engines behind the multimedia IOMMU
++ * CAMSV engines behind the multimedia IOMMU and the main camera also
++ * through the RAW and YUV engines of the image signal processor
+  * (mt6878-unihertz-titan2-cameras.dtsi), with the factory device tree
+  * battery limits (2.05 A, CV 4.45 V).
+  *
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi
+index 4ecec599b3a8..1e5839c0e8c8 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-cameras.dtsi
+@@ -1,7 +1,9 @@
+ // SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+ /*
+  * Unihertz Titan 2: the three cameras, each on its own CAMSV engine behind
+- * the MM IOMMU, so user space (libcamera) sees three cameras at once.
++ * the MM IOMMU, so user space (libcamera) sees three cameras at once, and
++ * the main camera (IMX766) also through the RAW and YUV engines of the
++ * image signal processor (see "ISP path" below).
+  * Included by mt6878-unihertz-titan2-all.dts.
+  *
+  *   sensor    bus        CSI port  seninf  mux  cam mux  CAMSV (camsv-id)  larb
+@@ -35,7 +37,9 @@
+  * regulator core. Reset and power down lines are the sensor drivers' GPIOs.
+  *
+  * Paths to memory: camsv1 larb14 -> cam sub-common 1; camsv2 larb13 and
+- * camsv5 larb29 -> cam sub-common 0; both sub-commons -> cam-vcore
++ * camsv5 larb29 -> cam sub-common 0; RAW-A larb16 and YUV-B larb34 -> cam
++ * sub-common 0, YUV-A larb17 and RAW-B larb33 -> cam sub-common 1;
++ * both sub-commons -> cam-vcore
+  * sub-common -> smi-common -> M4U. Every CAMSV
+  * engine is its own media device ("mtk-camsv") with one video node, one
+  * seninf CSI port sub-device and one sensor (plus its lens); the libcamera
+@@ -43,6 +47,20 @@
+  * only when its sensor (and VCM) driver is bound, so the modules can load in
+  * any order (udev loads them all at boot).
+  *
++ * ISP path: CSI port 2 (IMX766) has a second destination, RAW-A, next to
++ * camsv1, so its seninf sub-device has three pads. RAW-A works with RAW-B
++ * as its second engine (mediatek,twin) and each RAW engine with its YUV
++ * engine (mediatek,yuv, in mt6878.dtsi); writers on larbs 16/17 (side A)
++ * and 33/34 (side B). The RAW video node (mtk-camraw driver) is a media
++ * device of its own, outside the CAMSV graph; the sensor and the CSI port
++ * are set up through the camsv1 media device. Nothing of this path is
++ * powered at idle: the RAW engine takes its domain (CAM_SUBA, CAM_SUBB for
++ * side B) and clocks by runtime PM only while its node streams, its YUV
++ * engine and the larbs follow by device links. The driver loads the
++ * request files /lib/firmware/titan2/camraw-start.bin and camraw-frame.bin
++ * when its node is opened; without them the RAW node cannot stream and the
++ * CAMSV path is unchanged.
++ *
+  * The S5KGD1SP needs its sensor firmware patch, /lib/firmware/s5kgd1sp_tnp.bin,
+  * at stream start. The file is not distributed; the user has to supply it
+  * (format: drivers/media/i2c/s5kgd1sp.c).
+@@ -168,6 +186,23 @@ &larb29 {
+ 	status = "okay";
+ };
+ 
++/* ISP path: RAW-A (16) and YUV-A (17), RAW-B (33) and YUV-B (34) */
++&larb16 {
++	status = "okay";
++};
++
++&larb17 {
++	status = "okay";
++};
++
++&larb33 {
++	status = "okay";
++};
++
++&larb34 {
++	status = "okay";
++};
++
+ &m4u {
+ 	status = "okay";
+ };
+@@ -453,6 +488,7 @@ imx766_out: endpoint {
+ 
+ /* ------------------------------------------------------------------ */
+ /* seninf: CSI ports 0..2 in, outputs 0..2 to camsv5, camsv2, camsv1    */
++/* (output 2 also to RAW-A)                                             */
+ 
+ &seninf {
+ 	status = "okay";
+@@ -500,9 +536,17 @@ seninf_csi1_out: endpoint {
+ };
+ 
+ &seninf_port5 {
++	#address-cells = <1>;
++	#size-cells = <0>;
++
+ 	seninf_csi2_out: endpoint {
+ 		remote-endpoint = <&camsv1_in>;
+ 	};
++
++	seninf_csi2_raw: endpoint@1 {
++		reg = <1>;
++		remote-endpoint = <&cam_raw_a_in>;
++	};
+ };
+ 
+ /* ------------------------------------------------------------------ */
+@@ -537,3 +581,30 @@ camsv5_in: endpoint {
+ 		};
+ 	};
+ };
++
++/* ------------------------------------------------------------------ */
++/* ISP path: RAW and YUV engines of both sides (iommus in mt6878.dtsi) */
++
++&cam_raw_a {
++	status = "okay";
++	mediatek,twin = <&cam_raw_b>;
++
++	port {
++		cam_raw_a_in: endpoint {
++			remote-endpoint = <&seninf_csi2_raw>;
++		};
++	};
++};
++
++&cam_yuv_a {
++	status = "okay";
++};
++
++/* second engine of RAW-A: no input of its own */
++&cam_raw_b {
++	status = "okay";
++};
++
++&cam_yuv_b {
++	status = "okay";
++};
+diff --git a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-raw.dts b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-raw.dts
+index 9c575e3cdef5..4ce4de6d9020 100644
+--- a/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-raw.dts
++++ b/arch/arm64/boot/dts/mediatek/mt6878-unihertz-titan2-raw.dts
+@@ -1,70 +1,13 @@
+ // SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+ /*
+  * Titan 2: TEST board, -all plus the RAW and YUV engines of the image
+- * signal processor for the replay of captured command queues
+- * (the mtk-camraw-mt6878 driver): larbs 16/17 (side A) and 33/34 (side B) behind
+- * the M4U, the engine nodes of both sides with RAW-B as the second engine
+- * of RAW-A, and a second destination of CSI port 2 (the main IMX766
+- * camera) toward RAW-A next to its CAMSV engine.
++ * signal processor (the mtk-camraw-mt6878 driver) with the second
++ * destination of CSI port 2 (the main IMX766 camera) toward RAW-A.
+  *
+- * The CSI port of the main camera has three pads on this board; its media
+- * device is otherwise the one of -all, and the sensor mode is set there.
+- * The RAW video node is outside the media graph. Nothing is powered or
+- * written until that node streams, and it needs the request dumps
+- * /lib/firmware/titan2/camraw-start.bin and camraw-frame.bin. Side B is
+- * powered only with the module parameter twin=1.
+- *
+- * Boot it as a one-shot entry, -all afterwards.
++ * The -all board now carries that path itself
++ * (mt6878-unihertz-titan2-cameras.dtsi), so this board is the same as
++ * -all. It stays for the boot scripts and may be removed later.
+  *
+  * Copyright (c) 2026 serlk <22211586+Serlk@users.noreply.github.com>
+  */
+ #include "mt6878-unihertz-titan2-all.dts"
+-
+-&larb16 {
+-	status = "okay";
+-};
+-
+-&larb17 {
+-	status = "okay";
+-};
+-
+-&larb33 {
+-	status = "okay";
+-};
+-
+-&larb34 {
+-	status = "okay";
+-};
+-
+-&cam_yuv_a {
+-	status = "okay";
+-};
+-
+-&cam_yuv_b {
+-	status = "okay";
+-};
+-
+-&cam_raw_b {
+-	status = "okay";
+-};
+-
+-&cam_raw_a {
+-	status = "okay";
+-	mediatek,twin = <&cam_raw_b>;
+-
+-	port {
+-		cam_raw_a_in: endpoint {
+-			remote-endpoint = <&seninf_csi2_raw>;
+-		};
+-	};
+-};
+-
+-&seninf_port5 {
+-	#address-cells = <1>;
+-	#size-cells = <0>;
+-
+-	seninf_csi2_raw: endpoint@1 {
+-		reg = <1>;
+-		remote-endpoint = <&cam_raw_a_in>;
+-	};
+-};
+-- 
+2.56.1
+

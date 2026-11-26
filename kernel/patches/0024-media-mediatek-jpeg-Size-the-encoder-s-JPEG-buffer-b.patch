@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 13:50:47 +0300
-Subject: [PATCH 24/34] media: mediatek: jpeg: Size the encoder's JPEG buffer
+Subject: [PATCH 24/35] media: mediatek: jpeg: Size the encoder's JPEG buffer
  by the frame
 
 The JPEG (capture) buffer of the encoder gets the size the client asks

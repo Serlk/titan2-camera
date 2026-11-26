@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 14:04:26 +0300
-Subject: [PATCH 29/34] media: mediatek: camraw: Both RAW engines by default
+Subject: [PATCH 29/35] media: mediatek: camraw: Both RAW engines by default
 
 The captured requests split the frame between RAW-A and RAW-B, and RAW-A
 alone overruns on the first line (phone run of 26.11, side A only). twin=0

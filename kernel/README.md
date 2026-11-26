@@ -12,7 +12,8 @@ nvmem device, the device tree bindings, and the camera nodes of
 Since 2026-11-26 it also carries work in progress that the published user space does not use:
 
 - **RAW/YUV engines of the image signal processor** (`drivers/media/platform/mediatek/camraw`,
-  board `mt6878-unihertz-titan2-raw.dtb`, EXPERIMENTAL): a driver that replays a captured command
+  EXPERIMENTAL; since 2026-11-27 enabled on the default board `mt6878-unihertz-titan2-all.dtb`,
+  `-raw` is now the same as `-all` and stays as an alias): a driver that replays a captured command
   queue on both RAW engines (the frame is split between RAW-A and RAW-B) and their YUV engines,
   fed by a second destination of the main camera's CSI port in seninf. **It delivers frames**: on
   a lit scene a correct colour 1450x1088 picture (NV21) through the hardware ISP. All processing
@@ -27,7 +28,9 @@ Since 2026-11-26 it also carries work in progress that the published user space 
   and `camraw-frame.bin`, captured on your own phone from its original camera software with
   `scripts/camraw-capture.sh` of this repository (README.md, "Hardware ISP replay"). No dump is
   part of this repository; without them the module loads, but streaming fails with a missing
-  firmware file.
+  firmware file, and libcamera keeps the main camera on its CAMSV path. The engines take their
+  power domain and clocks only while the RAW video node streams (runtime PM; the YUV engines and
+  the larbs follow through device links), so nothing of the path is on at idle.
 - **VCP host driver** (`drivers/soc/mediatek/vcp`, boards `-vcp`, `-vcp-iommu`, EXPERIMENTAL): the
   video companion processor that runs the hardware video codec firmware; the start is not
   working reliably yet, and no video codec uses it.
@@ -42,7 +45,7 @@ the phone, but MJPEG recording through them has not been tested there yet.
 
 This directory:
 
-- `patches/`: the series as `git format-patch` files (34 patches):
+- `patches/`: the series as `git format-patch` files (35 patches):
   - `0001-media-dt-bindings-mediatek-Add-MT6878-CAMSV.patch`
   - `0002-media-mediatek-camsv-Add-MT6878-CAMSV-capture-driver.patch`
   - `0003-media-dt-bindings-mediatek-Add-MT6878-seninf.patch`
@@ -77,6 +80,7 @@ This directory:
   - `0032-media-mediatek-camraw-Never-hold-the-lists-back-reco.patch`
   - `0033-media-mediatek-camraw-Hand-buffers-back-from-the-IRQ.patch`
   - `0034-media-mediatek-camraw-Hold-a-CPU-wake-up-latency-lim.patch`
+  - `0035-arm64-dts-mediatek-mt6878-unihertz-titan2-Enable-the.patch`
 - `titan2-camera.config`: the kernel config fragment with these options.
 
 ## Building

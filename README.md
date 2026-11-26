@@ -6,8 +6,9 @@ User-space camera support for mainline Linux on the **Unihertz Titan 2** (MediaT
 patches for [libcamera](https://libcamera.org/) (simple pipeline handler + software ISP), the
 libcamera, WirePlumber and udev configuration, an Alpine package build, and test scripts. Ordinary
 applications (`cam`, `qcam`, GNOME Snapshot, GStreamer `libcamerasrc`, PipeWire and the camera
-portal) use the cameras through libcamera and its software ISP; the SoC's hardware ISP is not
-used. Design, state and test procedures: [docs/CAMERA.md](docs/CAMERA.md).
+portal) use the cameras through libcamera and its software ISP. The SoC's hardware ISP is used
+only with request dumps captured on your own phone (experimental, "Hardware ISP replay" below);
+the default board `all` carries it since 2026-11-27. Design, state and test procedures: [docs/CAMERA.md](docs/CAMERA.md).
 
 > **Experimental.** The three cameras deliver pictures and 1080p30 video with sound on the phone,
 > but colour and lens shading are not calibrated (see below).
@@ -149,8 +150,9 @@ is there:
 
 ## Hardware ISP replay (experimental, for developers)
 
-The kernel series has a driver for the SoC's RAW/YUV engines (`mtk-camraw-mt6878`, board
-`mt6878-unihertz-titan2-raw.dtb`) that replays a command queue captured from the phone's original
+The kernel series has a driver for the SoC's RAW/YUV engines (`mtk-camraw-mt6878`, enabled on the
+default board `mt6878-unihertz-titan2-all.dtb` since 2026-11-27; `-raw` is the same and stays as an
+alias) that replays a command queue captured from the phone's original
 camera software. It produces a correct colour picture through the hardware ISP, but everything the
 ISP does is frozen in the captured request (black level, white balance, colour, sharpening): **no
 3A of its own**. With libcamera patches 0027/0028 the main camera runs through it in libcamera
@@ -192,9 +194,8 @@ The kernel must carry this repository's kernel series with `CONFIG_VIDEO_MEDIATE
 
 ### 3. Run
 
-Boot the `-raw` board as a one-shot entry. Keep it among the first 12 entries of the boot menu
-(older titan2-boot packs show only 12), e.g. `VARIANTS="all all-fb full raw"` for titan2-tools'
-`scripts/linux-update.sh`; boot `all` again afterwards. Then, as root on the phone, copy
+Boot the default `all` entry (a kernel with this series from 2026-11-27 on; with an older series
+boot the `-raw` board as a one-shot entry). Then, as root on the phone, copy
 `scripts/camera-raw-replay-test.sh` there and run:
 
     sh camera-raw-replay-test.sh check            # module, nodes, dumps, the driver's reading of them
@@ -239,6 +240,9 @@ frames were lost.
   `openh264enc`; the one-minute acceptance run is still open. No hardware video encoder yet.
 - Autofocus: contrast AF on the two rear cameras; lens maps from the module EEPROM, the
   Hi-847 infinity position in `configuration.yaml` is a placeholder.
+- Hardware ISP: the RAW/YUV engines are enabled on the default `all` board (since 2026-11-27;
+  `-raw` is the same). With your own dumps installed libcamera picks the `mtkcamraw` pipeline
+  for the main camera on `all`; without them the main camera stays on the software ISP.
 - Not done: lens shading tables, calibrated tone/noise settings, hardware H.264 encoding, the
   hardware ISP beyond the replay (the replay driver runs the main camera in libcamera with auto
   exposure, but every ISP setting is frozen in a captured request and the dumps must come from

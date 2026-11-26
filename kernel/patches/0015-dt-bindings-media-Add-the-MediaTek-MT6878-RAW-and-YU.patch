@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 04:02:24 +0300
-Subject: [PATCH 15/34] dt-bindings: media: Add the MediaTek MT6878 RAW and YUV
+Subject: [PATCH 15/35] dt-bindings: media: Add the MediaTek MT6878 RAW and YUV
  engines
 
 The RAW engine of the image signal processor and the YUV engine with the

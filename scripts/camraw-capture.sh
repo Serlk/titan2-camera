@@ -151,7 +151,7 @@ echo "$got dumps in $D"
 echo
 python3 "$ROOT/scripts/camraw-dump-info.py" --table "$D"/camraw-p"$PIPE"-*.bin | tee "$D/table.txt" || true
 echo
-echo "for the phone under Linux (board -raw): a start request and a steady request with the common split"
+echo "for the phone under Linux (board -all): a start request and a steady request with the common split"
 echo "0-2079 / 1984-4095, e.g."
 echo "  scp $D/camraw-p$PIPE-1.bin root@<phone>:/lib/firmware/titan2/camraw-start.bin"
 echo "  scp $D/camraw-p$PIPE-<steady>.bin root@<phone>:/lib/firmware/titan2/camraw-frame.bin"

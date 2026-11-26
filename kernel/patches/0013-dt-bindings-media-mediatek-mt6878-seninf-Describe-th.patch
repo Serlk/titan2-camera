@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 04:02:24 +0300
-Subject: [PATCH 13/34] dt-bindings: media: mediatek,mt6878-seninf: Describe
+Subject: [PATCH 13/35] dt-bindings: media: mediatek,mt6878-seninf: Describe
  the RAW engine endpoint
 
 An output port may carry a second endpoint (endpoint 1) toward a RAW

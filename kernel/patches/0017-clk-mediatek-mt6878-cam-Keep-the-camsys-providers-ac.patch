@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 04:02:25 +0300
-Subject: [PATCH 17/34] clk: mediatek: mt6878-cam: Keep the camsys providers
+Subject: [PATCH 17/35] clk: mediatek: mt6878-cam: Keep the camsys providers
  active through system sleep
 
 At every system resume the CAM_MAIN power domain failed to come back

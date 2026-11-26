@@ -136,7 +136,8 @@ itself once such an encoder exists and its "hardware encoding" setting is on.
 ## 6. Hardware ISP
 
 Without request dumps the SoC's RAW/YUV image processing engines are not used by this user space.
-The kernel series has an experimental driver (`camraw`, board `-raw`) that replays a command queue captured from the
+The kernel series has an experimental driver (`camraw`, on the default board `-all` since
+2026-11-27, `-raw` is the same) that replays a command queue captured from the
 phone's original camera software on both RAW engines. It **delivers frames**: on a lit scene a
 correct colour 1450x1088 picture comes out of the hardware ISP. You can reproduce this with your
 own capture: `scripts/camraw-capture.sh` on the original Android, `scripts/camraw-dump-info.py` on
