@@ -31,10 +31,17 @@ configuration:
           default: 1.0
         # S5KGD1SP (front): fixed focus, no lens.
   software_isp:
-    # cpu: verified on the phone (1080p, 30 fps). gpu (EGL on panthor): denoise/sharpening
-    # stage, lens shading, full-size output from each sensor mode; not yet the default.
-    # LIBCAMERA_SOFTISP_MODE=gpu|cpu overrides this for one run.
-    mode: cpu
+    # cpu: verified on the phone (1080p, 30 fps, ~22 % of the 8 CPUs in wireplumber). gpu (EGL
+    # surfaceless on panthor/panfrost, inside the wireplumber process): lens shading, tone curve,
+    # denoise/sharpening (patches 0013/0020/0022) and full-size output from each sensor mode; the
+    # CPU is then free for the video encoder. Measured on the phone: 1080p at 30 fps for 300
+    # frames, flat memory use, no EGL errors, clearly less CPU than the CPU path. `cpu` stays
+    # the fallback.
+    # NOTE libcamera 0.7.1 reads this key only: there is no LIBCAMERA_SOFTISP_MODE environment
+    # override, and no automatic CPU fallback when EGL fails to initialise. Edit this file (or
+    # ~/.config/libcamera/configuration.yaml, which wins if present) to switch.
+    mode: gpu
+    # mode: cpu   # the fallback without EGL
     # CPU debayer threads (default 2); the Dimensity 7300 has 4 big cores
     threads: 3
 ...
