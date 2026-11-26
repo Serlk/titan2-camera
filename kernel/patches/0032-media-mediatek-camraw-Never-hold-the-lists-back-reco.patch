@@ -1,0 +1,180 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 15:12:11 +0300
+Subject: [PATCH 32/34] media: mediatek: camraw: Never hold the lists back,
+ recover from dropped frames, black pitch padding
+
+Phone runs with apply_wait: the frame done comes a fixed ~32.7 ms after
+its start of frame (readout 3072 x 10.49 us plus ~0.5 ms), so with the
+shortest vertical blanking (1.09 ms) it lands within 0.05..0.6 ms of the
+next start of frame and sometimes after it. Holding the next lists back
+for such a late done made the engine drop the frame (DROP_FRAME_EN: no
+lists started for it), a dropped frame brings neither a done nor a start
+of frame, and the held-back lists never came: under libcamera the stream
+stopped with a CQ trigger delay and SOF drop at every frame.
+
+- apply_wait defaults to 0: the lists are started at every start of
+  frame. A late done is still attributed to its own frame.
+- On a dropped frame (TG_SOF_DROP without a start of frame) held-back
+  lists are started at once; dropped frames are counted.
+- buf_prepare fills the columns between the picture width and the line
+  pitch with black: the writers never touch them, and consumers that
+  take the pitch as the width show them.
+
+The real cure for the late dones is more vertical blanking (user space:
+the libcamera IPA keeps at least 300 lines on the IMX766).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/mediatek/camraw/mtk-camraw-drv.c | 62 ++++++++++++++++---
+ .../platform/mediatek/camraw/mtk-camraw.h     |  1 +
+ 2 files changed, 54 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+index b381957b9d70..ded33962dcd9 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+@@ -123,9 +123,9 @@ module_param(prestart, bool, 0644);
+ MODULE_PARM_DESC(prestart, "Also apply the per-frame request before the viewfinder is switched on, after the start request");
+ 
+ 
+-static bool apply_wait = true;
++static bool apply_wait;
+ module_param(apply_wait, bool, 0644);
+-MODULE_PARM_DESC(apply_wait, "Hold the per-frame lists back until the frame before reports its done (default 1; 0: always at the start of frame)");
++MODULE_PARM_DESC(apply_wait, "Hold the per-frame lists back until the frame before reports its done (0, default: always at the start of frame; 1 stalled the stream: with DROP_FRAME_EN a frame without lists is dropped)");
+ 
+ static unsigned int err_mask = 1;
+ module_param(err_mask, uint, 0644);
+@@ -441,11 +441,11 @@ static void camraw_show_counters(struct mtk_camraw *raw, struct seq_file *m,
+ 	err_bits = raw->err_bits;
+ 	spin_unlock_irqrestore(&raw->irq_lock, flags);
+ 
+-	CAMRAW_OUT("lists started %u (per-frame request %u times), main list done %u, sub list done %u, start of frame %u, pass 1 done %u, SW pass 1 done (frame done) %u, YUVO_R1 done %u, frames delivered %u, without a buffer %u, buffers lost %u, frame done after the next start of frame %u, applications held back %u",
++	CAMRAW_OUT("lists started %u (per-frame request %u times), main list done %u, sub list done %u, start of frame %u, pass 1 done %u, SW pass 1 done (frame done) %u, YUVO_R1 done %u, frames delivered %u, without a buffer %u, buffers lost %u, frame done after the next start of frame %u, applications held back %u, frames dropped by the engine %u",
+ 		   raw->n_applied, raw->n_frame_applied, n_main, n_sub, n_sof,
+ 		   n_p1, raw->n_swp1, n_yuvo, raw->n_frames,
+ 		   raw->n_no_buffer_frames, raw->n_buf_errors, raw->n_late_done,
+-		   raw->n_deferred);
++		   raw->n_deferred, raw->n_sof_drop);
+ 	camraw_dmain_text(dline, sizeof(dline), raw->int8_bits, true);
+ 	CAMRAW_OUT("input underflow seen in interrupts (INT8):%s", dline);
+ 	camraw_dmain_text(dline, sizeof(dline), raw->int3_bits, false);
+@@ -703,6 +703,7 @@ static int camraw_dmain_text(char *buf, size_t size, u32 v, bool underflow)
+ 
+ static void camraw_frame_start(struct mtk_camraw *raw);
+ static void camraw_frame_end(struct mtk_camraw *raw);
++static void camraw_frame_dropped(struct mtk_camraw *raw);
+ 
+ static irqreturn_t camraw_irq_common(struct mtk_camraw *raw, unsigned int line,
+ 				     void __iomem *base, int irq)
+@@ -790,6 +791,8 @@ static irqreturn_t camraw_irq_common(struct mtk_camraw *raw, unsigned int line,
+ 			camraw_frame_end(raw);
+ 		if (st[1] & CAMCTL_INT_TG_SOF)
+ 			camraw_frame_start(raw);
++		else if (st[1] & CAMCTL_INT_TG_SOF_DROP)
++			camraw_frame_dropped(raw);
+ 	}
+ 
+ 	return IRQ_WAKE_THREAD;
+@@ -834,6 +837,22 @@ static u32 camraw_probe_off(struct mtk_camraw *raw, unsigned int i)
+ 
+ #define CAMRAW_NUM_PROBES		(2 * CAMRAW_PICTURE_PLANES)
+ 
++/* luma 16 and neutral chroma in the pitch columns right of the picture */
++static void camraw_pad_fill(struct mtk_camraw *raw, u8 *vaddr)
++{
++	u32 pad = raw->stride - raw->width, line;
++	u8 *p;
++
++	if (!vaddr || !pad)
++		return;
++	for (line = 0, p = vaddr + raw->width; line < raw->height;
++	     line++, p += raw->stride)
++		memset(p, 16, pad);
++	for (line = 0, p = vaddr + raw->pic_size[0] + raw->width;
++	     line < raw->height / 2; line++, p += raw->stride)
++		memset(p, 128, pad);
++}
++
+ static void camraw_probe_fill(struct mtk_camraw *raw, u8 *vaddr)
+ {
+ 	unsigned int i;
+@@ -991,11 +1010,14 @@ static void camraw_frame_end(struct mtk_camraw *raw)
+ /*
+  * Hard IRQ, start of frame. The application made at the previous start of
+  * frame is now in effect (double buffered registers); the next one is
+- * made at once, well inside the command queue start period - unless the
+- * frame before has not reported its done yet: lists started while the
+- * engine still finishes a frame were seen to end in a CQ trigger delay
+- * (the long first frames of a stream). Then the application waits for
+- * that done (apply_wait), at most until the next start of frame.
++ * made at once, well inside the command queue start period.
++ *
++ * The frame done comes about 0.5 ms after the last line is read, so with
++ * the shortest vertical blanking it falls right at the next start of frame
++ * and sometimes after it. Such a late done is attributed to its own frame.
++ * The application is not held back for it by default (apply_wait): the
++ * engine drops a frame for which no list was started (DROP_FRAME_EN), and
++ * a dropped frame brings neither a done nor a start of frame.
+  */
+ static void camraw_frame_start(struct mtk_camraw *raw)
+ {
+@@ -1059,6 +1081,21 @@ static void camraw_frame_start(struct mtk_camraw *raw)
+ 	}
+ }
+ 
++/*
++ * Hard IRQ, the engine dropped a frame (TG_SOF_DROP): no start of frame
++ * comes for it. An application held back for a done is made now, or the
++ * stream would stall: every later frame would be dropped for want of
++ * lists.
++ */
++static void camraw_frame_dropped(struct mtk_camraw *raw)
++{
++	raw->n_sof_drop++;
++	if (raw->apply_deferred) {
++		raw->apply_deferred = false;
++		camraw_apply_frame(raw);
++	}
++}
++
+ static irqreturn_t camraw_raw_thread(int irq, void *data)
+ {
+ 	struct mtk_camraw *raw = data;
+@@ -1599,6 +1636,7 @@ static int camraw_stream_start(struct mtk_camraw *raw)
+ 	raw->apply_deferred = false;
+ 	raw->n_late_done = 0;
+ 	raw->n_deferred = 0;
++	raw->n_sof_drop = 0;
+ 	raw->n_applied = 0;
+ 	raw->n_frame_applied = 0;
+ 	raw->n_sof_log = 0;
+@@ -1759,6 +1797,12 @@ static int camraw_buf_prepare(struct vb2_buffer *vb)
+ 
+ 	if (vb2_plane_size(vb, 0) < raw->sizeimage)
+ 		return -EINVAL;
++	/*
++	 * The writers leave the columns between the picture width and the
++	 * line pitch alone. Consumers that take the pitch as the width (the
++	 * libcamera handler offers it so by default) show them: black.
++	 */
++	camraw_pad_fill(raw, vb2_plane_vaddr(vb, 0));
+ 	/*
+ 	 * The first picture is checked for what the writers left. Here, not
+ 	 * at queueing: the cache is cleaned for the device after this.
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw.h b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+index 3fa9f7f5386a..c84c284664f7 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw.h
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+@@ -198,6 +198,7 @@ struct mtk_camraw {
+ 	bool apply_deferred;
+ 	unsigned int n_late_done;
+ 	unsigned int n_deferred;
++	unsigned int n_sof_drop;
+ 	unsigned int n_no_buffer_frames;
+ 	unsigned int n_buf_errors;
+ 	bool probe_done;
+-- 
+2.56.1
+

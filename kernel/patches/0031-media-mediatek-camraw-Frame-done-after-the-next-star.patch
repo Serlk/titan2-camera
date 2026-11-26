@@ -1,0 +1,297 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 14:41:12 +0300
+Subject: [PATCH 31/34] media: mediatek: camraw: Frame done after the next
+ start of frame
+
+The one error of the first V4L2 run with the hard-IRQ timing was a CQ
+trigger delay (INT b18) 0.13 ms after the second start of frame, right
+after the per-frame lists were started for frame 3; there were 13 starts
+of frame and 12 frame dones, and the first frames of a stream are long.
+The frame done of frame 1 most likely came after the start of frame 2,
+so the lists were started while the engine was still finishing a frame.
+The same case also completed the wrong buffer: a late done was taken for
+the frame that had just started.
+
+- A frame done that comes after the next start of frame now ends the
+  frame before (its own buffer, sequence and time stamp).
+- While that done is outstanding, the per-frame application of the new
+  start of frame is held back until it arrives (apply_wait, default on),
+  at most until the next start of frame; a frame whose done never comes
+  returns its buffer with an error.
+- The start-of-frame log records each frame's done time; the counters
+  show late dones and held-back applications, so the next run shows
+  whether this was the cause.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/mediatek/camraw/mtk-camraw-drv.c | 129 ++++++++++++++----
+ .../platform/mediatek/camraw/mtk-camraw.h     |  10 ++
+ 2 files changed, 109 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+index 926f949f638d..b381957b9d70 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+@@ -123,6 +123,10 @@ module_param(prestart, bool, 0644);
+ MODULE_PARM_DESC(prestart, "Also apply the per-frame request before the viewfinder is switched on, after the start request");
+ 
+ 
++static bool apply_wait = true;
++module_param(apply_wait, bool, 0644);
++MODULE_PARM_DESC(apply_wait, "Hold the per-frame lists back until the frame before reports its done (default 1; 0: always at the start of frame)");
++
+ static unsigned int err_mask = 1;
+ module_param(err_mask, uint, 0644);
+ MODULE_PARM_DESC(err_mask,
+@@ -437,10 +441,11 @@ static void camraw_show_counters(struct mtk_camraw *raw, struct seq_file *m,
+ 	err_bits = raw->err_bits;
+ 	spin_unlock_irqrestore(&raw->irq_lock, flags);
+ 
+-	CAMRAW_OUT("lists started %u (per-frame request %u times), main list done %u, sub list done %u, start of frame %u, pass 1 done %u, SW pass 1 done (frame done) %u, YUVO_R1 done %u, frames delivered %u, without a buffer %u, buffers lost %u",
++	CAMRAW_OUT("lists started %u (per-frame request %u times), main list done %u, sub list done %u, start of frame %u, pass 1 done %u, SW pass 1 done (frame done) %u, YUVO_R1 done %u, frames delivered %u, without a buffer %u, buffers lost %u, frame done after the next start of frame %u, applications held back %u",
+ 		   raw->n_applied, raw->n_frame_applied, n_main, n_sub, n_sof,
+ 		   n_p1, raw->n_swp1, n_yuvo, raw->n_frames,
+-		   raw->n_no_buffer_frames, raw->n_buf_errors);
++		   raw->n_no_buffer_frames, raw->n_buf_errors, raw->n_late_done,
++		   raw->n_deferred);
+ 	camraw_dmain_text(dline, sizeof(dline), raw->int8_bits, true);
+ 	CAMRAW_OUT("input underflow seen in interrupts (INT8):%s", dline);
+ 	camraw_dmain_text(dline, sizeof(dline), raw->int3_bits, false);
+@@ -456,10 +461,10 @@ static void camraw_show_counters(struct mtk_camraw *raw, struct seq_file *m,
+ 			   q[i].w1c_tried ? ", burst: status written back" : "",
+ 			   q[i].storm ? ", LINE SWITCHED OFF" : "");
+ 	for (i = 0; i < min(raw->n_sof_log, CAMRAW_SOF_LOG); i++)
+-		CAMRAW_OUT("start of frame %u: %u us after viewfinder on, after %u per-frame applications, frame number 0x%x latched 0x%x, frame size 0x%08x",
++		CAMRAW_OUT("start of frame %u: %u us after viewfinder on, after %u per-frame applications, frame number 0x%x latched 0x%x, frame size 0x%08x, done at %u us",
+ 			   i + 1, raw->sof_log[i].t_us, raw->sof_log[i].applied,
+ 			   raw->sof_log[i].seq, raw->sof_log[i].seq_inner,
+-			   raw->sof_log[i].frmsize);
++			   raw->sof_log[i].frmsize, raw->sof_log[i].done_us);
+ 	if (raw->err_us)
+ 		CAMRAW_OUT("first error interrupt %u us after viewfinder on", raw->err_us);
+ }
+@@ -877,13 +882,13 @@ static void camraw_probe_report(struct mtk_camraw *raw)
+ 
+ static void camraw_buf_finish(struct mtk_camraw *raw,
+ 			      struct mtk_camraw_buffer *buf,
+-			      enum vb2_buffer_state state)
++			      enum vb2_buffer_state state, u32 frame, u64 ns)
+ {
+ 	if (state == VB2_BUF_STATE_DONE) {
+ 		vb2_set_plane_payload(&buf->vb.vb2_buf, 0, raw->sizeimage);
+ 		buf->vb.field = V4L2_FIELD_NONE;
+-		buf->vb.sequence = raw->inflight_frame;
+-		buf->vb.vb2_buf.timestamp = raw->inflight_ns;
++		buf->vb.sequence = frame;
++		buf->vb.vb2_buf.timestamp = ns;
+ 		if (!raw->probe_done)
+ 			camraw_probe_check(raw, vb2_plane_vaddr(&buf->vb.vb2_buf, 0),
+ 					   buf->dma);
+@@ -892,6 +897,28 @@ static void camraw_buf_finish(struct mtk_camraw *raw,
+ 	vb2_buffer_done(&buf->vb.vb2_buf, state);
+ }
+ 
++/* hard IRQ: hand back the buffer of application @k (0: the start request, none) */
++static void camraw_finish_app(struct mtk_camraw *raw, unsigned int k,
++			      enum vb2_buffer_state state, u32 frame, u64 ns)
++{
++	struct mtk_camraw_buffer *buf;
++
++	if (!k)
++		return;
++	spin_lock(&raw->buf_lock);
++	buf = raw->app_buf[k % CAMRAW_APP_RING];
++	raw->app_buf[k % CAMRAW_APP_RING] = NULL;
++	spin_unlock(&raw->buf_lock);
++	if (buf)
++		camraw_buf_finish(raw, buf, state, frame, ns);
++}
++
++static void camraw_log_done(struct mtk_camraw *raw, u32 frame)
++{
++	if (frame < CAMRAW_SOF_LOG)
++		raw->sof_log[frame].done_us = camraw_us_since_vf(raw) ? : 1;
++}
++
+ /*
+  * Program the next frame: application j of the per-frame request, from
+  * copy j % 2, with the picture planes in the next queued buffer (or in the
+@@ -935,48 +962,78 @@ static void camraw_apply_frame(struct mtk_camraw *raw)
+ 	raw->n_frame_applied = j;
+ }
+ 
+-/* hard IRQ, frame done: the picture of the frame in flight is complete */
++/*
++ * Hard IRQ, frame done (SW_PASS1_DONE). Normally it ends the frame in
++ * flight. When it comes after the next start of frame, it ends the frame
++ * before, and the application that start of frame held back is made now.
++ */
+ static void camraw_frame_end(struct mtk_camraw *raw)
+ {
+-	unsigned int k = raw->inflight;
+-	struct mtk_camraw_buffer *buf;
+-
+-	if (frame_done != 0 || !k)
++	if (raw->late_pending) {
++		raw->late_pending = false;
++		camraw_log_done(raw, raw->late_frame);
++		if (frame_done == 0)
++			camraw_finish_app(raw, raw->late_app, VB2_BUF_STATE_DONE,
++					  raw->late_frame, raw->late_ns);
++		if (raw->apply_deferred) {
++			raw->apply_deferred = false;
++			camraw_apply_frame(raw);
++		}
+ 		return;
+-	spin_lock(&raw->buf_lock);
+-	buf = raw->app_buf[k % CAMRAW_APP_RING];
+-	raw->app_buf[k % CAMRAW_APP_RING] = NULL;
+-	spin_unlock(&raw->buf_lock);
+-	if (buf)
+-		camraw_buf_finish(raw, buf, VB2_BUF_STATE_DONE);
++	}
++	raw->inflight_done = true;
++	camraw_log_done(raw, raw->inflight_frame);
++	if (frame_done == 0)
++		camraw_finish_app(raw, raw->inflight, VB2_BUF_STATE_DONE,
++				  raw->inflight_frame, raw->inflight_ns);
+ }
+ 
+ /*
+  * Hard IRQ, start of frame. The application made at the previous start of
+  * frame is now in effect (double buffered registers); the next one is
+- * made at once, well inside the command queue start period.
++ * made at once, well inside the command queue start period - unless the
++ * frame before has not reported its done yet: lists started while the
++ * engine still finishes a frame were seen to end in a CQ trigger delay
++ * (the long first frames of a stream). Then the application waits for
++ * that done (apply_wait), at most until the next start of frame.
+  */
+ static void camraw_frame_start(struct mtk_camraw *raw)
+ {
+ 	struct v4l2_event ev = { .type = V4L2_EVENT_FRAME_SYNC };
+-	struct mtk_camraw_buffer *buf = NULL;
+ 	struct mtk_camraw_sof *log;
+ 	unsigned int k = raw->inflight;
++	bool applied = false;
+ 
+-	if (frame_done == 1 && k) {
++	if (raw->late_pending) {
++		/* a whole frame without the done of the one before: lost */
++		camraw_finish_app(raw, raw->late_app, VB2_BUF_STATE_ERROR, 0, 0);
++		raw->late_pending = false;
++		raw->n_buf_errors++;
++	}
++	if (raw->apply_deferred) {
++		/* held back for a done that never came: for this frame now */
++		raw->apply_deferred = false;
++		camraw_apply_frame(raw);
++		applied = true;
++	}
++
++	if (frame_done == 1) {
+ 		/* the earlier rule: the frame before this one is complete */
+-		spin_lock(&raw->buf_lock);
+-		buf = raw->app_buf[k % CAMRAW_APP_RING];
+-		raw->app_buf[k % CAMRAW_APP_RING] = NULL;
+-		spin_unlock(&raw->buf_lock);
+-		if (buf)
+-			camraw_buf_finish(raw, buf, VB2_BUF_STATE_DONE);
++		camraw_finish_app(raw, k, VB2_BUF_STATE_DONE, raw->inflight_frame,
++				  raw->inflight_ns);
++	} else if (!raw->inflight_done) {
++		raw->late_pending = true;
++		raw->late_app = k;
++		raw->late_frame = raw->inflight_frame;
++		raw->late_ns = raw->inflight_ns;
++		raw->n_late_done++;
+ 	}
+ 
+ 	raw->frame_idx = raw->n_sof - 1;
+ 	raw->inflight = raw->n_frame_applied;
+ 	raw->inflight_frame = raw->frame_idx;
+ 	raw->inflight_ns = raw->sof_ns;
++	raw->inflight_done = false;
+ 
+ 	if (raw->frame_idx < CAMRAW_SOF_LOG) {
+ 		log = &raw->sof_log[raw->frame_idx];
+@@ -985,14 +1042,21 @@ static void camraw_frame_start(struct mtk_camraw *raw)
+ 		log->seq = raw_rd(raw, CAMRAW_FRAME_SEQ_NUM);
+ 		log->seq_inner = readl(raw->inner + CAMRAW_FRAME_SEQ_NUM);
+ 		log->frmsize = raw_rd(raw, TG_FRMSIZE_ST);
++		log->done_us = 0;
+ 		raw->n_sof_log = raw->frame_idx + 1;
+ 	}
+ 
+ 	ev.u.frame_sync.frame_sequence = raw->frame_idx;
+ 	v4l2_event_queue(&raw->vdev, &ev);
+ 
+-	if (reapply)
++	if (!reapply || applied)
++		return;
++	if (raw->late_pending && apply_wait) {
++		raw->apply_deferred = true;
++		raw->n_deferred++;
++	} else {
+ 		camraw_apply_frame(raw);
++	}
+ }
+ 
+ static irqreturn_t camraw_raw_thread(int irq, void *data)
+@@ -1530,6 +1594,11 @@ static int camraw_stream_start(struct mtk_camraw *raw)
+ 	raw->probe_done = false;
+ 	raw->probe_report = false;
+ 	memset(raw->app_buf, 0, sizeof(raw->app_buf));
++	raw->inflight_done = true;
++	raw->late_pending = false;
++	raw->apply_deferred = false;
++	raw->n_late_done = 0;
++	raw->n_deferred = 0;
+ 	raw->n_applied = 0;
+ 	raw->n_frame_applied = 0;
+ 	raw->n_sof_log = 0;
+@@ -1967,10 +2036,10 @@ static int camraw_status_show(struct seq_file *m, void *unused)
+ 		   raw->sizeimage);
+ 	seq_printf(m, "second RAW engine: %s\n", raw->twin ?
+ 		   dev_name(raw->twin->dev) : "none on this board");
+-	seq_printf(m, "stream: %s, %s, reapply %u, stats_off %d, extra_off %d, prestart %d, err_mask %u, cam_mhz %u, db_order %u, frame_done %u\n",
++	seq_printf(m, "stream: %s, %s, reapply %u, stats_off %d, extra_off %d, prestart %d, err_mask %u, cam_mhz %u, db_order %u, frame_done %u, apply_wait %d\n",
+ 		   raw->streaming ? "running" : "stopped",
+ 		   twin ? "twin" : "side A only", reapply, stats_off, extra_off,
+-		   prestart, err_mask, cam_mhz, db_order, frame_done);
++		   prestart, err_mask, cam_mhz, db_order, frame_done, apply_wait);
+ 	camraw_show_counters(raw, m, NULL);
+ 	camraw_snaps_show(raw, m);
+ 	camraw_rdyreq_show(raw, m);
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw.h b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+index 448e05c7e337..3fa9f7f5386a 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw.h
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+@@ -118,6 +118,7 @@ struct mtk_camraw_sof {
+ 	u32 seq;		/* frame number register */
+ 	u32 seq_inner;		/* its latched copy */
+ 	u32 frmsize;		/* frame size the timing generator measured */
++	u32 done_us;		/* its frame done, 0 if not seen */
+ };
+ 
+ /**
+@@ -188,6 +189,15 @@ struct mtk_camraw {
+ 	u32 frame_idx;
+ 	u32 inflight_frame;
+ 	u64 inflight_ns;
++	bool inflight_done;
++	/* a frame whose done comes after the next start of frame */
++	bool late_pending;
++	unsigned int late_app;
++	u32 late_frame;
++	u64 late_ns;
++	bool apply_deferred;
++	unsigned int n_late_done;
++	unsigned int n_deferred;
+ 	unsigned int n_no_buffer_frames;
+ 	unsigned int n_buf_errors;
+ 	bool probe_done;
+-- 
+2.56.1
+

@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 18:25:01 +0300
+Subject: [PATCH 34/34] media: mediatek: camraw: Hold a CPU wake-up latency
+ limit while streaming
+
+The first V4L2 run on a kernel with the deep CPU idle states showed the
+start-of-frame interrupts handled up to tens of ms late: intervals of
+2..110 ms instead of 35.4, nearly every frame done handled after the next
+start of frame, CQ trigger delays and lost frames. The handler itself
+started the lists 10..100 us after it ran. The same run with a process
+writing sensor controls every 30 ms (keeping a CPU awake) was clean with
+intervals of 34.4..36.3 ms.
+
+The next frame's lists are started in the start-of-frame interrupt and
+must begin within the command queue start period, so the driver now holds
+a CPU latency QoS request while streaming (qos_us, default 100 us; -1
+none).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/mediatek/camraw/mtk-camraw-drv.c | 22 +++++++++++++++++--
+ .../platform/mediatek/camraw/mtk-camraw.h     |  3 +++
+ 2 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+index a7f55b29d003..b64d28bea777 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+@@ -123,6 +123,11 @@ module_param(prestart, bool, 0644);
+ MODULE_PARM_DESC(prestart, "Also apply the per-frame request before the viewfinder is switched on, after the start request");
+ 
+ 
++static int qos_us = 100;
++module_param(qos_us, int, 0644);
++MODULE_PARM_DESC(qos_us,
++		 "CPU wake-up latency limit in us while streaming (default 100; -1: none). Deep CPU idle states delayed the start-of-frame interrupt by tens of ms, the next frame's lists started late and frames were lost");
++
+ static bool apply_wait;
+ module_param(apply_wait, bool, 0644);
+ MODULE_PARM_DESC(apply_wait, "Hold the per-frame lists back until the frame before reports its done (0, default: always at the start of frame; 1 stalled the stream: with DROP_FRAME_EN a frame without lists is dropped)");
+@@ -1713,6 +1718,14 @@ static int camraw_stream_start(struct mtk_camraw *raw)
+ 	}
+ 	camraw_clocks(raw);
+ 
++	/*
++	 * The next frame's lists are started in the start-of-frame interrupt
++	 * and must begin within the command queue start period: keep the CPUs
++	 * out of idle states that take longer to wake while streaming.
++	 */
++	if (qos_us >= 0)
++		cpu_latency_qos_add_request(&raw->qos, qos_us);
++
+ 	/* reset, camsys settings, initialize: A and B */
+ 	camraw_hw_reset(raw);
+ 	if (raw->twin_on)
+@@ -1817,6 +1830,8 @@ static int camraw_stream_start(struct mtk_camraw *raw)
+ 		pm_runtime_put(b->dev);
+ 	}
+ err_pm:
++	if (cpu_latency_qos_request_active(&raw->qos))
++		cpu_latency_qos_remove_request(&raw->qos);
+ 	camraw_clocks_restore(raw);
+ 	raw->twin_on = false;
+ 	pm_runtime_put(raw->dev);
+@@ -1854,6 +1869,8 @@ static void camraw_stream_stop(struct mtk_camraw *raw)
+ 		pm_runtime_put(raw->twin->dev);
+ 	}
+ 	raw->twin_on = false;
++	if (cpu_latency_qos_request_active(&raw->qos))
++		cpu_latency_qos_remove_request(&raw->qos);
+ 	camraw_clocks_restore(raw);
+ 	pm_runtime_put(raw->dev);
+ }
+@@ -2191,10 +2208,11 @@ static int camraw_status_show(struct seq_file *m, void *unused)
+ 		   raw->sizeimage);
+ 	seq_printf(m, "second RAW engine: %s\n", raw->twin ?
+ 		   dev_name(raw->twin->dev) : "none on this board");
+-	seq_printf(m, "stream: %s, %s, reapply %u, stats_off %d, extra_off %d, prestart %d, err_mask %u, cam_mhz %u, db_order %u, frame_done %u, apply_wait %d\n",
++	seq_printf(m, "stream: %s, %s, reapply %u, stats_off %d, extra_off %d, prestart %d, err_mask %u, cam_mhz %u, db_order %u, frame_done %u, apply_wait %d, qos_us %d\n",
+ 		   raw->streaming ? "running" : "stopped",
+ 		   twin ? "twin" : "side A only", reapply, stats_off, extra_off,
+-		   prestart, err_mask, cam_mhz, db_order, frame_done, apply_wait);
++		   prestart, err_mask, cam_mhz, db_order, frame_done, apply_wait,
++		   qos_us);
+ 	camraw_show_counters(raw, m, NULL);
+ 	camraw_snaps_show(raw, m);
+ 	camraw_rdyreq_show(raw, m);
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw.h b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+index fce18748c110..bb79e5f0c134 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw.h
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+@@ -12,6 +12,7 @@
+ #include <linux/completion.h>
+ #include <linux/list.h>
+ #include <linux/mutex.h>
++#include <linux/pm_qos.h>
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
+ #include <linux/workqueue.h>
+@@ -219,6 +220,8 @@ struct mtk_camraw {
+ 	unsigned int n_late_done;
+ 	unsigned int n_deferred;
+ 	unsigned int n_sof_drop;
++	/* CPU wake-up latency limit while streaming */
++	struct pm_qos_request qos;
+ 	/* first frame user space sees as 0: the first per-frame request's */
+ 	u32 seq_base;
+ 	/* when and where the last lists were started, the last frame done */
+-- 
+2.56.1
+

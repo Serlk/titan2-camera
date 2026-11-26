@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 18:22:56 +0300
-Subject: [PATCH 09/21] media: dt-bindings: Add Samsung S5KGD1SP image sensor
+Subject: [PATCH 09/34] media: dt-bindings: Add Samsung S5KGD1SP image sensor
 
 S5KGD1SP is a 32 MP sensor with a 4-lane MIPI CSI-2 D-PHY output, used as
 the front camera of the Unihertz Titan 2.

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 18:23:01 +0300
-Subject: [PATCH 12/21] arm64: dts: mediatek: mt6878-titan2: Add the three
+Subject: [PATCH 12/34] arm64: dts: mediatek: mt6878-titan2: Add the three
  cameras
 
 mt6878-unihertz-titan2-cameras.dtsi, included by -all: the IMX766 main,

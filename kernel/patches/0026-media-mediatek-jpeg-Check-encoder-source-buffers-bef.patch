@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:53:07 +0300
+Subject: [PATCH 26/34] media: mediatek: jpeg: Check encoder source buffers
+ before the DMA
+
+Nothing checks that a source buffer holds what the encoder reads from
+it. The encoder reads whole MCUs of the encode size: the crop height
+rounded up to the MCU height, scaled by each plane's vertical sampling,
+lines of round_up(crop width * h_sample / 4, 2^h_align) bytes at the
+plane stride, from the plane's data offset on. A buffer too short for
+that, or a data offset that moves the frame past the end, makes the
+encoder read beyond the buffer.
+
+Check this in buf_prepare for MMAP and imported DMABUF buffers alike and
+refuse such a buffer with -EINVAL and one error line, before the
+hardware runs. For packed formats the encoder's line pitch is derived
+from the crop width, so the line must equal the stride there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/mediatek/jpeg/mtk_jpeg_core.c    | 56 ++++++++++++++++++-
+ 1 file changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
+index 0acb60f8fc76..a63fb5f6f969 100644
+--- a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
++++ b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
+@@ -869,17 +869,71 @@ static int mtk_jpeg_queue_setup(struct vb2_queue *q,
+ 	return 0;
+ }
+ 
++/*
++ * Check before any DMA that an encoder source buffer holds what the encoder
++ * reads: whole MCUs of the crop, i.e. the crop height rounded up to the
++ * MCU height lines (scaled by the plane's vertical sampling) of
++ * round_up(crop width * h_sample / 4, 2^h_align) bytes each, at the plane
++ * stride, from the plane's data offset on. This holds for MMAP and
++ * imported DMABUF buffers alike.
++ */
++static int mtk_jpeg_enc_check_src_buf(struct mtk_jpeg_ctx *ctx,
++				      struct vb2_buffer *vb)
++{
++	const struct mtk_jpeg_q_data *q = &ctx->out_q;
++	const struct mtk_jpeg_fmt *fmt = q->fmt;
++	const struct v4l2_rect *crop = &q->enc_crop_rect;
++	u32 rows_y = roundup(crop->height, mtk_jpeg_enc_mcu_height(fmt));
++	int i;
++
++	for (i = 0; i < fmt->colplanes; i++) {
++		u32 stride = q->pix_mp.plane_fmt[i].bytesperline;
++		u32 rows = rows_y * fmt->v_sample[i] / 4;
++		u32 line = round_up(crop->width * fmt->h_sample[i] / 4,
++				    1U << fmt->h_align);
++		u64 need;
++
++		if (!rows || (fmt->colplanes == 1 ? line != stride :
++						     line > stride)) {
++			dev_err(ctx->jpeg->dev,
++				"source plane %d: %u lines of %u bytes do not fit stride %u\n",
++				i, rows, line, stride);
++			return -EINVAL;
++		}
++
++		need = (u64)vb->planes[i].data_offset +
++		       (u64)(rows - 1) * stride + line;
++		if (need > vb2_plane_size(vb, i)) {
++			dev_err(ctx->jpeg->dev,
++				"source plane %d: %llu bytes needed (offset %u, %u lines of %u bytes, stride %u), buffer has %lu\n",
++				i, need, vb->planes[i].data_offset, rows, line,
++				stride, vb2_plane_size(vb, i));
++			return -EINVAL;
++		}
++	}
++
++	return 0;
++}
++
+ static int mtk_jpeg_buf_prepare(struct vb2_buffer *vb)
+ {
+ 	struct mtk_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+ 	struct mtk_jpeg_q_data *q_data = NULL;
+ 	struct v4l2_plane_pix_format plane_fmt = {};
+-	int i;
++	int i, ret;
+ 
+ 	q_data = mtk_jpeg_get_q_data(ctx, vb->vb2_queue->type);
+ 	if (!q_data)
+ 		return -EINVAL;
+ 
++	/* the source of the encoder: raw frames */
++	if (V4L2_TYPE_IS_OUTPUT(vb->vb2_queue->type) &&
++	    q_data->fmt->fourcc != V4L2_PIX_FMT_JPEG) {
++		ret = mtk_jpeg_enc_check_src_buf(ctx, vb);
++		if (ret)
++			return ret;
++	}
++
+ 	for (i = 0; i < q_data->fmt->colplanes; i++) {
+ 		plane_fmt = q_data->pix_mp.plane_fmt[i];
+ 		if (ctx->enable_exif &&
+-- 
+2.56.1
+

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 04:02:24 +0300
-Subject: [PATCH 16/21] media: mediatek: Add an MT6878 RAW/YUV engine driver
+Subject: [PATCH 16/34] media: mediatek: Add an MT6878 RAW/YUV engine driver
  for a replayed command queue
 
 EXPERIMENTAL: on the phone the first frame overruns the timing generator

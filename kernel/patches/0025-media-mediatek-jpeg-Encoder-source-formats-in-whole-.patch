@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:52:02 +0300
+Subject: [PATCH 25/34] media: mediatek: jpeg: Encoder source formats in whole
+ MCUs, crop to the asked size
+
+The h_align and v_align values of the encoder's source formats are log2
+values, but TRY_FMT passes them to round_up() as plain alignments. An
+NV12M source of 636x478 then becomes 636x480 with a 636 byte stride,
+while the encoder reads whole MCUs with a line of 640 bytes: it reads
+past the end of the buffer (an IOMMU fault on the luma read port).
+
+Negotiate the source format in whole MCUs: the width a multiple of
+2^h_align * 4 / h_sample[0] pixels, the height a multiple of 2^v_align
+lines, the asked size first clamped to the limits (the maximum rounded
+down to the MCU) and then rounded up. Each plane gets bytesperline equal
+to its stride, round_up(width * h_sample / 4, 2^h_align), which is
+round_up(width * 2, 32) for packed 4:2:2, the memory line pitch the
+encoder is programmed with. sizeimage is exactly stride times the plane's
+lines, without padding: clients lay out the planes of a buffer by it.
+
+S_FMT on the source queue keeps the whole-MCU size in the format and sets
+the encode size (crop) to the size the client asked for, so a 636x478
+source still gives a 636x478 JPEG. S_SELECTION and S_FMT clamp the crop
+to the minimum size and the format size. For packed 4:2:2 the encoder
+derives the memory line pitch from the crop width, so the crop may not be
+narrower than the format width minus one MCU plus one. A new context
+starts with the crop equal to the default format.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/mediatek/jpeg/mtk_jpeg_core.c    | 106 +++++++++++++++++-
+ 1 file changed, 100 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
+index fc7c883e4b67..0acb60f8fc76 100644
+--- a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
++++ b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
+@@ -256,6 +256,57 @@ mtk_jpeg_find_format(struct mtk_jpeg_fmt *mtk_jpeg_formats, int num_formats,
+ 	return NULL;
+ }
+ 
++/*
++ * The encoder reads its source in whole MCUs: 16x16 pixels for 4:2:0,
++ * 16x8 for packed 4:2:2. h_align and v_align of the encoder's source
++ * formats are log2 values: the MCU is 2^h_align bytes of the first plane
++ * wide and 2^v_align lines high.
++ */
++static u32 mtk_jpeg_enc_mcu_width(const struct mtk_jpeg_fmt *fmt)
++{
++	return (1U << fmt->h_align) * 4 / fmt->h_sample[0];
++}
++
++static u32 mtk_jpeg_enc_mcu_height(const struct mtk_jpeg_fmt *fmt)
++{
++	return 1U << fmt->v_align;
++}
++
++/*
++ * An encoder source format: whole MCUs, the size the client asked for
++ * clamped to the limits first, then rounded up to the next MCU. Each plane
++ * is exactly stride x lines; a larger sizeimage would move the second
++ * plane of clients that lay the planes out by it.
++ */
++static void mtk_jpeg_enc_try_fmt_src(struct v4l2_pix_format_mplane *pix_mp,
++				     const struct mtk_jpeg_fmt *fmt)
++{
++	u32 mcu_w = mtk_jpeg_enc_mcu_width(fmt);
++	u32 mcu_h = mtk_jpeg_enc_mcu_height(fmt);
++	int i;
++
++	pix_mp->width = clamp(pix_mp->width, MTK_JPEG_MIN_WIDTH,
++			      rounddown(MTK_JPEG_MAX_WIDTH, mcu_w));
++	pix_mp->width = roundup(pix_mp->width, mcu_w);
++	pix_mp->height = clamp(pix_mp->height, MTK_JPEG_MIN_HEIGHT,
++			       rounddown(MTK_JPEG_MAX_HEIGHT, mcu_h));
++	pix_mp->height = roundup(pix_mp->height, mcu_h);
++
++	for (i = 0; i < fmt->colplanes; i++) {
++		struct v4l2_plane_pix_format *pfmt = &pix_mp->plane_fmt[i];
++		/*
++		 * For packed 4:2:2 this is round_up(width * 2, 32), the line
++		 * pitch the encoder uses in memory.
++		 */
++		u32 stride = round_up(pix_mp->width * fmt->h_sample[i] / 4,
++				      1U << fmt->h_align);
++		u32 lines = pix_mp->height * fmt->v_sample[i] / 4;
++
++		pfmt->bytesperline = stride;
++		pfmt->sizeimage = stride * lines;
++	}
++}
++
+ static int mtk_jpeg_try_fmt_mplane(struct v4l2_pix_format_mplane *pix_mp,
+ 				   struct mtk_jpeg_fmt *fmt)
+ {
+@@ -282,6 +333,11 @@ static int mtk_jpeg_try_fmt_mplane(struct v4l2_pix_format_mplane *pix_mp,
+ 		return 0;
+ 	}
+ 
++	if (fmt->flags & MTK_JPEG_FMT_FLAG_OUTPUT) {
++		mtk_jpeg_enc_try_fmt_src(pix_mp, fmt);
++		return 0;
++	}
++
+ 	/* other fourcc */
+ 	pix_mp->height = clamp(round_up(pix_mp->height, fmt->v_align),
+ 			       MTK_JPEG_MIN_HEIGHT, MTK_JPEG_MAX_HEIGHT);
+@@ -481,17 +537,56 @@ static int mtk_jpeg_s_fmt_mplane(struct mtk_jpeg_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * The encode size (crop): within the source format, at least the minimum
++ * size. For packed 4:2:2 the encoder takes round_up(crop width * 2, 32) as
++ * the line pitch in memory, which matches the format's bytesperline only
++ * for a crop less than one MCU narrower than the format.
++ */
++static void mtk_jpeg_enc_clamp_crop(struct mtk_jpeg_ctx *ctx,
++				    struct v4l2_rect *r)
++{
++	const struct mtk_jpeg_q_data *q = &ctx->out_q;
++	u32 min_w = MTK_JPEG_MIN_WIDTH;
++
++	if (q->fmt->colplanes == 1)
++		min_w = max(min_w,
++			    q->pix_mp.width - mtk_jpeg_enc_mcu_width(q->fmt) + 1);
++
++	r->left = 0;
++	r->top = 0;
++	r->width = clamp(r->width, min_w, q->pix_mp.width);
++	r->height = clamp(r->height, MTK_JPEG_MIN_HEIGHT, q->pix_mp.height);
++}
++
+ static int mtk_jpeg_s_fmt_vid_out_mplane(struct file *file, void *priv,
+ 					 struct v4l2_format *f)
+ {
++	struct mtk_jpeg_ctx *ctx = mtk_jpeg_file_to_ctx(file);
++	struct v4l2_rect crop = {
++		.width = f->fmt.pix_mp.width,
++		.height = f->fmt.pix_mp.height,
++	};
+ 	int ret;
+ 
+ 	ret = mtk_jpeg_try_fmt_vid_out_mplane(file, priv, f);
+ 	if (ret)
+ 		return ret;
+ 
+-	return mtk_jpeg_s_fmt_mplane(mtk_jpeg_file_to_ctx(file), f,
+-				     MTK_JPEG_FMT_FLAG_OUTPUT);
++	ret = mtk_jpeg_s_fmt_mplane(ctx, f, MTK_JPEG_FMT_FLAG_OUTPUT);
++	if (ret)
++		return ret;
++
++	/*
++	 * The encoder's source format is in whole MCUs; the JPEG gets the
++	 * size the client asked for.
++	 */
++	if (ctx->out_q.fmt->fourcc != V4L2_PIX_FMT_JPEG) {
++		mtk_jpeg_enc_clamp_crop(ctx, &crop);
++		ctx->out_q.enc_crop_rect = crop;
++	}
++
++	return 0;
+ }
+ 
+ static int mtk_jpeg_s_fmt_vid_cap_mplane(struct file *file, void *priv,
+@@ -646,10 +741,7 @@ static int mtk_jpeg_enc_s_selection(struct file *file, void *priv,
+ 
+ 	switch (s->target) {
+ 	case V4L2_SEL_TGT_CROP:
+-		s->r.left = 0;
+-		s->r.top = 0;
+-		s->r.width = min(s->r.width, ctx->out_q.pix_mp.width);
+-		s->r.height = min(s->r.height, ctx->out_q.pix_mp.height);
++		mtk_jpeg_enc_clamp_crop(ctx, &s->r);
+ 		ctx->out_q.enc_crop_rect = s->r;
+ 		break;
+ 	default:
+@@ -1258,6 +1350,8 @@ static void mtk_jpeg_set_default_params(struct mtk_jpeg_ctx *ctx)
+ 	q->pix_mp.width = MTK_JPEG_MIN_WIDTH;
+ 	q->pix_mp.height = MTK_JPEG_MIN_HEIGHT;
+ 	mtk_jpeg_try_fmt_mplane(&q->pix_mp, q->fmt);
++	q->enc_crop_rect.width = q->pix_mp.width;
++	q->enc_crop_rect.height = q->pix_mp.height;
+ 
+ 	q = &ctx->cap_q;
+ 	q->fmt = mtk_jpeg_find_format(jpeg->variant->formats,
+-- 
+2.56.1
+

@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:36:55 +0300
+Subject: [PATCH 28/34] media: mediatek: camraw: Sensor input as crop bounds,
+ cached buffers
+
+For the libcamera pipeline handler:
+
+- VIDIOC_G_SELECTION, CROP / CROP_BOUNDS / CROP_DEFAULT: the sensor frame
+  the captured requests were made for (the input size of the start
+  request), so that user space can set that sensor mode without knowing
+  the capture.
+- The buffers are allocated cached (non_coherent_mem): the picture is
+  read by the CPU (AE statistics, software consumers), which was very
+  slow on uncached memory. The first-frame probes are now written in
+  buf_prepare, before the cache is cleaned for the device, and synced for
+  the CPU before they are read in the frame done interrupt.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/mediatek/camraw/mtk-camraw-drv.c | 53 ++++++++++++++++---
+ 1 file changed, 46 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+index 66be54ed0a60..ad4b89723fd2 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+@@ -96,7 +96,7 @@ MODULE_PARM_DESC(twin, "Run both RAW engines as captured (1), or only the side A
+ static unsigned int reapply = 1;
+ module_param(reapply, uint, 0644);
+ MODULE_PARM_DESC(reapply,
+-		 "At each start of frame: 0 nothing (start request only), 1 apply the per-frame request, 2 also toggle the double buffer enable");
++		 "At each start of frame: 0 nothing (start request only), 1 apply the per-frame request");
+ 
+ static bool stats_off;
+ module_param(stats_off, bool, 0644);
+@@ -839,7 +839,8 @@ static void camraw_probe_fill(struct mtk_camraw *raw, u8 *vaddr)
+ }
+ 
+ /* hard IRQ: how much of the fill pattern the first picture left */
+-static void camraw_probe_check(struct mtk_camraw *raw, const u8 *vaddr)
++static void camraw_probe_check(struct mtk_camraw *raw, const u8 *vaddr,
++			       dma_addr_t dma)
+ {
+ 	unsigned int i, j;
+ 
+@@ -848,6 +849,10 @@ static void camraw_probe_check(struct mtk_camraw *raw, const u8 *vaddr)
+ 	for (i = 0; i < CAMRAW_NUM_PROBES; i++) {
+ 		const u8 *q = vaddr + camraw_probe_off(raw, i);
+ 
++		/* cached buffer: drop what the CPU holds of it first */
++		dma_sync_single_for_cpu(raw->dev, dma + camraw_probe_off(raw, i),
++					CAMRAW_PROBE_BYTES, DMA_FROM_DEVICE);
++
+ 		raw->probe_same[i] = 0;
+ 		for (j = 0; j < CAMRAW_PROBE_BYTES; j++)
+ 			raw->probe_same[i] += q[j] == CAMRAW_FILL;
+@@ -880,7 +885,8 @@ static void camraw_buf_finish(struct mtk_camraw *raw,
+ 		buf->vb.sequence = raw->inflight_frame;
+ 		buf->vb.vb2_buf.timestamp = raw->inflight_ns;
+ 		if (!raw->probe_done)
+-			camraw_probe_check(raw, vb2_plane_vaddr(&buf->vb.vb2_buf, 0));
++			camraw_probe_check(raw, vb2_plane_vaddr(&buf->vb.vb2_buf, 0),
++					   buf->dma);
+ 		raw->n_frames++;
+ 	}
+ 	vb2_buffer_done(&buf->vb.vb2_buf, state);
+@@ -1682,7 +1688,15 @@ static int camraw_buf_prepare(struct vb2_buffer *vb)
+ {
+ 	struct mtk_camraw *raw = vb2_get_drv_priv(vb->vb2_queue);
+ 
+-	return vb2_plane_size(vb, 0) < raw->sizeimage ? -EINVAL : 0;
++	if (vb2_plane_size(vb, 0) < raw->sizeimage)
++		return -EINVAL;
++	/*
++	 * The first picture is checked for what the writers left. Here, not
++	 * at queueing: the cache is cleaned for the device after this.
++	 */
++	if (!raw->probe_done)
++		camraw_probe_fill(raw, vb2_plane_vaddr(vb, 0));
++	return 0;
+ }
+ 
+ static void camraw_buf_queue(struct vb2_buffer *vb)
+@@ -1693,9 +1707,6 @@ static void camraw_buf_queue(struct vb2_buffer *vb)
+ 	unsigned long flags;
+ 
+ 	buf->dma = vb2_dma_contig_plane_dma_addr(vb, 0);
+-	/* the first picture is checked for what the writers left */
+-	if (!raw->probe_done)
+-		camraw_probe_fill(raw, vb2_plane_vaddr(vb, 0));
+ 	spin_lock_irqsave(&raw->buf_lock, flags);
+ 	list_add_tail(&buf->list, &raw->bufs);
+ 	spin_unlock_irqrestore(&raw->buf_lock, flags);
+@@ -1804,6 +1815,31 @@ static int camraw_enum_input(struct file *file, void *priv,
+ 	return 0;
+ }
+ 
++/*
++ * The crop bounds are the sensor frame the captured requests were made
++ * for; the picture is made from it (crop and scale of the lists).
++ */
++static int camraw_g_selection(struct file *file, void *priv,
++			      struct v4l2_selection *sel)
++{
++	struct mtk_camraw *raw = video_drvdata(file);
++
++	if (sel->type != V4L2_BUF_TYPE_VIDEO_CAPTURE || !raw->loaded)
++		return -EINVAL;
++	switch (sel->target) {
++	case V4L2_SEL_TGT_CROP:
++	case V4L2_SEL_TGT_CROP_BOUNDS:
++	case V4L2_SEL_TGT_CROP_DEFAULT:
++		sel->r.left = 0;
++		sel->r.top = 0;
++		sel->r.width = raw->start.in_width;
++		sel->r.height = raw->start.in_height;
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
+ static int camraw_subscribe_event(struct v4l2_fh *fh,
+ 				  const struct v4l2_event_subscription *sub)
+ {
+@@ -1830,6 +1866,7 @@ static const struct v4l2_ioctl_ops camraw_ioctl_ops = {
+ 	.vidioc_s_fmt_vid_cap = camraw_g_fmt,
+ 	.vidioc_try_fmt_vid_cap = camraw_g_fmt,
+ 	.vidioc_enum_framesizes = camraw_enum_framesizes,
++	.vidioc_g_selection = camraw_g_selection,
+ 	.vidioc_enum_input = camraw_enum_input,
+ 	.vidioc_subscribe_event = camraw_subscribe_event,
+ 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+@@ -2135,6 +2172,8 @@ static int camraw_video_register(struct mtk_camraw *raw)
+ 	q->buf_struct_size = sizeof(struct mtk_camraw_buffer);
+ 	q->ops = &camraw_vb2_ops;
+ 	q->mem_ops = &vb2_dma_contig_memops;
++	/* cached buffers: user space reads the picture with the CPU */
++	q->non_coherent_mem = true;
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC |
+ 			     V4L2_BUF_FLAG_TSTAMP_SRC_SOE;
+ 	q->lock = &raw->vlock;
+-- 
+2.56.1
+

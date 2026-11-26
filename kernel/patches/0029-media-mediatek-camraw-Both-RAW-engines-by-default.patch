@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 14:04:26 +0300
+Subject: [PATCH 29/34] media: mediatek: camraw: Both RAW engines by default
+
+The captured requests split the frame between RAW-A and RAW-B, and RAW-A
+alone overruns on the first line (phone run of 26.11, side A only). twin=0
+stays for experiments.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+index ad4b89723fd2..353e2b6acb61 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+@@ -89,9 +89,9 @@ static char *frame_fw = "titan2/camraw-frame.bin";
+ module_param(frame_fw, charp, 0644);
+ MODULE_PARM_DESC(frame_fw, "Steady request applied for every frame, below the firmware directory");
+ 
+-static bool twin;
++static bool twin = true;
+ module_param(twin, bool, 0644);
+-MODULE_PARM_DESC(twin, "Run both RAW engines as captured (1), or only the side A descriptors (0, left part of the picture)");
++MODULE_PARM_DESC(twin, "Run both RAW engines as captured (1, default), or only the side A descriptors (0: RAW-A alone overruns on the first line; for experiments)");
+ 
+ static unsigned int reapply = 1;
+ module_param(reapply, uint, 0644);
+-- 
+2.56.1
+

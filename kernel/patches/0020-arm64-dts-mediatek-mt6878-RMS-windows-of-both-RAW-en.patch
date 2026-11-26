@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 13:19:21 +0300
-Subject: [PATCH 20/21] arm64: dts: mediatek: mt6878: RMS windows of both RAW
+Subject: [PATCH 20/34] arm64: dts: mediatek: mt6878: RMS windows of both RAW
  engines
 
 The command queue writes the RMS block of each side, and the
@@ -40,10 +40,10 @@ index cb5a133a0f1b..e139f57dfd73 100644
    interrupts:
      maxItems: 1
 diff --git a/arch/arm64/boot/dts/mediatek/mt6878.dtsi b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
-index 9643c685c04a..b4d1543d8094 100644
+index 66052c094680..978da209351c 100644
 --- a/arch/arm64/boot/dts/mediatek/mt6878.dtsi
 +++ b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
-@@ -1595,13 +1595,15 @@ seninf_port5: port@5 {
+@@ -1600,13 +1600,15 @@ seninf_port5: port@5 {
  		/*
  		 * RAW-A and YUV-A engines of the image signal processor, for
  		 * the driver that replays a captured command queue. The RMS-A
@@ -63,7 +63,7 @@ index 9643c685c04a..b4d1543d8094 100644
  			interrupts = <GIC_SPI 136 IRQ_TYPE_LEVEL_HIGH 0>;
  			clocks = <&camsys_main CLK_CAM_MAIN_CAM>,
  				 <&camsys_main CLK_CAM_MAIN_CAMTG>,
-@@ -1657,14 +1659,15 @@ cam_yuv_a: cam-yuv@1a050000 {
+@@ -1662,14 +1664,15 @@ cam_yuv_a: cam-yuv@1a050000 {
  
  		/*
  		 * RAW-B and YUV-B: the second half of a frame split between two

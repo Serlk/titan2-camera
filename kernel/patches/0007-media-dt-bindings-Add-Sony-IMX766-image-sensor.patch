@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 18:22:54 +0300
-Subject: [PATCH 07/21] media: dt-bindings: Add Sony IMX766 image sensor
+Subject: [PATCH 07/34] media: dt-bindings: Add Sony IMX766 image sensor
 
 IMX766 is a 50 MP sensor with a 3-trio MIPI CSI-2 C-PHY output, used as
 the main rear camera of the Unihertz Titan 2.

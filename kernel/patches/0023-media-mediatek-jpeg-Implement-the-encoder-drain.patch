@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:53:39 +0300
+Subject: [PATCH 23/34] media: mediatek: jpeg: Implement the encoder drain
+
+V4L2_ENC_CMD_STOP is accepted through v4l2_m2m_ioctl_encoder_cmd(), but
+nothing ends the drain: no capture buffer is ever returned with
+V4L2_BUF_FLAG_LAST and V4L2_EVENT_EOS cannot even be subscribed to. A
+client that drains at the end of the stream, such as GStreamer at EOS,
+waits forever.
+
+Implement the stateful encoder drain with the mem2mem helpers:
+  - let clients subscribe to V4L2_EVENT_EOS on the encoder;
+  - keep the mem2mem streaming state in start and stop streaming;
+  - mark the capture buffer of the last source buffer of a drain LAST
+    and send EOS when its job ends, whether the frame was encoded or not;
+  - after a STOP that found no source buffer queued, return the next
+    capture buffer at once, empty and LAST, and send EOS;
+  - send EOS when STOP finds the encoder already idle, and let
+    V4L2_ENC_CMD_START resume encoding after a finished drain.
+
+The multi-core encoders get the event, the commands and the queue state
+handling too, but do not mark the last buffer yet: a drain with source
+buffers queued still does not end there, as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/mediatek/jpeg/mtk_jpeg_core.c    | 93 ++++++++++++++++++-
+ 1 file changed, 90 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
+index 63c48587327a..a30c04309efe 100644
+--- a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
++++ b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
+@@ -491,6 +491,59 @@ static void mtk_jpeg_queue_src_chg_event(struct mtk_jpeg_ctx *ctx)
+ 	v4l2_event_queue_fh(&ctx->fh, &ev_src_ch);
+ }
+ 
++static const struct v4l2_event mtk_jpeg_eos_event = {
++	.type = V4L2_EVENT_EOS,
++};
++
++static int mtk_jpeg_enc_subscribe_event(struct v4l2_fh *fh,
++					const struct v4l2_event_subscription *sub)
++{
++	switch (sub->type) {
++	case V4L2_EVENT_EOS:
++		return v4l2_event_subscribe(fh, sub, 0, NULL);
++	}
++
++	return v4l2_ctrl_subscribe_event(fh, sub);
++}
++
++/*
++ * The stateful encoder drain: on V4L2_ENC_CMD_STOP the capture buffer of
++ * the last source buffer queued before it is returned with
++ * V4L2_BUF_FLAG_LAST and V4L2_EVENT_EOS is sent; with no source buffer
++ * left, the next capture buffer is returned empty with the flag at once.
++ * V4L2_ENC_CMD_START resumes encoding after a finished drain.
++ */
++static int mtk_jpeg_enc_encoder_cmd(struct file *file, void *priv,
++				    struct v4l2_encoder_cmd *cmd)
++{
++	struct mtk_jpeg_ctx *ctx = mtk_jpeg_file_to_ctx(file);
++	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
++	bool stopped;
++	int ret;
++
++	ret = v4l2_m2m_ioctl_try_encoder_cmd(file, priv, cmd);
++	if (ret)
++		return ret;
++
++	if (!vb2_is_streaming(v4l2_m2m_get_src_vq(m2m_ctx)))
++		return 0;
++
++	stopped = v4l2_m2m_has_stopped(m2m_ctx);
++	ret = v4l2_m2m_ioctl_encoder_cmd(file, priv, cmd);
++	if (ret)
++		return ret;
++
++	if (cmd->cmd == V4L2_ENC_CMD_STOP && v4l2_m2m_has_stopped(m2m_ctx))
++		v4l2_event_queue_fh(&ctx->fh, &mtk_jpeg_eos_event);
++
++	if (cmd->cmd == V4L2_ENC_CMD_START && stopped) {
++		vb2_clear_last_buffer_dequeued(v4l2_m2m_get_dst_vq(m2m_ctx));
++		v4l2_m2m_try_schedule(m2m_ctx);
++	}
++
++	return 0;
++}
++
+ static int mtk_jpeg_subscribe_event(struct v4l2_fh *fh,
+ 				    const struct v4l2_event_subscription *sub)
+ {
+@@ -614,7 +667,7 @@ static const struct v4l2_ioctl_ops mtk_jpeg_enc_ioctl_ops = {
+ 	.vidioc_s_fmt_vid_cap_mplane    = mtk_jpeg_s_fmt_vid_cap_mplane,
+ 	.vidioc_s_fmt_vid_out_mplane    = mtk_jpeg_s_fmt_vid_out_mplane,
+ 	.vidioc_qbuf                    = v4l2_m2m_ioctl_qbuf,
+-	.vidioc_subscribe_event         = mtk_jpeg_subscribe_event,
++	.vidioc_subscribe_event         = mtk_jpeg_enc_subscribe_event,
+ 	.vidioc_g_selection		= mtk_jpeg_enc_g_selection,
+ 	.vidioc_s_selection		= mtk_jpeg_enc_s_selection,
+ 
+@@ -629,7 +682,7 @@ static const struct v4l2_ioctl_ops mtk_jpeg_enc_ioctl_ops = {
+ 
+ 	.vidioc_unsubscribe_event	= v4l2_event_unsubscribe,
+ 
+-	.vidioc_encoder_cmd		= v4l2_m2m_ioctl_encoder_cmd,
++	.vidioc_encoder_cmd		= mtk_jpeg_enc_encoder_cmd,
+ 	.vidioc_try_encoder_cmd		= v4l2_m2m_ioctl_try_encoder_cmd,
+ };
+ 
+@@ -782,12 +835,23 @@ static void mtk_jpeg_set_queue_data(struct mtk_jpeg_ctx *ctx,
+ static void mtk_jpeg_enc_buf_queue(struct vb2_buffer *vb)
+ {
+ 	struct mtk_jpeg_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
++	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+ 	struct mtk_jpeg_dev *jpeg = ctx->jpeg;
+ 
+ 	v4l2_dbg(2, debug, &jpeg->v4l2_dev, "(%d) buf_q id=%d, vb=%p\n",
+ 		 vb->vb2_queue->type, vb->index, vb);
+ 
+-	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, to_vb2_v4l2_buffer(vb));
++	/* a drain that found no source buffer: this one ends it */
++	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
++	    vb2_is_streaming(vb->vb2_queue) &&
++	    v4l2_m2m_dst_buf_is_last(ctx->fh.m2m_ctx)) {
++		vb2_set_plane_payload(vb, 0, 0);
++		v4l2_m2m_last_buffer_done(ctx->fh.m2m_ctx, vbuf);
++		v4l2_event_queue_fh(&ctx->fh, &mtk_jpeg_eos_event);
++		return;
++	}
++
++	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
+ }
+ 
+ static void mtk_jpeg_dec_buf_queue(struct vb2_buffer *vb)
+@@ -838,6 +902,15 @@ static struct vb2_v4l2_buffer *mtk_jpeg_buf_remove(struct mtk_jpeg_ctx *ctx,
+ 		return v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+ }
+ 
++static int mtk_jpeg_enc_start_streaming(struct vb2_queue *q, unsigned int count)
++{
++	struct mtk_jpeg_ctx *ctx = vb2_get_drv_priv(q);
++
++	v4l2_m2m_update_start_streaming_state(ctx->fh.m2m_ctx, q);
++
++	return 0;
++}
++
+ static void mtk_jpeg_enc_stop_streaming(struct vb2_queue *q)
+ {
+ 	struct mtk_jpeg_ctx *ctx = vb2_get_drv_priv(q);
+@@ -845,6 +918,12 @@ static void mtk_jpeg_enc_stop_streaming(struct vb2_queue *q)
+ 
+ 	while ((vb = mtk_jpeg_buf_remove(ctx, q->type)))
+ 		v4l2_m2m_buf_done(vb, VB2_BUF_STATE_ERROR);
++
++	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, q);
++
++	if (V4L2_TYPE_IS_OUTPUT(q->type) &&
++	    v4l2_m2m_has_stopped(ctx->fh.m2m_ctx))
++		v4l2_event_queue_fh(&ctx->fh, &mtk_jpeg_eos_event);
+ }
+ 
+ static void mtk_jpeg_dec_stop_streaming(struct vb2_queue *q)
+@@ -884,6 +963,7 @@ static const struct vb2_ops mtk_jpeg_enc_qops = {
+ 	.queue_setup        = mtk_jpeg_queue_setup,
+ 	.buf_prepare        = mtk_jpeg_buf_prepare,
+ 	.buf_queue          = mtk_jpeg_enc_buf_queue,
++	.start_streaming    = mtk_jpeg_enc_start_streaming,
+ 	.stop_streaming     = mtk_jpeg_enc_stop_streaming,
+ };
+ 
+@@ -942,6 +1022,13 @@ static void mtk_jpeg_enc_job_done(struct mtk_jpeg_dev *jpeg,
+ 	vb2_set_plane_payload(&dst_buf->vb2_buf, 0,
+ 			      state == VB2_BUF_STATE_DONE ? size : 0);
+ 
++	/* the last source buffer of a drain: its JPEG ends the stream */
++	if (v4l2_m2m_is_last_draining_src_buf(ctx->fh.m2m_ctx, src_buf)) {
++		dst_buf->flags |= V4L2_BUF_FLAG_LAST;
++		v4l2_m2m_mark_stopped(ctx->fh.m2m_ctx);
++		v4l2_event_queue_fh(&ctx->fh, &mtk_jpeg_eos_event);
++	}
++
+ 	v4l2_m2m_buf_done(src_buf, state);
+ 	v4l2_m2m_buf_done(dst_buf, state);
+ 	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
+-- 
+2.56.1
+

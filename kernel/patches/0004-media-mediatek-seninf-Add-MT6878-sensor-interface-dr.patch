@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 12 Nov 2026 18:22:52 +0300
-Subject: [PATCH 04/21] media: mediatek: seninf: Add MT6878 sensor interface
+Subject: [PATCH 04/34] media: mediatek: seninf: Add MT6878 sensor interface
  driver
 
 A driver for the sensor interface of the MT6878: CSI PHY 3.1 analog and

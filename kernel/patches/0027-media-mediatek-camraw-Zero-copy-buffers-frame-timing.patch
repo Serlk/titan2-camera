@@ -1,0 +1,809 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:26:07 +0300
+Subject: [PATCH 27/34] media: mediatek: camraw: Zero-copy buffers, frame
+ timing in the hard IRQ, media device
+
+The replay now runs (correct colour picture of both halves), with two
+CQ trigger delay errors per stream: the per-frame lists were started from
+the IRQ thread, which also copied the 2.4 MB picture out of uncached
+memory at every frame done, so a start of frame could wait longer than
+the command queue start period and two starts of frame merged.
+
+- The picture is written straight into the queued V4L2 buffer: the queue
+  is dma-contig (MMAP and DMABUF) on the RAW-A device, which shares the
+  IOMMU domain with every engine of the frame (checked at probe). At each
+  application only the picture address words of the per-frame copy are
+  patched (camraw_replay_patch_picture); frames without a queued buffer go
+  to the frame request's own picture planes.
+- Start of frame and frame done (SW_PASS1_DONE) are handled in the hard
+  IRQ: the next application is made at once, and the buffer of the frame
+  in flight is completed with the frame number and start of frame time of
+  that frame. A buffer whose frame never finished is returned with an
+  error when its ring slot comes round again. The IRQ thread keeps the
+  logging, snapshots and the first-frame probe report (probe points filled
+  in the first queued buffers).
+- V4L2_EVENT_FRAME_SYNC at every start of frame, with the frame number the
+  completed buffer will carry, for sensor control timing in user space.
+- A media device of its own (driver name mtk-camraw-mt6878) with the video
+  node as its one entity, so that the node can be found by enumerating
+  media devices. The input is named after the sensor interface entity
+  that feeds it, to find the sensor in that sensor interface's graph.
+- VIDIOC_ENUM_FRAMESIZES: the one captured size.
+- apply_delay_us and reapply=2 are gone (the order of section 11 never
+  toggles per frame; the delay made no difference).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../media/platform/mediatek/camraw/Kconfig    |   3 +-
+ .../platform/mediatek/camraw/mtk-camraw-drv.c | 381 ++++++++++++------
+ .../mediatek/camraw/mtk-camraw-replay.c       |  25 ++
+ .../mediatek/camraw/mtk-camraw-replay.h       |   2 +
+ .../platform/mediatek/camraw/mtk-camraw.h     |  30 +-
+ 5 files changed, 308 insertions(+), 133 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/camraw/Kconfig b/drivers/media/platform/mediatek/camraw/Kconfig
+index bfea89355970..1832097ae5c5 100644
+--- a/drivers/media/platform/mediatek/camraw/Kconfig
++++ b/drivers/media/platform/mediatek/camraw/Kconfig
+@@ -3,12 +3,13 @@ config VIDEO_MEDIATEK_CAMRAW_REPLAY
+ 	tristate "MediaTek MT6878 RAW/YUV engine, replay of a captured command queue"
+ 	depends on V4L_PLATFORM_DRIVERS
+ 	depends on VIDEO_DEV
++	depends on MEDIA_CONTROLLER
+ 	depends on ARCH_MEDIATEK || COMPILE_TEST
+ 	depends on PM
+ 	depends on VIDEO_MEDIATEK_SENINF
+ 	depends on MFD_SYSCON
+ 	select FW_LOADER
+-	select VIDEOBUF2_VMALLOC
++	select VIDEOBUF2_DMA_CONTIG
+ 	help
+ 	  Bring-up driver for the RAW-A and YUV-A engines of the image
+ 	  signal processor of the MediaTek MT6878 SoC. The register
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+index d2f3f5f4a760..66be54ed0a60 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+@@ -60,7 +60,8 @@
+ 
+ #include <media/v4l2-ioctl.h>
+ #include <media/v4l2-subdev.h>
+-#include <media/videobuf2-vmalloc.h>
++#include <media/v4l2-event.h>
++#include <media/videobuf2-dma-contig.h>
+ 
+ #include "../seninf/mtk-seninf.h"
+ #include "mtk-camraw.h"
+@@ -121,9 +122,6 @@ static bool prestart;
+ module_param(prestart, bool, 0644);
+ MODULE_PARM_DESC(prestart, "Also apply the per-frame request before the viewfinder is switched on, after the start request");
+ 
+-static unsigned int apply_delay_us;
+-module_param(apply_delay_us, uint, 0644);
+-MODULE_PARM_DESC(apply_delay_us, "Wait this long after a start of frame before applying the per-frame request (0..30000)");
+ 
+ static unsigned int err_mask = 1;
+ module_param(err_mask, uint, 0644);
+@@ -439,9 +437,10 @@ static void camraw_show_counters(struct mtk_camraw *raw, struct seq_file *m,
+ 	err_bits = raw->err_bits;
+ 	spin_unlock_irqrestore(&raw->irq_lock, flags);
+ 
+-	CAMRAW_OUT("lists started %u (per-frame request %u times), main list done %u, sub list done %u, start of frame %u, pass 1 done %u, SW pass 1 done (frame done) %u, YUVO_R1 done %u, frames delivered %u, without a buffer %u",
++	CAMRAW_OUT("lists started %u (per-frame request %u times), main list done %u, sub list done %u, start of frame %u, pass 1 done %u, SW pass 1 done (frame done) %u, YUVO_R1 done %u, frames delivered %u, without a buffer %u, buffers lost %u",
+ 		   raw->n_applied, raw->n_frame_applied, n_main, n_sub, n_sof,
+-		   n_p1, raw->n_swp1, n_yuvo, raw->n_frames, raw->n_no_buffer);
++		   n_p1, raw->n_swp1, n_yuvo, raw->n_frames,
++		   raw->n_no_buffer_frames, raw->n_buf_errors);
+ 	camraw_dmain_text(dline, sizeof(dline), raw->int8_bits, true);
+ 	CAMRAW_OUT("input underflow seen in interrupts (INT8):%s", dline);
+ 	camraw_dmain_text(dline, sizeof(dline), raw->int3_bits, false);
+@@ -697,6 +696,9 @@ static int camraw_dmain_text(char *buf, size_t size, u32 v, bool underflow)
+ /* ------------------------------------------------------------------ */
+ /* Interrupts                                                          */
+ 
++static void camraw_frame_start(struct mtk_camraw *raw);
++static void camraw_frame_end(struct mtk_camraw *raw);
++
+ static irqreturn_t camraw_irq_common(struct mtk_camraw *raw, unsigned int line,
+ 				     void __iomem *base, int irq)
+ {
+@@ -777,6 +779,14 @@ static irqreturn_t camraw_irq_common(struct mtk_camraw *raw, unsigned int line,
+ 	}
+ 	spin_unlock(&raw->irq_lock);
+ 
++	/* buffers and the next frame's lists: here, not in the thread */
++	if (line == CAMRAW_IRQ_RAW && READ_ONCE(raw->streaming)) {
++		if (st[1] & CAMCTL_INT_SW_PASS1_DONE)
++			camraw_frame_end(raw);
++		if (st[1] & CAMCTL_INT_TG_SOF)
++			camraw_frame_start(raw);
++	}
++
+ 	return IRQ_WAKE_THREAD;
+ }
+ 
+@@ -807,110 +817,176 @@ static void camraw_take_pending(struct mtk_camraw *raw, unsigned int line,
+ 	spin_unlock_irqrestore(&raw->irq_lock, flags);
+ }
+ 
+-/* how much of the fill pattern the first frame left, left and right */
+-static void camraw_check_picture(struct mtk_camraw *raw, unsigned int set)
++/* probe points of the first frame: middle line of each plane, left and right */
++static u32 camraw_probe_off(struct mtk_camraw *raw, unsigned int i)
++{
++	unsigned int plane = i / 2;
++	u32 line = (plane ? raw->height / 2 : raw->height) / 2;
++	u32 col = i & 1 ? raw->width - 2 * CAMRAW_PROBE_BYTES : CAMRAW_PROBE_BYTES;
++
++	return (plane ? raw->pic_size[0] : 0) + line * raw->stride + col;
++}
++
++#define CAMRAW_NUM_PROBES		(2 * CAMRAW_PICTURE_PLANES)
++
++static void camraw_probe_fill(struct mtk_camraw *raw, u8 *vaddr)
++{
++	unsigned int i;
++
++	for (i = 0; vaddr && i < CAMRAW_NUM_PROBES; i++)
++		memset(vaddr + camraw_probe_off(raw, i), CAMRAW_FILL,
++		       CAMRAW_PROBE_BYTES);
++}
++
++/* hard IRQ: how much of the fill pattern the first picture left */
++static void camraw_probe_check(struct mtk_camraw *raw, const u8 *vaddr)
++{
++	unsigned int i, j;
++
++	if (!vaddr)
++		return;
++	for (i = 0; i < CAMRAW_NUM_PROBES; i++) {
++		const u8 *q = vaddr + camraw_probe_off(raw, i);
++
++		raw->probe_same[i] = 0;
++		for (j = 0; j < CAMRAW_PROBE_BYTES; j++)
++			raw->probe_same[i] += q[j] == CAMRAW_FILL;
++		memcpy(raw->probe_bytes[i], q, sizeof(raw->probe_bytes[i]));
++	}
++	raw->probe_done = true;
++	raw->probe_report = true;
++}
++
++static void camraw_probe_report(struct mtk_camraw *raw)
+ {
+ 	static const char * const where[] = { "left", "right" };
+-	unsigned int p, i, j, same;
+-	u32 line, col[2];
+-	const u8 *q;
++	unsigned int i;
+ 
+-	for (p = 0; p < CAMRAW_PICTURE_PLANES; p++) {
+-		line = (p ? raw->height / 2 : raw->height) / 2;
+-		col[0] = CAMRAW_PROBE_BYTES;
+-		col[1] = raw->width - 2 * CAMRAW_PROBE_BYTES;
+-		for (i = 0; i < ARRAY_SIZE(col); i++) {
+-			q = (const u8 *)raw->pic_cpu[set][p] + line * raw->stride +
+-			    col[i];
+-			for (same = 0, j = 0; j < CAMRAW_PROBE_BYTES; j++)
+-				same += q[j] == CAMRAW_FILL;
+-			dev_info(raw->dev,
+-				 "first frame: plane %u line %u %s (column %u): %u of %u bytes still the fill pattern%s, first bytes %*ph\n",
+-				 p, line, where[i], col[i], same,
+-				 CAMRAW_PROBE_BYTES,
+-				 same == CAMRAW_PROBE_BYTES ? " (NOT WRITTEN)" : "",
+-				 8, q);
+-		}
++	for (i = 0; i < CAMRAW_NUM_PROBES; i++)
++		dev_info(raw->dev,
++			 "first frame: plane %u %s: %u of %u bytes still the fill pattern%s, first bytes %*ph\n",
++			 i / 2, where[i & 1], raw->probe_same[i], CAMRAW_PROBE_BYTES,
++			 raw->probe_same[i] == CAMRAW_PROBE_BYTES ? " (NOT WRITTEN)" : "",
++			 8, raw->probe_bytes[i]);
++}
++
++static void camraw_buf_finish(struct mtk_camraw *raw,
++			      struct mtk_camraw_buffer *buf,
++			      enum vb2_buffer_state state)
++{
++	if (state == VB2_BUF_STATE_DONE) {
++		vb2_set_plane_payload(&buf->vb.vb2_buf, 0, raw->sizeimage);
++		buf->vb.field = V4L2_FIELD_NONE;
++		buf->vb.sequence = raw->inflight_frame;
++		buf->vb.vb2_buf.timestamp = raw->inflight_ns;
++		if (!raw->probe_done)
++			camraw_probe_check(raw, vb2_plane_vaddr(&buf->vb.vb2_buf, 0));
++		raw->n_frames++;
+ 	}
++	vb2_buffer_done(&buf->vb.vb2_buf, state);
+ }
+ 
+-/* the picture of set @set is complete: copy it into the next buffer */
+-static void camraw_deliver(struct mtk_camraw *raw, unsigned int set)
++/*
++ * Program the next frame: application j of the per-frame request, from
++ * copy j % 2, with the picture planes in the next queued buffer (or in the
++ * scratch planes when none is queued). Any context; takes buf_lock.
++ */
++static void camraw_apply_frame(struct mtk_camraw *raw)
+ {
+-	struct mtk_camraw_buffer *buf;
++	unsigned int j = raw->n_frame_applied + 1;
++	unsigned int set = j % CAMRAW_NUM_SETS;
++	struct mtk_camraw_buffer *buf, *old;
++	dma_addr_t pic[CAMRAW_PICTURE_PLANES];
+ 	unsigned long flags;
+-	u8 *dst;
+-
+-	if (!raw->n_frames++)
+-		camraw_check_picture(raw, set);
++	u8 *slot = raw->slot_frame[set].cpu;
+ 
+ 	spin_lock_irqsave(&raw->buf_lock, flags);
+ 	buf = list_first_entry_or_null(&raw->bufs, struct mtk_camraw_buffer, list);
+ 	if (buf)
+ 		list_del(&buf->list);
++	old = raw->app_buf[j % CAMRAW_APP_RING];
++	raw->app_buf[j % CAMRAW_APP_RING] = buf;
+ 	spin_unlock_irqrestore(&raw->buf_lock, flags);
+-	if (!buf) {
+-		raw->n_no_buffer++;
+-		return;
++
++	if (old) {
++		/* never completed: its frame was lost */
++		raw->n_buf_errors++;
++		vb2_buffer_done(&old->vb.vb2_buf, VB2_BUF_STATE_ERROR);
++	}
++	if (buf) {
++		pic[0] = buf->dma;
++		pic[1] = buf->dma + raw->pic_size[0];
++	} else {
++		pic[0] = raw->scratch_dma[0];
++		pic[1] = raw->scratch_dma[1];
++		raw->n_no_buffer_frames++;
+ 	}
++	camraw_replay_patch_picture(&raw->frame, slot, pic);
++	if (raw->frame.frame_seq_off != CAMRAW_NO_OFFSET)
++		put_unaligned_le32(j, slot + raw->frame.frame_seq_off);
++	camraw_apply_cq(raw, raw->slot_frame[set].dma, &raw->frame,
++			raw->frame_size);
++	raw->n_frame_applied = j;
++}
+ 
+-	dst = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+-	memcpy(dst, raw->pic_cpu[set][0], raw->pic_size[0]);
+-	memcpy(dst + raw->pic_size[0], raw->pic_cpu[set][1], raw->pic_size[1]);
+-	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, raw->sizeimage);
+-	buf->vb.field = V4L2_FIELD_NONE;
+-	buf->vb.sequence = raw->sequence++;
+-	buf->vb.vb2_buf.timestamp = raw->sof_ns ? raw->sof_ns : ktime_get_ns();
+-	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
++/* hard IRQ, frame done: the picture of the frame in flight is complete */
++static void camraw_frame_end(struct mtk_camraw *raw)
++{
++	unsigned int k = raw->inflight;
++	struct mtk_camraw_buffer *buf;
++
++	if (frame_done != 0 || !k)
++		return;
++	spin_lock(&raw->buf_lock);
++	buf = raw->app_buf[k % CAMRAW_APP_RING];
++	raw->app_buf[k % CAMRAW_APP_RING] = NULL;
++	spin_unlock(&raw->buf_lock);
++	if (buf)
++		camraw_buf_finish(raw, buf, VB2_BUF_STATE_DONE);
+ }
+ 
+ /*
+- * Start of frame. Application j of the per-frame request, made after one
+- * start of frame, is taken for the next frame (double buffered registers),
+- * which writes the picture set j % 2. So at this start of frame the frame
+- * of application j - 1 has ended: deliver its set, then apply j + 1 from
+- * the copy of that same set (its frame starts one frame later).
++ * Hard IRQ, start of frame. The application made at the previous start of
++ * frame is now in effect (double buffered registers); the next one is
++ * made at once, well inside the command queue start period.
+  */
+-static void camraw_sof(struct mtk_camraw *raw)
++static void camraw_frame_start(struct mtk_camraw *raw)
+ {
+-	unsigned int j = raw->n_frame_applied, set;
++	struct v4l2_event ev = { .type = V4L2_EVENT_FRAME_SYNC };
++	struct mtk_camraw_buffer *buf = NULL;
+ 	struct mtk_camraw_sof *log;
++	unsigned int k = raw->inflight;
++
++	if (frame_done == 1 && k) {
++		/* the earlier rule: the frame before this one is complete */
++		spin_lock(&raw->buf_lock);
++		buf = raw->app_buf[k % CAMRAW_APP_RING];
++		raw->app_buf[k % CAMRAW_APP_RING] = NULL;
++		spin_unlock(&raw->buf_lock);
++		if (buf)
++			camraw_buf_finish(raw, buf, VB2_BUF_STATE_DONE);
++	}
+ 
+-	if (!raw->n_sof_log)
+-		camraw_snap_event(raw, 0);
+-	if (raw->n_sof_log < CAMRAW_SOF_LOG) {
+-		log = &raw->sof_log[raw->n_sof_log];
++	raw->frame_idx = raw->n_sof - 1;
++	raw->inflight = raw->n_frame_applied;
++	raw->inflight_frame = raw->frame_idx;
++	raw->inflight_ns = raw->sof_ns;
++
++	if (raw->frame_idx < CAMRAW_SOF_LOG) {
++		log = &raw->sof_log[raw->frame_idx];
+ 		log->t_us = camraw_us_since_vf(raw);
+-		log->applied = j;
++		log->applied = raw->n_frame_applied;
+ 		log->seq = raw_rd(raw, CAMRAW_FRAME_SEQ_NUM);
+ 		log->seq_inner = readl(raw->inner + CAMRAW_FRAME_SEQ_NUM);
+ 		log->frmsize = raw_rd(raw, TG_FRMSIZE_ST);
++		raw->n_sof_log = raw->frame_idx + 1;
+ 	}
+-	raw->n_sof_log++;
+ 
+-	/* the application in effect for the frame that starts now */
+-	raw->inflight = j;
+-	if (frame_done == 1 && j >= 2)
+-		camraw_deliver(raw, (j - 1) % CAMRAW_NUM_SETS);
+-	if (!reapply)
+-		return;
++	ev.u.frame_sync.frame_sequence = raw->frame_idx;
++	v4l2_event_queue(&raw->vdev, &ev);
+ 
+-	if (apply_delay_us)
+-		usleep_range(min(apply_delay_us, 30000U),
+-			     min(apply_delay_us, 30000U) + 100);
+-	j++;
+-	set = j % CAMRAW_NUM_SETS;
+-	if (raw->frame.frame_seq_off != CAMRAW_NO_OFFSET)
+-		put_unaligned_le32(j, (u8 *)raw->slot_frame[set].cpu +
+-				   raw->frame.frame_seq_off);
+-	camraw_apply_cq(raw, raw->slot_frame[set].dma, &raw->frame,
+-			raw->frame_size);
+-	raw->n_frame_applied = j;
+-	if (reapply > 1) {
+-		camraw_toggle_db(raw);
+-		if (raw->twin_on)
+-			camraw_toggle_db(raw->twin);
+-	}
++	if (reapply)
++		camraw_apply_frame(raw);
+ }
+ 
+ static irqreturn_t camraw_raw_thread(int irq, void *data)
+@@ -936,11 +1012,6 @@ static irqreturn_t camraw_raw_thread(int irq, void *data)
+ 		camraw_snap_event(raw, 1);
+ 		camraw_rdyreq_take(raw);
+ 	}
+-
+-	/* end of the frame in flight: its picture set is complete */
+-	if ((pend[1] & CAMCTL_INT_SW_PASS1_DONE) && READ_ONCE(raw->streaming) &&
+-	    frame_done == 0 && raw->inflight >= 1)
+-		camraw_deliver(raw, raw->inflight % CAMRAW_NUM_SETS);
+ 	if (pend[1] & CAMCTL_INT_ERRORS)
+ 		dev_warn_ratelimited(raw->dev,
+ 				     "error interrupt 0x%08x; DMA error status YUVO_R1 0x%x YUVBO_R1 0x%x AAO 0x%x CQI_R1 0x%x\n",
+@@ -951,7 +1022,11 @@ static irqreturn_t camraw_raw_thread(int irq, void *data)
+ 				     raw_rd(raw, CAMRAW_CQI_R1 + CAMRAW_DMA_ERR_STAT));
+ 
+ 	if ((pend[1] & CAMCTL_INT_TG_SOF) && READ_ONCE(raw->streaming))
+-		camraw_sof(raw);
++		camraw_snap_event(raw, 0);
++	if (raw->probe_report) {
++		raw->probe_report = false;
++		camraw_probe_report(raw);
++	}
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -1053,8 +1128,6 @@ static void camraw_unload(struct mtk_camraw *raw)
+ 	camraw_free_dma(raw, &raw->slot_start);
+ 	for (i = 0; i < CAMRAW_NUM_SETS; i++)
+ 		camraw_free_dma(raw, &raw->slot_frame[i]);
+-	for (i = 0; i < CAMRAW_PICTURE_PLANES; i++)
+-		camraw_free_dma(raw, &raw->pic1[i]);
+ 	raw->loaded = false;
+ 	raw->pair_problem = NULL;
+ 	raw->sizeimage = 0;
+@@ -1117,10 +1190,7 @@ static int camraw_set_format(struct mtk_camraw *raw)
+ 		const struct camraw_capbuf *b = &rp->bufs[rp->out_plane[p]];
+ 
+ 		raw->pic_size[p] = b->size;
+-		raw->pic_cpu[0][p] = b->cpu;
+-		raw->pic_dma[0][p] = b->dma;
+-		raw->pic_cpu[1][p] = raw->pic1[p].cpu;
+-		raw->pic_dma[1][p] = raw->pic1[p].dma;
++		raw->scratch_dma[p] = b->dma;
+ 	}
+ 	raw->width = rp->width;
+ 	raw->height = rp->height;
+@@ -1206,15 +1276,6 @@ static int camraw_load(struct mtk_camraw *raw)
+ 			    raw->frame.slot_size);
+ 
+ 	if (camraw_replay_has_picture(&raw->frame)) {
+-		for (i = 0; !ret && i < CAMRAW_PICTURE_PLANES; i++)
+-			ret = camraw_alloc_dma(raw, &raw->pic1[i],
+-					       raw->frame.bufs[raw->frame.out_plane[i]].size);
+-		if (ret)
+-			goto err;
+-		camraw_debugfs_blob(raw, "picture1-0", raw->pic1[0].cpu,
+-				    raw->frame.bufs[raw->frame.out_plane[0]].size);
+-		camraw_debugfs_blob(raw, "picture1-1", raw->pic1[1].cpu,
+-				    raw->frame.bufs[raw->frame.out_plane[1]].size);
+ 		ret = camraw_set_format(raw);
+ 		if (ret)
+ 			goto err;
+@@ -1298,15 +1359,11 @@ static int camraw_emit_all(struct mtk_camraw *raw)
+ 	for (i = 0; !ret && i < CAMRAW_NUM_SETS; i++)
+ 		ret = camraw_replay_emit(&raw->frame, raw->slot_frame[i].cpu,
+ 					 raw->slot_frame[i].dma, raw->emit_flags,
+-					 raw->pic_dma[i], raw->frame_size);
++					 raw->scratch_dma, raw->frame_size);
+ 	if (ret) {
+ 		dev_err(raw->dev, "the queue slots cannot be written: %d\n", ret);
+ 		return ret;
+ 	}
+-	for (i = 0; i < CAMRAW_NUM_SETS; i++) {
+-		memset(raw->pic_cpu[i][0], CAMRAW_FILL, raw->pic_size[0]);
+-		memset(raw->pic_cpu[i][1], CAMRAW_FILL, raw->pic_size[1]);
+-	}
+ 	dev_info(raw->dev,
+ 		 "%s: start request %u lists 0x%x + 0x%x bytes, per-frame request %u lists 0x%x + 0x%x bytes%s%s\n",
+ 		 raw->twin_on ? "both RAW engines" : "side A only",
+@@ -1365,17 +1422,12 @@ static void camraw_clocks_restore(struct mtk_camraw *raw)
+ 	raw->cam_rate_saved = 0;
+ }
+ 
+-/* the per-frame request before the viewfinder: application 1, set 1 */
++/* the per-frame request before the viewfinder: application 1 */
+ static void camraw_prestart(struct mtk_camraw *raw)
+ {
+-	if (raw->frame.frame_seq_off != CAMRAW_NO_OFFSET)
+-		put_unaligned_le32(1, (u8 *)raw->slot_frame[1].cpu +
+-				   raw->frame.frame_seq_off);
+ 	raw->cq_seen = 0;
+ 	reinit_completion(&raw->cq_done);
+-	camraw_apply_cq(raw, raw->slot_frame[1].dma, &raw->frame,
+-			raw->frame_size);
+-	raw->n_frame_applied = 1;
++	camraw_apply_frame(raw);
+ 	if (!wait_for_completion_timeout(&raw->cq_done,
+ 					 msecs_to_jiffies(CAMRAW_CQ_TIMEOUT_MS)))
+ 		dev_warn(raw->dev, "prestart: the per-frame request's lists did not both finish: done bits 0x%x\n",
+@@ -1466,9 +1518,12 @@ static int camraw_stream_start(struct mtk_camraw *raw)
+ 	if (db_order == 1)
+ 		camraw_toggle_engines(raw, false);
+ 
+-	raw->sequence = 0;
+ 	raw->n_frames = 0;
+-	raw->n_no_buffer = 0;
++	raw->n_no_buffer_frames = 0;
++	raw->n_buf_errors = 0;
++	raw->probe_done = false;
++	raw->probe_report = false;
++	memset(raw->app_buf, 0, sizeof(raw->app_buf));
+ 	raw->n_applied = 0;
+ 	raw->n_frame_applied = 0;
+ 	raw->n_sof_log = 0;
+@@ -1591,8 +1646,16 @@ static void camraw_return_bufs(struct mtk_camraw *raw,
+ 	unsigned long flags;
+ 	LIST_HEAD(list);
+ 
++	unsigned int i;
++
+ 	spin_lock_irqsave(&raw->buf_lock, flags);
+ 	list_splice_init(&raw->bufs, &list);
++	/* buffers the lists of a frame pointed at */
++	for (i = 0; i < CAMRAW_APP_RING; i++) {
++		if (raw->app_buf[i])
++			list_add_tail(&raw->app_buf[i]->list, &list);
++		raw->app_buf[i] = NULL;
++	}
+ 	spin_unlock_irqrestore(&raw->buf_lock, flags);
+ 	list_for_each_entry_safe(buf, tmp, &list, list) {
+ 		list_del(&buf->list);
+@@ -1629,6 +1692,10 @@ static void camraw_buf_queue(struct vb2_buffer *vb)
+ 		container_of(to_vb2_v4l2_buffer(vb), struct mtk_camraw_buffer, vb);
+ 	unsigned long flags;
+ 
++	buf->dma = vb2_dma_contig_plane_dma_addr(vb, 0);
++	/* the first picture is checked for what the writers left */
++	if (!raw->probe_done)
++		camraw_probe_fill(raw, vb2_plane_vaddr(vb, 0));
+ 	spin_lock_irqsave(&raw->buf_lock, flags);
+ 	list_add_tail(&buf->list, &raw->bufs);
+ 	spin_unlock_irqrestore(&raw->buf_lock, flags);
+@@ -1701,16 +1768,50 @@ static int camraw_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
+ 	return 0;
+ }
+ 
++static int camraw_enum_framesizes(struct file *file, void *priv,
++				  struct v4l2_frmsizeenum *fsize)
++{
++	struct mtk_camraw *raw = video_drvdata(file);
++
++	if (fsize->index || !raw->sizeimage ||
++	    fsize->pixel_format != raw->pixfmt)
++		return -EINVAL;
++	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
++	fsize->discrete.width = raw->width;
++	fsize->discrete.height = raw->height;
++	return 0;
++}
++
++/*
++ * The one input is named after the sensor interface entity that feeds it,
++ * so that user space can find the sensor in the media graph of that sensor
++ * interface (this node is not linked into it).
++ */
+ static int camraw_enum_input(struct file *file, void *priv,
+ 			     struct v4l2_input *inp)
+ {
++	struct mtk_camraw *raw = video_drvdata(file);
++
+ 	if (inp->index)
+ 		return -EINVAL;
+ 	inp->type = V4L2_INPUT_TYPE_CAMERA;
+-	strscpy(inp->name, "RAW-A", sizeof(inp->name));
++	mutex_lock(&raw->lock);
++	if (!raw->source)
++		camraw_find_source(raw);
++	strscpy(inp->name, raw->source ? raw->source->name : "RAW-A",
++		sizeof(inp->name));
++	mutex_unlock(&raw->lock);
+ 	return 0;
+ }
+ 
++static int camraw_subscribe_event(struct v4l2_fh *fh,
++				  const struct v4l2_event_subscription *sub)
++{
++	if (sub->type == V4L2_EVENT_FRAME_SYNC)
++		return v4l2_event_subscribe(fh, sub, 2, NULL);
++	return -EINVAL;
++}
++
+ static int camraw_g_input(struct file *file, void *priv, unsigned int *i)
+ {
+ 	*i = 0;
+@@ -1728,7 +1829,10 @@ static const struct v4l2_ioctl_ops camraw_ioctl_ops = {
+ 	.vidioc_g_fmt_vid_cap = camraw_g_fmt,
+ 	.vidioc_s_fmt_vid_cap = camraw_g_fmt,
+ 	.vidioc_try_fmt_vid_cap = camraw_g_fmt,
++	.vidioc_enum_framesizes = camraw_enum_framesizes,
+ 	.vidioc_enum_input = camraw_enum_input,
++	.vidioc_subscribe_event = camraw_subscribe_event,
++	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+ 	.vidioc_g_input = camraw_g_input,
+ 	.vidioc_s_input = camraw_s_input,
+ 	.vidioc_reqbufs = vb2_ioctl_reqbufs,
+@@ -1817,20 +1921,19 @@ static int camraw_status_show(struct seq_file *m, void *unused)
+ 	camraw_show_request(m, "per-frame", &raw->frame);
+ 	seq_printf(m, "pair: %s\n", raw->pair_problem ? raw->pair_problem :
+ 		   "consistent for replay");
+-	seq_printf(m, "slots: start %pad, per-frame %pad and %pad; picture planes set 0 %pad/%pad, set 1 %pad/%pad\n",
++	seq_printf(m, "slots: start %pad, per-frame %pad and %pad; scratch picture planes %pad/%pad\n",
+ 		   &raw->slot_start.dma, &raw->slot_frame[0].dma,
+-		   &raw->slot_frame[1].dma, &raw->pic_dma[0][0],
+-		   &raw->pic_dma[0][1], &raw->pic_dma[1][0], &raw->pic_dma[1][1]);
++		   &raw->slot_frame[1].dma, &raw->scratch_dma[0],
++		   &raw->scratch_dma[1]);
+ 	seq_printf(m, "video node: %p4cc %ux%u pitch %u, %u bytes\n",
+ 		   &raw->pixfmt, raw->width, raw->height, raw->stride,
+ 		   raw->sizeimage);
+ 	seq_printf(m, "second RAW engine: %s\n", raw->twin ?
+ 		   dev_name(raw->twin->dev) : "none on this board");
+-	seq_printf(m, "stream: %s, %s, reapply %u, stats_off %d, extra_off %d, prestart %d, err_mask %u, cam_mhz %u, apply_delay_us %u, db_order %u, frame_done %u\n",
++	seq_printf(m, "stream: %s, %s, reapply %u, stats_off %d, extra_off %d, prestart %d, err_mask %u, cam_mhz %u, db_order %u, frame_done %u\n",
+ 		   raw->streaming ? "running" : "stopped",
+ 		   twin ? "twin" : "side A only", reapply, stats_off, extra_off,
+-		   prestart, err_mask, cam_mhz, apply_delay_us, db_order,
+-		   frame_done);
++		   prestart, err_mask, cam_mhz, db_order, frame_done);
+ 	camraw_show_counters(raw, m, NULL);
+ 	camraw_snaps_show(raw, m);
+ 	camraw_rdyreq_show(raw, m);
+@@ -2013,16 +2116,25 @@ static int camraw_video_register(struct mtk_camraw *raw)
+ 	struct vb2_queue *q = &raw->vq;
+ 	int ret;
+ 
++	/* a media device of its own: the node is found by its driver name */
++	raw->mdev.dev = raw->dev;
++	strscpy(raw->mdev.model, "MediaTek MT6878 RAW replay",
++		sizeof(raw->mdev.model));
++	strscpy(raw->mdev.driver_name, CAMRAW_DRV_NAME,
++		sizeof(raw->mdev.driver_name));
++	media_device_init(&raw->mdev);
++	raw->v4l2_dev.mdev = &raw->mdev;
++
+ 	ret = v4l2_device_register(raw->dev, &raw->v4l2_dev);
+ 	if (ret)
+-		return ret;
++		goto err_mdev;
+ 
+ 	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-	q->io_modes = VB2_MMAP;
++	q->io_modes = VB2_MMAP | VB2_DMABUF;
+ 	q->drv_priv = raw;
+ 	q->buf_struct_size = sizeof(struct mtk_camraw_buffer);
+ 	q->ops = &camraw_vb2_ops;
+-	q->mem_ops = &vb2_vmalloc_memops;
++	q->mem_ops = &vb2_dma_contig_memops;
+ 	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC |
+ 			     V4L2_BUF_FLAG_TSTAMP_SRC_SOE;
+ 	q->lock = &raw->vlock;
+@@ -2031,6 +2143,11 @@ static int camraw_video_register(struct mtk_camraw *raw)
+ 	if (ret)
+ 		goto err_v4l2;
+ 
++	raw->pad.flags = MEDIA_PAD_FL_SINK;
++	ret = media_entity_pads_init(&vdev->entity, 1, &raw->pad);
++	if (ret)
++		goto err_v4l2;
++
+ 	strscpy(vdev->name, "mtk-camraw-a", sizeof(vdev->name));
+ 	vdev->fops = &camraw_fops;
+ 	vdev->ioctl_ops = &camraw_ioctl_ops;
+@@ -2043,11 +2160,20 @@ static int camraw_video_register(struct mtk_camraw *raw)
+ 	video_set_drvdata(vdev, raw);
+ 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+ 	if (ret)
+-		goto err_v4l2;
++		goto err_entity;
++	ret = media_device_register(&raw->mdev);
++	if (ret)
++		goto err_video;
+ 	return 0;
+ 
++err_video:
++	vb2_video_unregister_device(vdev);
++err_entity:
++	media_entity_cleanup(&vdev->entity);
+ err_v4l2:
+ 	v4l2_device_unregister(&raw->v4l2_dev);
++err_mdev:
++	media_device_cleanup(&raw->mdev);
+ 	return ret;
+ }
+ 
+@@ -2195,8 +2321,11 @@ static void camraw_remove(struct platform_device *pdev)
+ 
+ 	if (raw->raw_id)
+ 		return;
++	media_device_unregister(&raw->mdev);
+ 	vb2_video_unregister_device(&raw->vdev);
++	media_entity_cleanup(&raw->vdev.entity);
+ 	v4l2_device_unregister(&raw->v4l2_dev);
++	media_device_cleanup(&raw->mdev);
+ 	debugfs_remove_recursive(raw->debugfs);
+ 	raw->debugfs_bufs = NULL;
+ 	mutex_lock(&raw->lock);
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.c b/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.c
+index b009ce8ef959..0e8590442ed6 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.c
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.c
+@@ -667,3 +667,28 @@ int camraw_replay_emit(const struct camraw_replay *rp, u8 *dst, u64 slot_base,
+ 	}
+ 	return 0;
+ }
++
++/*
++ * Point the picture planes of an emitted slot (@dst) at @picture[]: only
++ * the address words of the picture output, both sides. Cheap enough for
++ * every application of the per-frame request.
++ */
++void camraw_replay_patch_picture(const struct camraw_replay *rp, u8 *dst,
++				 const dma_addr_t picture[CAMRAW_PICTURE_PLANES])
++{
++	unsigned int i, p;
++
++	for (i = 0; i < rp->num_relocs; i++) {
++		const struct camraw_reloc *r = &rp->relocs[i];
++
++		for (p = 0; p < CAMRAW_PICTURE_PLANES; p++) {
++			u64 addr;
++
++			if (r->buf != rp->out_plane[p])
++				continue;
++			addr = (u64)picture[p] + r->addend;
++			put_unaligned_le32(lower_32_bits(addr), dst + r->off);
++			put_unaligned_le32(upper_32_bits(addr), dst + r->msb_off);
++		}
++	}
++}
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.h b/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.h
+index eb19ded5b28d..729e23891507 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.h
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-replay.h
+@@ -196,5 +196,7 @@ const char *camraw_replay_pair_check(const struct camraw_replay *start,
+ int camraw_replay_emit(const struct camraw_replay *rp, u8 *dst, u64 slot_base,
+ 		       unsigned int flags, const dma_addr_t *picture,
+ 		       u32 emit_size[CAMRAW_NUM_LISTS]);
++void camraw_replay_patch_picture(const struct camraw_replay *rp, u8 *dst,
++				 const dma_addr_t picture[CAMRAW_PICTURE_PLANES]);
+ 
+ #endif /* _MTK_CAMRAW_REPLAY_H */
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw.h b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+index 826581724f50..43b9a459694c 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw.h
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+@@ -16,6 +16,7 @@
+ #include <linux/types.h>
+ #include <linux/workqueue.h>
+ 
++#include <media/media-device.h>
+ #include <media/v4l2-device.h>
+ #include <media/videobuf2-v4l2.h>
+ 
+@@ -26,8 +27,10 @@
+ #define CAMYUV_DRV_NAME			"mtk-camyuv-mt6878"
+ 
+ #define CAMYUV_NUM_CLKS			3
+-/* two copies of the per-frame request, each with its own picture planes */
++/* two copies of the per-frame request, used alternately */
+ #define CAMRAW_NUM_SETS			2
++/* applications whose buffers are tracked (in flight and programmed) */
++#define CAMRAW_APP_RING			4
+ #define CAMRAW_SOF_LOG			16
+ /* register snapshot of one engine pair: ranges, then the port error words */
+ #define CAMRAW_SNAP_WORDS		200
+@@ -57,6 +60,7 @@ struct mtk_camyuv {
+ struct mtk_camraw_buffer {
+ 	struct vb2_v4l2_buffer vb;
+ 	struct list_head list;
++	dma_addr_t dma;
+ };
+ 
+ /**
+@@ -134,6 +138,8 @@ struct mtk_camraw {
+ 	struct clk *cam_sel;
+ 	unsigned long cam_rate_saved;
+ 
++	struct media_device mdev;
++	struct media_pad pad;
+ 	struct v4l2_device v4l2_dev;
+ 	struct video_device vdev;
+ 	struct vb2_queue vq;
+@@ -149,11 +155,13 @@ struct mtk_camraw {
+ 	const char *pair_problem;
+ 	struct mtk_camraw_dma slot_start;
+ 	struct mtk_camraw_dma slot_frame[CAMRAW_NUM_SETS];
+-	/* picture planes of set 1; set 0 are the frame request's own buffers */
+-	struct mtk_camraw_dma pic1[CAMRAW_PICTURE_PLANES];
+-	dma_addr_t pic_dma[CAMRAW_NUM_SETS][CAMRAW_PICTURE_PLANES];
+-	void *pic_cpu[CAMRAW_NUM_SETS][CAMRAW_PICTURE_PLANES];
++	/*
++	 * Picture planes: plane 1 follows plane 0 in one buffer (NV21). The
++	 * frame request's own picture buffers take frames that have no
++	 * queued buffer.
++	 */
+ 	u32 pic_size[CAMRAW_PICTURE_PLANES];
++	dma_addr_t scratch_dma[CAMRAW_PICTURE_PLANES];
+ 	u32 start_size[CAMRAW_NUM_LISTS];
+ 	u32 frame_size[CAMRAW_NUM_LISTS];
+ 	u32 pixfmt;
+@@ -169,8 +177,18 @@ struct mtk_camraw {
+ 	bool streaming;
+ 	bool twin_on;
+ 	unsigned int emit_flags;
+-	unsigned int sequence;
+ 	unsigned int n_frame_applied;
++	/* buffer of each application, the frame in flight */
++	struct mtk_camraw_buffer *app_buf[CAMRAW_APP_RING];
++	u32 frame_idx;
++	u32 inflight_frame;
++	u64 inflight_ns;
++	unsigned int n_no_buffer_frames;
++	unsigned int n_buf_errors;
++	bool probe_done;
++	bool probe_report;
++	unsigned int probe_same[2 * CAMRAW_PICTURE_PLANES];
++	u8 probe_bytes[2 * CAMRAW_PICTURE_PLANES][8];
+ 	struct completion cq_done;
+ 	struct delayed_work watchdog;
+ 	struct mtk_camraw_sof sof_log[CAMRAW_SOF_LOG];
+-- 
+2.56.1
+

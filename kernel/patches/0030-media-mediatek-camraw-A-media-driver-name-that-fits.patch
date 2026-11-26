@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 14:38:42 +0300
+Subject: [PATCH 30/34] media: mediatek: camraw: A media driver name that fits
+
+media_device_info.driver and v4l2_capability.driver hold 15 characters:
+"mtk-camraw-mt6878" reached user space as "mtk-camraw-mt68", and the
+libcamera pipeline handler, which matches the full name, never found the
+media device. Both now carry "mtk-camraw"; the platform driver keeps its
+name.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c | 4 ++--
+ drivers/media/platform/mediatek/camraw/mtk-camraw.h     | 5 +++++
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+index 353e2b6acb61..926f949f638d 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw-drv.c
+@@ -1746,7 +1746,7 @@ static const struct vb2_ops camraw_vb2_ops = {
+ static int camraw_querycap(struct file *file, void *priv,
+ 			   struct v4l2_capability *cap)
+ {
+-	strscpy(cap->driver, CAMRAW_DRV_NAME, sizeof(cap->driver));
++	strscpy(cap->driver, CAMRAW_MDEV_NAME, sizeof(cap->driver));
+ 	strscpy(cap->card, "MT6878 RAW replay", sizeof(cap->card));
+ 	return 0;
+ }
+@@ -2157,7 +2157,7 @@ static int camraw_video_register(struct mtk_camraw *raw)
+ 	raw->mdev.dev = raw->dev;
+ 	strscpy(raw->mdev.model, "MediaTek MT6878 RAW replay",
+ 		sizeof(raw->mdev.model));
+-	strscpy(raw->mdev.driver_name, CAMRAW_DRV_NAME,
++	strscpy(raw->mdev.driver_name, CAMRAW_MDEV_NAME,
+ 		sizeof(raw->mdev.driver_name));
+ 	media_device_init(&raw->mdev);
+ 	raw->v4l2_dev.mdev = &raw->mdev;
+diff --git a/drivers/media/platform/mediatek/camraw/mtk-camraw.h b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+index 43b9a459694c..448e05c7e337 100644
+--- a/drivers/media/platform/mediatek/camraw/mtk-camraw.h
++++ b/drivers/media/platform/mediatek/camraw/mtk-camraw.h
+@@ -24,6 +24,11 @@
+ #include "mtk-camraw-replay.h"
+ 
+ #define CAMRAW_DRV_NAME			"mtk-camraw-mt6878"
++/*
++ * Media device and V4L2 driver name, what user space matches on: the
++ * fields hold 15 characters, the platform driver name would be cut.
++ */
++#define CAMRAW_MDEV_NAME		"mtk-camraw"
+ #define CAMYUV_DRV_NAME			"mtk-camyuv-mt6878"
+ 
+ #define CAMYUV_NUM_CLKS			3
+-- 
+2.56.1
+

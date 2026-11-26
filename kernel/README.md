@@ -17,8 +17,12 @@ Since 2026-11-26 it also carries work in progress that the published user space 
   fed by a second destination of the main camera's CSI port in seninf. **It delivers frames**: on
   a lit scene a correct colour 1450x1088 picture (NV21) through the hardware ISP. All processing
   settings (black level, white balance, colour, sharpening, statistics) are the ones frozen in the
-  captured request: there is no 3A, no auto exposure (exposure and gain are set by hand through
-  the sensor's V4L2 controls), and no libcamera integration. The right edge of a frame shows the
+  captured request: there is no 3A of its own; exposure and gain are the sensor's V4L2 controls,
+  which the libcamera `mtkcamraw` handler of this repository drives (patches 0027/0028 under
+  `patches/libcamera`). Since 2026-11-27 the driver hands out zero-copy buffers, latches
+  per-frame requests on every start of frame, runs both RAW engines by default, recovers from
+  dropped frames, registers a media device of its own and holds a CPU wake-up latency limit
+  while it streams (`qos_us`). The right edge of a frame shows the
   line padding (pitch 1472). It needs two request dumps, `/lib/firmware/titan2/camraw-start.bin`
   and `camraw-frame.bin`, captured on your own phone from its original camera software with
   `scripts/camraw-capture.sh` of this repository (README.md, "Hardware ISP replay"). No dump is
@@ -31,11 +35,14 @@ Since 2026-11-26 it also carries work in progress that the published user space 
 - The camsys clock providers stay active through system sleep, so the camera power domain comes
   back after a resume.
 
-The MJPEG streaming fixes of the JPEG encoder are not in this series yet (a later publication).
+Since 2026-11-27 the series also carries the streaming fixes of the JPEG encoder (every job
+ends with its metadata, the encoder drain with EOS, buffer sizes by the frame, source formats in
+whole MCUs with the crop, a source buffer check before the DMA). They are built and booted on
+the phone, but MJPEG recording through them has not been tested there yet.
 
 This directory:
 
-- `patches/`: the series as `git format-patch` files (21 patches):
+- `patches/`: the series as `git format-patch` files (34 patches):
   - `0001-media-dt-bindings-mediatek-Add-MT6878-CAMSV.patch`
   - `0002-media-mediatek-camsv-Add-MT6878-CAMSV-capture-driver.patch`
   - `0003-media-dt-bindings-mediatek-Add-MT6878-seninf.patch`
@@ -57,6 +64,19 @@ This directory:
   - `0019-arm64-dts-mediatek-mt6878-titan2-RAW-YUV-engines-raw.patch`
   - `0020-arm64-dts-mediatek-mt6878-RMS-windows-of-both-RAW-en.patch`
   - `0021-media-mediatek-camraw-Load-the-start-request-before-.patch`
+  - `0022-media-mediatek-jpeg-End-every-single-core-encoder-jo.patch`
+  - `0023-media-mediatek-jpeg-Implement-the-encoder-drain.patch`
+  - `0024-media-mediatek-jpeg-Size-the-encoder-s-JPEG-buffer-b.patch`
+  - `0025-media-mediatek-jpeg-Encoder-source-formats-in-whole-.patch`
+  - `0026-media-mediatek-jpeg-Check-encoder-source-buffers-bef.patch`
+  - `0027-media-mediatek-camraw-Zero-copy-buffers-frame-timing.patch`
+  - `0028-media-mediatek-camraw-Sensor-input-as-crop-bounds-ca.patch`
+  - `0029-media-mediatek-camraw-Both-RAW-engines-by-default.patch`
+  - `0030-media-mediatek-camraw-A-media-driver-name-that-fits.patch`
+  - `0031-media-mediatek-camraw-Frame-done-after-the-next-star.patch`
+  - `0032-media-mediatek-camraw-Never-hold-the-lists-back-reco.patch`
+  - `0033-media-mediatek-camraw-Hand-buffers-back-from-the-IRQ.patch`
+  - `0034-media-mediatek-camraw-Hold-a-CPU-wake-up-latency-lim.patch`
 - `titan2-camera.config`: the kernel config fragment with these options.
 
 ## Building
@@ -71,11 +91,11 @@ https://github.com/Serlk/titan2-linux:
 
     git clone -b titan2 https://github.com/Serlk/titan2-linux linux
     cd linux
-    git checkout -b titan2-local 035b459a3c6cc246eff2c9557ec8b0c78a3292a7
+    git checkout -b titan2-local 8c61a1b594a6f01c75efd5f8c4318f8ec416ae62
     git am ../../titan2-camera/kernel/patches/*.patch
     cd ..
 
-The series was made with `git format-patch` on `titan2` commit `035b459a3c6cc246eff2c9557ec8b0c78a3292a7` (the `git checkout` line
+The series was made with `git format-patch` on `titan2` commit `8c61a1b594a6f01c75efd5f8c4318f8ec416ae62` (the `git checkout` line
 above). A newer `titan2` usually takes it as well (`git checkout -b titan2-local titan2`); if
 `git am` stops, use the base commit. The series of titan2-camera, titan2-fingerprint and
 titan2-gnss touch different hunks and can be applied one after another on the same tree (tested

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: serlk <22211586+Serlk@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 04:02:44 +0300
-Subject: [PATCH 19/21] arm64: dts: mediatek: mt6878-titan2: RAW/YUV engines,
+Subject: [PATCH 19/34] arm64: dts: mediatek: mt6878-titan2: RAW/YUV engines,
  -raw, -jpeg and -vcp test boards
 
 - mt6878.dtsi: RAW-A/YUV-A and RAW-B/YUV-B engine nodes, disabled.
@@ -397,10 +397,10 @@ index e693d5ed5f4b..d5329a96fb77 100644
 +	status = "okay";
 +};
 diff --git a/arch/arm64/boot/dts/mediatek/mt6878.dtsi b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
-index 51062cfa3827..9643c685c04a 100644
+index 74ba611227c5..66052c094680 100644
 --- a/arch/arm64/boot/dts/mediatek/mt6878.dtsi
 +++ b/arch/arm64/boot/dts/mediatek/mt6878.dtsi
-@@ -1592,6 +1592,132 @@ seninf_port5: port@5 {
+@@ -1597,6 +1597,132 @@ seninf_port5: port@5 {
  			};
  		};
  

@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: serlk <22211586+Serlk@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 13:48:30 +0300
+Subject: [PATCH 22/34] media: mediatek: jpeg: End every single-core encoder
+ job, with its metadata
+
+The done path of the single-core encoder returns the capture buffer
+without the metadata of its source buffer. Both queues use
+V4L2_BUF_FLAG_TIMESTAMP_COPY, so every JPEG comes back with timestamp 0
+and a client that matches frames by timestamp, such as GStreamer's
+v4l2jpegenc, keeps only the first one ("Encoder is producing too many
+buffers").
+
+The interrupt handler also cancels the job watchdog first and then
+returns without ending the job when the status has no DONE bit. The
+encoder raises such an interrupt e.g. when the bitstream buffer fills up
+before the end of the frame. The job then stays running without a
+watchdog, the frame is lost and the context hangs for good:
+v4l2_m2m_cancel_job() never returns.
+
+End the job in one place for the done, error and timeout paths: copy the
+source buffer's metadata to the capture buffer with
+v4l2_m2m_buf_copy_metadata(), set the payload and return both buffers.
+In the interrupt handler, read and clear the whole status register. Any
+non-zero status ends the running job: with DONE as before, otherwise the
+encoder is reset and both buffers are returned with an error and a
+warning. The watchdog is cancelled only by the handler that ends the job;
+if it is no longer pending, the timeout work owns the job (or none is
+running) and the handler leaves it alone.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../platform/mediatek/jpeg/mtk_jpeg_core.c    | 123 ++++++++++--------
+ 1 file changed, 71 insertions(+), 52 deletions(-)
+
+diff --git a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
+index a50b2f210126..63c48587327a 100644
+--- a/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
++++ b/drivers/media/platform/mediatek/jpeg/mtk_jpeg_core.c
+@@ -924,12 +924,34 @@ static int mtk_jpeg_set_dec_dst(struct mtk_jpeg_ctx *ctx,
+ 	return 0;
+ }
+ 
++/*
++ * End the running encoder job: return its source and capture buffers in
++ * @state, the capture buffer with the source buffer's metadata (the
++ * timestamp a client matches frames by) and @size bytes of payload.
++ */
++static void mtk_jpeg_enc_job_done(struct mtk_jpeg_dev *jpeg,
++				  struct mtk_jpeg_ctx *ctx,
++				  enum vb2_buffer_state state, u32 size)
++{
++	struct vb2_v4l2_buffer *src_buf, *dst_buf;
++
++	src_buf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++	dst_buf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
++
++	v4l2_m2m_buf_copy_metadata(src_buf, dst_buf);
++	vb2_set_plane_payload(&dst_buf->vb2_buf, 0,
++			      state == VB2_BUF_STATE_DONE ? size : 0);
++
++	v4l2_m2m_buf_done(src_buf, state);
++	v4l2_m2m_buf_done(dst_buf, state);
++	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
++}
++
+ static void mtk_jpeg_enc_device_run(void *priv)
+ {
+ 	struct mtk_jpeg_ctx *ctx = priv;
+ 	struct mtk_jpeg_dev *jpeg = ctx->jpeg;
+ 	struct vb2_v4l2_buffer *src_buf, *dst_buf;
+-	enum vb2_buffer_state buf_state = VB2_BUF_STATE_ERROR;
+ 	unsigned long flags;
+ 	int ret;
+ 
+@@ -937,8 +959,10 @@ static void mtk_jpeg_enc_device_run(void *priv)
+ 	dst_buf = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
+ 
+ 	ret = pm_runtime_resume_and_get(jpeg->dev);
+-	if (ret < 0)
+-		goto enc_end;
++	if (ret < 0) {
++		mtk_jpeg_enc_job_done(jpeg, ctx, VB2_BUF_STATE_ERROR, 0);
++		return;
++	}
+ 
+ 	schedule_delayed_work(&jpeg->job_timeout_work,
+ 			msecs_to_jiffies(MTK_JPEG_HW_TIMEOUT_MSEC));
+@@ -956,14 +980,6 @@ static void mtk_jpeg_enc_device_run(void *priv)
+ 	mtk_jpeg_set_enc_params(ctx, jpeg->reg_base);
+ 	mtk_jpeg_enc_start(jpeg->reg_base);
+ 	spin_unlock_irqrestore(&jpeg->hw_lock, flags);
+-	return;
+-
+-enc_end:
+-	v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+-	v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+-	v4l2_m2m_buf_done(src_buf, buf_state);
+-	v4l2_m2m_buf_done(dst_buf, buf_state);
+-	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
+ }
+ 
+ static void mtk_jpeg_multicore_enc_device_run(void *priv)
+@@ -1231,13 +1247,19 @@ static void mtk_jpeg_job_timeout_work(struct work_struct *work)
+ 	struct vb2_v4l2_buffer *src_buf, *dst_buf;
+ 
+ 	ctx = v4l2_m2m_get_curr_priv(jpeg->m2m_dev);
+-	src_buf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+-	dst_buf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+ 
+ 	jpeg->variant->hw_reset(jpeg->reg_base);
+ 
+ 	pm_runtime_put(jpeg->dev);
+ 
++	if (jpeg->variant->cap_q_default_fourcc == V4L2_PIX_FMT_JPEG) {
++		dev_warn(jpeg->dev, "encoder timeout: frame dropped\n");
++		mtk_jpeg_enc_job_done(jpeg, ctx, VB2_BUF_STATE_ERROR, 0);
++		return;
++	}
++
++	src_buf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++	dst_buf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+ 	v4l2_m2m_buf_done(src_buf, VB2_BUF_STATE_ERROR);
+ 	v4l2_m2m_buf_done(dst_buf, VB2_BUF_STATE_ERROR);
+ 	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
+@@ -1549,35 +1571,6 @@ static int mtk_jpegdec_set_hw_param(struct mtk_jpeg_ctx *ctx,
+ 	return 0;
+ }
+ 
+-static irqreturn_t mtk_jpeg_enc_done(struct mtk_jpeg_dev *jpeg)
+-{
+-	struct mtk_jpeg_ctx *ctx;
+-	struct vb2_v4l2_buffer *src_buf, *dst_buf;
+-	enum vb2_buffer_state buf_state = VB2_BUF_STATE_ERROR;
+-	u32 result_size;
+-
+-	ctx = v4l2_m2m_get_curr_priv(jpeg->m2m_dev);
+-	if (!ctx) {
+-		v4l2_err(&jpeg->v4l2_dev, "Context is NULL\n");
+-		return IRQ_HANDLED;
+-	}
+-
+-	src_buf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
+-	dst_buf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
+-
+-	result_size = mtk_jpeg_enc_get_file_size(jpeg->reg_base,
+-						 jpeg->variant->support_34bit);
+-	vb2_set_plane_payload(&dst_buf->vb2_buf, 0, result_size);
+-
+-	buf_state = VB2_BUF_STATE_DONE;
+-
+-	v4l2_m2m_buf_done(src_buf, buf_state);
+-	v4l2_m2m_buf_done(dst_buf, buf_state);
+-	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
+-	pm_runtime_put(ctx->jpeg->dev);
+-	return IRQ_HANDLED;
+-}
+-
+ static void mtk_jpegenc_worker(struct work_struct *work)
+ {
+ 	struct mtk_jpegenc_comp_dev *comp_jpeg[MTK_JPEGENC_HW_MAX];
+@@ -1792,24 +1785,50 @@ static void mtk_jpegdec_worker(struct work_struct *work)
+ 	v4l2_m2m_job_finish(jpeg->m2m_dev, ctx->fh.m2m_ctx);
+ }
+ 
++/*
++ * Every encoder interrupt ends the running job. Besides DONE the encoder
++ * also interrupts without it, e.g. when the bitstream buffer is full
++ * before the frame ends; it then waits for a reset, and a job left
++ * running would never finish.
++ */
+ static irqreturn_t mtk_jpeg_enc_irq(int irq, void *priv)
+ {
+ 	struct mtk_jpeg_dev *jpeg = priv;
++	struct mtk_jpeg_ctx *ctx;
+ 	u32 irq_status;
+-	irqreturn_t ret = IRQ_NONE;
+ 
+-	cancel_delayed_work(&jpeg->job_timeout_work);
++	irq_status = readl(jpeg->reg_base + JPEG_ENC_INT_STS);
++	if (!irq_status)
++		return IRQ_NONE;
++	writel(0, jpeg->reg_base + JPEG_ENC_INT_STS);
+ 
+-	irq_status = readl(jpeg->reg_base + JPEG_ENC_INT_STS) &
+-		     JPEG_ENC_INT_STATUS_MASK_ALLIRQ;
+-	if (irq_status)
+-		writel(0, jpeg->reg_base + JPEG_ENC_INT_STS);
++	/*
++	 * A job is running while its watchdog is pending. If the watchdog
++	 * is not pending, there is no job, or the watchdog is ending it.
++	 */
++	if (!cancel_delayed_work(&jpeg->job_timeout_work))
++		return IRQ_HANDLED;
+ 
+-	if (!(irq_status & JPEG_ENC_INT_STATUS_DONE))
+-		return ret;
++	ctx = v4l2_m2m_get_curr_priv(jpeg->m2m_dev);
++	if (!ctx) {
++		v4l2_err(&jpeg->v4l2_dev, "Context is NULL\n");
++		return IRQ_HANDLED;
++	}
+ 
+-	ret = mtk_jpeg_enc_done(jpeg);
+-	return ret;
++	if (irq_status & JPEG_ENC_INT_STATUS_DONE) {
++		mtk_jpeg_enc_job_done(jpeg, ctx, VB2_BUF_STATE_DONE,
++				      mtk_jpeg_enc_get_file_size(jpeg->reg_base,
++								 jpeg->variant->support_34bit));
++	} else {
++		dev_warn_ratelimited(jpeg->dev,
++				     "encoder interrupt %#x without DONE: frame dropped\n",
++				     irq_status);
++		mtk_jpeg_enc_reset(jpeg->reg_base);
++		mtk_jpeg_enc_job_done(jpeg, ctx, VB2_BUF_STATE_ERROR, 0);
++	}
++	pm_runtime_put(jpeg->dev);
++
++	return IRQ_HANDLED;
+ }
+ 
+ static irqreturn_t mtk_jpeg_dec_irq(int irq, void *priv)
+-- 
+2.56.1
+
