@@ -44,8 +44,9 @@ IMG=alpine:${REL#v}
 # aports 3.24-stable community/libcamera: 0.7.1-r1 ("rebuild against libpisp 1.5.0")
 APORTS_COMMIT=${APORTS_COMMIT:-c47555ebb1c7a0c29fbef5ebaf537177bfb00145}
 # Our build number: pkgrel of the APKBUILD := T2_REL; the result is T2_REL + 100 + number of
-# patches (10 + 100 + 25 = r135). Raise it with every rebuild that changes something, or apk on the
-# phone treats the package as already installed. Alpine's version (0.7.1-r1) is always lower.
+# patches (10 + 100 + 27 = r137 with the 27 patches of 2026-11-27). Raise it with every rebuild
+# that changes something, or apk on the phone treats the package as already installed. Alpine's
+# version (0.7.1-r1) is always lower.
 T2_REL=${T2_REL:-10}
 mkdir -p "$OUT/packages" "$DL/src" "$DL/apk-cache" "$DL/apk-cache-x86" "$KEYS"
 
