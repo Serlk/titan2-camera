@@ -5,5 +5,7 @@ libcamera libcamera-ipa libcamera-tools libcamera-gstreamer libcamera-v4l2 qcam
 pipewire pipewire-libs wireplumber pipewire-pulse gst-plugin-pipewire
 xdg-desktop-portal xdg-desktop-portal-gnome xdg-desktop-portal-gtk niri-portalsconf
 snapshot qt6-qtwayland
-gstreamer-tools gst-plugins-base gst-plugins-good gst-plugins-bad
+# Video recording: Snapshot's H.264/MP4 profile needs openh264enc (gst-plugins-bad) or x264enc
+# (gst-plugins-ugly, also a dependency of snapshot, listed explicitly); mp4mux is in -good.
+gstreamer-tools gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly
 dbus dbus-x11 xdg-user-dirs py3-gst
